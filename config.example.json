@@ -1,12 +1,12 @@
 {
-  "litellm_url": "http://localhost:4000",
-  "litellm_key": "YOUR_LITELLM_API_KEY_HERE",
+  "litellm_url": "https://opencode.ai/zen/go/v1",
+  "litellm_key": "YOUR_OPENCODE_GO_API_KEY_HERE",
   "models": {
-    "code": "gpt-5.3-codex",
-    "default": "claude-sonnet-5",
-    "master": "claude-opus-4-7",
-    "design": "claude-sonnet-5",
-    "specialist": "claude-sonnet-5"
+    "code": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
+    "default": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
+    "master": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
+    "design": {"model": "gpt-5.6-luna", "provider": "responses"},
+    "specialist": {"model": "kimi-k2.7-code", "provider": "chat_completions"}
   },
   "pipeline": {
     "max_retries": 3,

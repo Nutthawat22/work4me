@@ -8,6 +8,7 @@ what keys/types every part of the pipeline actually reads.
 """
 
 VALID_RESULT_FORMATS = {"junit", "jest_json"}
+VALID_PROVIDERS = {"chat_completions", "responses"}
 
 REQUIRED_TOP_LEVEL: dict[str, type] = {
     "litellm_url": str,
@@ -17,9 +18,11 @@ REQUIRED_TOP_LEVEL: dict[str, type] = {
     "languages": dict,
 }
 
-REQUIRED_MODEL_KEYS: dict[str, type] = {
-    "design": str,
-    "specialist": str,
+REQUIRED_MODEL_KEYS: tuple = ("design", "specialist")
+
+REQUIRED_MODEL_ENTRY_KEYS: dict[str, type] = {
+    "model": str,
+    "provider": str,
 }
 
 REQUIRED_PIPELINE_KEYS: dict[str, type] = {
@@ -72,13 +75,33 @@ def validate_config(config: dict) -> list[str]:
     # models.*
     models = config.get("models")
     if isinstance(models, dict):
-        for key, expected_type in REQUIRED_MODEL_KEYS.items():
+        for key in REQUIRED_MODEL_KEYS:
             if key not in models:
                 errors.append(f"Missing required key: models.{key}")
-            elif not isinstance(models[key], expected_type):
+                continue
+
+            model_entry = models[key]
+            if not isinstance(model_entry, dict):
                 errors.append(
-                    f"models.{key} must be {_article(expected_type)} {_type_name(expected_type)}, "
-                    f"got {type(models[key]).__name__}"
+                    f"models.{key} must be an object, got {type(model_entry).__name__}"
+                )
+                continue
+
+            for entry_key, expected_type in REQUIRED_MODEL_ENTRY_KEYS.items():
+                if entry_key not in model_entry:
+                    errors.append(f"Missing required key: models.{key}.{entry_key}")
+                    continue
+                elif not isinstance(model_entry[entry_key], expected_type):
+                    errors.append(
+                        f"models.{key}.{entry_key} must be {_article(expected_type)} "
+                        f"{_type_name(expected_type)}, got {type(model_entry[entry_key]).__name__}"
+                    )
+
+            provider = model_entry.get("provider")
+            if isinstance(provider, str) and provider not in VALID_PROVIDERS:
+                errors.append(
+                    f"models.{key}.provider must be one of {sorted(VALID_PROVIDERS)}, "
+                    f"got {provider!r}"
                 )
 
     # pipeline.*

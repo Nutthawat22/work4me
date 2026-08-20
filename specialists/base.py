@@ -115,7 +115,9 @@ def run_specialist(
         AgentResult with success=True and files_written populated on
         success, or success=False and notes describing the failure.
     """
-    model = config["models"]["specialist"]
+    model_cfg = config["models"]["specialist"]
+    model = model_cfg["model"]
+    provider = model_cfg["provider"]
     formatted_system_prompt = system_prompt.format(language=work_item.language)
     user_content = (
         f"Title: {work_item.title}\n"
@@ -134,7 +136,7 @@ def run_specialist(
         {"role": "user", "content": user_content},
     ]
 
-    raw = call_llm(messages, model, config)
+    raw = call_llm(messages, model, config, provider=provider)
 
     if raw.startswith(f"[{model}] Error:"):
         return AgentResult(

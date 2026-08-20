@@ -70,7 +70,9 @@ class DesignAgent:
         """
         valid_languages = set(self.config["languages"].keys())
 
-        model = self.config["models"]["design"]
+        model_cfg = self.config["models"]["design"]
+        model = model_cfg["model"]
+        provider = model_cfg["provider"]
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
             valid_languages=", ".join(sorted(valid_languages))
         )
@@ -78,7 +80,7 @@ class DesignAgent:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        raw = call_llm(messages, model, self.config)
+        raw = call_llm(messages, model, self.config, provider=provider)
 
         parsed = self._parse_json(raw)
         return self._validate_and_build(parsed, valid_languages)

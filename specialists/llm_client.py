@@ -1,41 +1,43 @@
 """
 specialists/llm_client.py
 
-Shared LiteLLM proxy client used by all agents (Master, Design, and
-future Phase 2 specialists). Standardized on the /chat/completions
-shape since it's the more common LiteLLM proxy interface.
+Thin dispatcher used by all agents (Master, Design, and specialists) to
+call an LLM. Resolves config["models"][role]["provider"] against the
+specialists.providers.PROVIDERS registry and delegates the actual
+request/response handling to the resolved adapter.
 """
 
-import requests
 from typing import Any
 
+from specialists.providers import PROVIDERS
 
-def call_llm(messages: list[dict], model: str, config: dict[str, Any], timeout: int = 60) -> str:
+
+def call_llm(
+    messages: list[dict],
+    model: str,
+    config: dict[str, Any],
+    provider: str = "chat_completions",
+    timeout: int = 60,
+) -> str:
     """
-    Send a chat-completions request to the configured LiteLLM proxy.
+    Dispatch an LLM call to the adapter registered for `provider`.
 
     Args:
         messages: Full list of {"role": ..., "content": ...} messages to send.
-        model: Model name string (e.g. config["models"]["design"]).
+        model: Model name string (e.g. config["models"]["design"]["model"]).
         config: Loaded config dict, must contain "litellm_url" and "litellm_key".
+        provider: Key into specialists.providers.PROVIDERS selecting which
+            adapter/API shape to use.
         timeout: Request timeout in seconds.
 
     Returns:
         The assistant's response content string, or a formatted error string
-        on connection/timeout/other failure.
+        on connection/timeout/other failure (see individual adapters).
+
+    Raises:
+        ValueError: if `provider` is not a registered provider.
     """
-    url = f"{config['litellm_url']}/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {config['litellm_key']}",
-        "Content-Type": "application/json",
-    }
-    try:
-        resp = requests.post(url, headers=headers, json={"model": model, "messages": messages}, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
-    except requests.exceptions.ConnectionError:
-        return f"[{model}] Error: could not connect to LiteLLM proxy at {config['litellm_url']}."
-    except requests.exceptions.Timeout:
-        return f"[{model}] Error: request timed out."
-    except Exception as e:
-        return f"[{model}] Error: {e}"
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unknown provider: {provider!r}. Valid providers: {sorted(PROVIDERS.keys())}")
+
+    return PROVIDERS[provider](messages, model, config, timeout)
