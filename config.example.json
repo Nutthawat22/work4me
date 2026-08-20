@@ -1,0 +1,33 @@
+{
+  "litellm_url": "http://localhost:4000",
+  "litellm_key": "YOUR_LITELLM_API_KEY_HERE",
+  "models": {
+    "code": "gpt-5.3-codex",
+    "default": "claude-sonnet-5",
+    "master": "claude-opus-4-7",
+    "design": "claude-sonnet-5",
+    "specialist": "claude-sonnet-5"
+  },
+  "pipeline": {
+    "max_retries": 3,
+    "runs_dir": "runs/",
+    "output_dir": "product",
+    "tests_dir": "tests"
+  },
+  "languages": {
+    "python": {
+      "test_command": ["pytest", "{tests_dir}", "--junitxml={junit_path}"],
+      "test_file_patterns": ["test_*.py", "*_test.py"],
+      "result_format": "junit",
+      "file_extension": ".py",
+      "test_framework_name": "pytest"
+    },
+    "javascript": {
+      "test_command": ["npx", "jest", "--ci", "--json", "--outputFile", "{result_path}"],
+      "test_file_patterns": ["*.test.js", "*.spec.js", "*.test.ts", "*.spec.ts"],
+      "result_format": "jest_json",
+      "file_extension": [".js", ".jsx", ".ts", ".tsx"],
+      "test_framework_name": "jest"
+    }
+  }
+}

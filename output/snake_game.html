@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Snake Game</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    background: #1e1e1e;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+
+  h1 {
+    margin-bottom: 10px;
+  }
+
+  #controls {
+    margin-bottom: 15px;
+    display: flex;
+    align-items: center;
+    gap: 15px;
+  }
+
+  #controls label {
+    font-weight: bold;
+  }
+
+  select, button {
+    font-size: 1rem;
+    padding: 6px 10px;
+    border-radius: 4px;
+    border: 1px solid #555;
+    background: #333;
+    color: #eee;
+    cursor: pointer;
+  }
+
+  select:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  button:hover:not(:disabled) {
+    background: #444;
+  }
+
+  #scoreBoard {
+    font-size: 1.2rem;
+    margin-bottom: 10px;
+  }
+
+  #gameCanvas {
+    background: #000;
+    border: 2px solid #555;
+  }
+
+  #gameOverMessage {
+    margin-top: 10px;
+    font-size: 1.3rem;
+    color: #ff5555;
+    font-weight: bold;
+  }
+
+  .hidden {
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<h1>Snake Game</h1>
+
+<div id="controls">
+  <label for="difficultySelect">Difficulty:</label>
+  <select id="difficultySelect" onchange="handleDifficultyChange()">
+    <option value="easy">Easy</option>
+    <option value="medium" selected>Medium</option>
+    <option value="hard">Hard</option>
+  </select>
+
+  <button id="startButton" onclick="handleStartClick()">Start</button>
+</div>
+
+<div id="scoreBoard">Score: <span id="scoreDisplay">0</span></div>
+
+<canvas id="gameCanvas" width="400" height="400"></canvas>
+
+<div id="gameOverMessage" class="hidden">
+  Game Over! Final Score: <span id="finalScore">0</span>
+</div>
+
+<script>
+  // ---------------------------------------------------------------------
+  // Configuration
+  // ---------------------------------------------------------------------
+  const DIFFICULTY_SPEEDS = {
+    easy: 200,
+    medium: 120,
+    hard: 70
+  };
+
+  const GRID_SIZE = 20; // number of cells per row/column
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+  const CELL_SIZE = canvas.width / GRID_SIZE;
+
+  // ---------------------------------------------------------------------
+  // Game state
+  // ---------------------------------------------------------------------
+  let snake = [];
+  let direction = { x: 1, y: 0 };
+  let nextDirection = { x: 1, y: 0 };
+  let food = { x: 0, y: 0 };
+  let score = 0;
+
+  // Speed is "locked in" at the moment the game starts. Changing the
+  // difficulty selector afterwards has no effect until the next Restart.
+  let speed = DIFFICULTY_SPEEDS.medium;
+
+  let gameLoopInterval = null;
+  let gameRunning = false;
+
+  // ---------------------------------------------------------------------
+  // Initialization
+  // ---------------------------------------------------------------------
+  function initGame() {
+    snake = [
+      { x: 10, y: 10 },
+      { x: 9, y: 10 },
+      { x: 8, y: 10 }
+    ];
+    direction = { x: 1, y: 0 };
+    nextDirection = { x: 1, y: 0 };
+    score = 0;
+    updateScoreDisplay();
+    placeFood();
+    draw();
+  }
+
+  function updateScoreDisplay() {
+    document.getElementById('scoreDisplay').textContent = score;
+  }
+
+  function placeFood() {
+    let valid = false;
+    let candidate;
+    while (!valid) {
+      candidate = {
+        x: Math.floor(Math.random() * GRID_SIZE),
+        y: Math.floor(Math.random() * GRID_SIZE)
+      };
+      valid = !snake.some(seg => seg.x === candidate.x && seg.y === candidate.y);
+    }
+    food = candidate;
+  }
+
+  // ---------------------------------------------------------------------
+  // Difficulty handling
+  // ---------------------------------------------------------------------
+  // Called whenever the difficulty selector changes. Per spec, selecting a
+  // new difficulty while a game is in progress must NOT change the current
+  // game's speed - the new value is only picked up the next time
+  // handleStartClick() runs (Start/Restart). Since the selector is disabled
+  // while playing, this is effectively a no-op during play; it exists so the
+  // control's change event is wired up and available for future use (e.g.
+  // previewing the selected speed) without affecting the running game.
+  function handleDifficultyChange() {
+    // Intentionally does not touch the `speed` variable used by gameLoop.
+    // The selected value is read fresh from the DOM in handleStartClick().
+  }
+
+  function getSelectedDifficulty() {
+    const select = document.getElementById('difficultySelect');
+    return select.value;
+  }
+
+  // ---------------------------------------------------------------------
+  // Start / Restart
+  // ---------------------------------------------------------------------
+  function handleStartClick() {
+    // Stop any previous loop before starting a new one.
+    if (gameLoopInterval !== null) {
+      clearInterval(gameLoopInterval);
+      gameLoopInterval = null;
+    }
+
+    initGame();
+
+    // Lock in the speed for this run based on the currently selected
+    // difficulty. Subsequent changes to the selector won't affect this run.
+    const difficulty = getSelectedDifficulty();
+    speed = DIFFICULTY_SPEEDS[difficulty] !== undefined
+      ? DIFFICULTY_SPEEDS[difficulty]
+      : DIFFICULTY_SPEEDS.medium;
+
+    // Hide any previous game-over message.
+    document.getElementById('gameOverMessage').classList.add('hidden');
+
+    // Disable difficulty changes while playing.
+    document.getElementById('difficultySelect').disabled = true;
+
+    document.getElementById('startButton').textContent = 'Restart';
+
+    gameRunning = true;
+    gameLoopInterval = setInterval(gameLoop, speed);
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function gameLoop() {
+    direction = nextDirection;
+
+    const head = {
+      x: snake[0].x + direction.x,
+      y: snake[0].y + direction.y
+    };
+
+    // Wall collision
+    const hitWall = head.x < 0 || head.x >= GRID_SIZE || head.y < 0 || head.y >= GRID_SIZE;
+    // Self collision
+    const hitSelf = snake.some(seg => seg.x === head.x && seg.y === head.y);
+
+    if (hitWall || hitSelf) {
+      endGame();
+      return;
+    }
+
+    snake.unshift(head);
+
+    if (head.x === food.x && head.y === food.y) {
+      score++;
+      updateScoreDisplay();
+      placeFood();
+    } else {
+      snake.pop();
+    }
+
+    draw();
+  }
+
+  function endGame() {
+    clearInterval(gameLoopInterval);
+    gameLoopInterval = null;
+    gameRunning = false;
+
+    document.getElementById('finalScore').textContent = score;
+    document.getElementById('gameOverMessage').classList.remove('hidden');
+
+    // Re-enable difficulty changes now that the game has ended.
+    document.getElementById('difficultySelect').disabled = false;
+
+    document.getElementById('startButton').textContent = 'Restart';
+  }
+
+  // ---------------------------------------------------------------------
+  // Rendering
+  // ---------------------------------------------------------------------
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Food
+    ctx.fillStyle = '#e74c3c';
+    ctx.fillRect(food.x * CELL_SIZE, food.y * CELL_SIZE, CELL_SIZE - 1, CELL_SIZE - 1);
+
+    // Snake
+    snake.forEach((seg, index) => {
+      ctx.fillStyle = index === 0 ? '#2ecc71' : '#27ae60';
+      ctx.fillRect(seg.x * CELL_SIZE, seg.y * CELL_SIZE, CELL_SIZE - 1, CELL_SIZE - 1);
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // Controls
+  // ---------------------------------------------------------------------
+  document.addEventListener('keydown', (e) => {
+    if (!gameRunning) return;
+
+    switch (e.key) {
+      case 'ArrowUp':
+      case 'w':
+      case 'W':
+        if (direction.y === 0) nextDirection = { x: 0, y: -1 };
+        e.preventDefault();
+        break;
+      case 'ArrowDown':
+      case 's':
+      case 'S':
+        if (direction.y === 0) nextDirection = { x: 0, y: 1 };
+        e.preventDefault();
+        break;
+      case 'ArrowLeft':
+      case 'a':
+      case 'A':
+        if (direction.x === 0) nextDirection = { x: -1, y: 0 };
+        e.preventDefault();
+        break;
+      case 'ArrowRight':
+      case 'd':
+      case 'D':
+        if (direction.x === 0) nextDirection = { x: 1, y: 0 };
+        e.preventDefault();
+        break;
+      default:
+        break;
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // Initial render (idle state, before Start is pressed)
+  // ---------------------------------------------------------------------
+  initGame();
+</script>
+
+</body>
+</html>
