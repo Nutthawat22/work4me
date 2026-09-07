@@ -7,7 +7,7 @@ specialists.providers.PROVIDERS registry and delegates the actual
 request/response handling to the resolved adapter.
 """
 
-from typing import Any
+from typing import Any, Optional
 
 from specialists.providers import PROVIDERS
 
@@ -18,6 +18,7 @@ def call_llm(
     config: dict[str, Any],
     provider: str = "chat_completions",
     timeout: int = 60,
+    response_schema: Optional[dict[str, Any]] = None,
 ) -> str:
     """
     Dispatch an LLM call to the adapter registered for `provider`.
@@ -29,6 +30,14 @@ def call_llm(
         provider: Key into specialists.providers.PROVIDERS selecting which
             adapter/API shape to use.
         timeout: Request timeout in seconds.
+        response_schema: Optional dict with keys "name" and "schema" (a
+            JSON Schema object) forwarded to the resolved adapter to
+            request structured-output enforcement (the model's token
+            generation is constrained to match the schema, eliminating
+            malformed/missing-field JSON as a failure mode rather than
+            just discouraging it via prompt text). None (default) — no
+            adapters currently in PROVIDERS require this, and passing
+            None preserves prior behavior exactly.
 
     Returns:
         The assistant's response content string, or a formatted error string
@@ -40,4 +49,4 @@ def call_llm(
     if provider not in PROVIDERS:
         raise ValueError(f"Unknown provider: {provider!r}. Valid providers: {sorted(PROVIDERS.keys())}")
 
-    return PROVIDERS[provider](messages, model, config, timeout)
+    return PROVIDERS[provider](messages, model, config, timeout, response_schema=response_schema)

@@ -14,6 +14,7 @@ prefix in `test_name`, joined with "::":
 
     test_name = f"{file_path}::{classname}::{name}"   # junit (pytest)
     test_name = f"{file_path}::{full_name}"            # jest_json
+    test_name = f"{file_path}::{full_name}"            # vitest_json
 
 Callers (MasterAgent) split on "::" and take the FIRST segment to
 recover the file path for matching against AgentResult.files_written.
@@ -21,6 +22,34 @@ Any new result-format parser added here must keep the file path as the
 first "::"-delimited segment so master.py's matching logic keeps working
 unchanged. This convention must stay consistent between this file and
 pipeline/master.py.
+
+SCOPE NOTE — Playwright (e2e) is intentionally NOT implemented here.
+Supertest needs no separate runner: it's a request-assertion library used
+*inside* Vitest test files, so it's exercised by the same
+`bunx vitest run` command as any other TS unit/integration test — no
+wiring change needed as long as Supertest-based specs match the
+`typescript` language's test_file_patterns (*.test.ts / *.spec.ts).
+
+Playwright IS a separate e2e test runner (its own CLI `playwright test`
+and its own JSON reporter shape, distinct from Vitest/Jest's
+testResults/assertionResults schema) and is out of scope for this
+handoff. To add it later:
+  1. Add a `playwright` entry to config's "languages" map (or a
+     dedicated non-language "e2e" bucket if WorkItem.language shouldn't
+     conflate unit-test language with e2e suite) with its own
+     test_command (e.g. ["bunx", "playwright", "test",
+     "--reporter=json"]) and result_format (e.g. "playwright_json").
+  2. Implement `_parse_playwright_json` here, following Playwright's own
+     JSON reporter schema (suites[].specs[].tests[].results[]), still
+     preserving the `file::name` test_name convention required by
+     master.py's map_failures_to_work_items.
+  3. Wire the new result_format into the dispatch in
+     `_run_language_suite` and into config_validation.py's
+     VALID_RESULT_FORMATS.
+  4. Decide whether e2e specs share the `typescript` language's
+     test_file_patterns or need a distinct pattern (e.g. *.e2e.ts) to
+     avoid Vitest also picking them up and failing (Playwright's test()/
+     expect() API is incompatible with Vitest's runtime).
 """
 
 import fnmatch
@@ -115,6 +144,10 @@ class TestRunner:
             fd, result_path = tempfile.mkstemp(suffix=".json", prefix="jest_result_")
             os.close(fd)
             format_context["result_path"] = result_path
+        elif result_format == "vitest_json":
+            fd, result_path = tempfile.mkstemp(suffix=".json", prefix="vitest_result_")
+            os.close(fd)
+            format_context["result_path"] = result_path
         else:
             return TestResult(
                 passed=False,
@@ -176,6 +209,8 @@ class TestRunner:
 
             if result_format == "junit":
                 return self._parse_junit_xml(result_path)
+            elif result_format == "vitest_json":
+                return self._parse_vitest_json(result_path)
             else:
                 return self._parse_jest_json(result_path)
         finally:
@@ -290,6 +325,95 @@ class TestRunner:
                         test_name="<jest json parse error>",
                         work_item_id="",
                         error_output=f"Could not parse jest JSON at {result_path}",
+                    )
+                ],
+            )
+
+        test_file_results = data.get("testResults", [])
+
+        failures: list[TestFailure] = []
+        for tr in test_file_results:
+            file_path = tr.get("name", "<unknown file>")
+            for ar in tr.get("assertionResults", []):
+                if ar.get("status") != "failed":
+                    continue
+
+                test_title = ar.get("fullName") or ar.get("title") or "<unnamed test>"
+                messages = ar.get("failureMessages") or []
+                error_text = "\n".join(messages).strip()
+                if len(error_text) > MAX_ERROR_OUTPUT_LEN:
+                    error_text = error_text[:MAX_ERROR_OUTPUT_LEN] + "...[truncated]"
+
+                failures.append(
+                    TestFailure(
+                        test_name=f"{file_path}::{test_title}",
+                        work_item_id="",
+                        error_output=error_text,
+                    )
+                )
+
+        total = data.get("numTotalTests")
+        if total is None:
+            total = sum(len(tr.get("assertionResults", [])) for tr in test_file_results)
+
+        failed = len(failures)
+        passed = failed == 0 and total > 0
+
+        return TestResult(passed=passed, total=total, failed=failed, failures=failures)
+
+    def _parse_vitest_json(self, result_path: str) -> TestResult:
+        """
+        Parse vitest's `run --reporter=json --outputFile=<path>` output.
+
+        Vitest's JSON reporter is documented as producing a report "in a
+        JSON format compatible with Jest's --json option"
+        (https://vitest.dev/guide/reporters.html#json-reporter), so the
+        schema is identical in the fields we care about:
+
+          { "numTotalTests": int, "numFailedTests": int,
+            "testResults": [
+              { "name": "<file path>",
+                "assertionResults": [
+                  { "status": "passed"|"failed"|..., "fullName": str,
+                    "title": str, "failureMessages": [str, ...] },
+                  ...
+                ]
+              },
+              ...
+            ]
+          }
+
+        Kept as a separate method (rather than aliasing _parse_jest_json)
+        so vitest-specific error messages are clear and the two formats
+        can diverge independently if a future vitest version changes its
+        JSON shape.
+        """
+        try:
+            with open(result_path, "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return TestResult(
+                passed=False,
+                total=0,
+                failed=0,
+                failures=[
+                    TestFailure(
+                        test_name="<vitest result file not found>",
+                        work_item_id="",
+                        error_output=f"Could not find vitest result file at {result_path}",
+                    )
+                ],
+            )
+        except json.JSONDecodeError:
+            return TestResult(
+                passed=False,
+                total=0,
+                failed=0,
+                failures=[
+                    TestFailure(
+                        test_name="<vitest json parse error>",
+                        work_item_id="",
+                        error_output=f"Could not parse vitest JSON at {result_path}",
                     )
                 ],
             )

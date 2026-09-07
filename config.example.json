@@ -24,10 +24,17 @@
     },
     "javascript": {
       "test_command": ["npx", "jest", "--ci", "--json", "--outputFile", "{result_path}"],
-      "test_file_patterns": ["*.test.js", "*.spec.js", "*.test.ts", "*.spec.ts"],
+      "test_file_patterns": ["*.test.js", "*.spec.js", "*.test.jsx", "*.spec.jsx"],
       "result_format": "jest_json",
-      "file_extension": [".js", ".jsx", ".ts", ".tsx"],
+      "file_extension": [".js", ".jsx"],
       "test_framework_name": "jest"
+    },
+    "typescript": {
+      "test_command": ["bunx", "vitest", "run", "--reporter=json", "--outputFile={result_path}"],
+      "test_file_patterns": ["*.test.ts", "*.spec.ts", "*.test.tsx", "*.spec.tsx"],
+      "result_format": "vitest_json",
+      "file_extension": [".ts", ".tsx"],
+      "test_framework_name": "vitest"
     }
   }
 }

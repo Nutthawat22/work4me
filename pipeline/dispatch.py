@@ -7,12 +7,20 @@ sequential dispatch to the matching specialist agent.
 
 import os
 from collections import deque
+from typing import Callable
 
 from pipeline.state import AgentResult, TestFailure, WorkItem
 from specialists.config import ConfigAgent
 from specialists.logic import LogicAgent
 from specialists.test_writer import TestAgent
 from specialists.ui import UIAgent
+
+# Called as progress(item, index, total) immediately BEFORE that item is
+# dispatched to its specialist (index is 1-based). Dispatch is sequential
+# and each specialist call is a blocking LLM request that can take a
+# while, so this is the caller's only hook to show "still working, on
+# item N of M" rather than appearing to hang for the whole batch.
+DispatchProgressCallback = Callable[[WorkItem, int, int], None]
 
 # Cap how much dependency content gets injected into a dependent
 # WorkItem's prompt — avoids blowing up context on deeply-chained items.
@@ -145,6 +153,7 @@ def dispatch_work_items(
     strict: bool = True,
     retry_context: dict[str, list[TestFailure]] | None = None,
     known_results: list[AgentResult] | None = None,
+    progress: DispatchProgressCallback | None = None,
 ) -> list[AgentResult]:
     """
     Topologically sort work_items by depends_on, then dispatch each to
@@ -171,6 +180,14 @@ def dispatch_work_items(
             present in this call's own work_items/results. Merged with
             results produced in this call (this call's own results take
             precedence for ids in both).
+        progress: Optional callback invoked as progress(item, index,
+            total) immediately before each item (1-based index) is
+            dispatched. Dispatch is strictly sequential and each
+            specialist call blocks on an LLM request that can take
+            anywhere from seconds to minutes — without this, a caller
+            driving a large batch (e.g. 20 WorkItems) has no visibility
+            into progress until the whole batch finishes. None (default)
+            disables progress reporting entirely.
 
     Raises:
         CycleError: propagated from topological_sort.
@@ -188,8 +205,11 @@ def dispatch_work_items(
         r.work_item_id: r for r in (known_results or [])
     }
 
+    total = len(ordered)
     results: list[AgentResult] = []
-    for item in ordered:
+    for index, item in enumerate(ordered, start=1):
+        if progress is not None:
+            progress(item, index, total)
         agent = registry[item.type]
         retry_failures = (retry_context or {}).get(item.id, [])
         dependency_context = build_dependency_context(item, results_by_id, run_dir)

@@ -7,7 +7,7 @@ free of validation logic — this module is the single place that knows
 what keys/types every part of the pipeline actually reads.
 """
 
-VALID_RESULT_FORMATS = {"junit", "jest_json"}
+VALID_RESULT_FORMATS = {"junit", "jest_json", "vitest_json"}
 VALID_PROVIDERS = {"chat_completions", "responses"}
 
 REQUIRED_TOP_LEVEL: dict[str, type] = {

@@ -20,6 +20,7 @@ from pipeline.master import MasterAgent
 from pipeline.config_validation import validate_config
 from pipeline.design import DesignAgent, DesignParseError
 from pipeline.dispatch import dispatch_work_items, CycleError
+from pipeline.instructions import write_instructions_md
 from pipeline.run_paths import append_index, create_run_dir, write_manifest
 from pipeline.state import AgentResult, FailReport, TestResult, WorkItem
 from pipeline.test_runner import TestRunner
@@ -53,6 +54,10 @@ def print_agent_result(result: AgentResult) -> None:
         print(f"    notes: {result.notes}")
 
 
+def _print_dispatch_progress(item: WorkItem, index: int, total: int) -> None:
+    print(f"  ⏳ [{index}/{total}] {item.id} ({item.type}) {item.title} — working...")
+
+
 def print_specialist_failures(results: list[AgentResult]) -> None:
     failures = [r for r in results if not r.success]
     if not failures:
@@ -82,7 +87,232 @@ def print_fail_report(report: FailReport) -> None:
     print("═" * 50)
 
 
+def run_pipeline(
+    config: dict,
+    *,
+    user_input: str | None = None,
+    work_items: list[WorkItem] | None = None,
+    label: str | None = None,
+) -> bool:
+    """
+    Run one full pipeline pass end-to-end (run-dir creation -> decompose
+    -> dispatch -> test/retry -> manifest finalize), driven either by a
+    raw free-text prompt (REPL path, routed through
+    DesignAgent.decompose) or a pre-built WorkItem list (e.g. an
+    ingestion tool — pipeline/ingest.py — that already called
+    DesignAgent.decompose_handoff()). Exactly one of user_input /
+    work_items must be given.
+
+    This is a pure extraction of the former REPL while-loop body in
+    main() — no behavioral change for the REPL path.
+
+    Args:
+        config: Loaded pipeline config (see load_config()).
+        user_input: Raw free-text prompt. Triggers design_agent.decompose().
+        work_items: Pre-built WorkItem list. Skips decompose() entirely
+            and dispatches these directly.
+        label: Human-readable label used for the run dir slug
+            (run_paths.create_run_dir) and the manifest's "prompt"
+            field. Defaults to user_input when user_input is given.
+            Required when work_items is given, since there's no raw
+            prompt string to derive it from.
+
+    Returns:
+        True if the run's tests ultimately passed, False otherwise
+        (DesignParseError, a dependency-cycle CycleError, or test
+        failures surviving all retries all count as False) — callers
+        can use this directly as a process exit-code signal.
+    """
+    if (user_input is None) == (work_items is None):
+        raise ValueError(
+            "run_pipeline requires exactly one of user_input or work_items"
+        )
+
+    if label is None:
+        if user_input is None:
+            raise ValueError("label is required when work_items is given")
+        label = user_input
+
+    master = MasterAgent(config)
+    design_agent = DesignAgent(config)
+    master.set_intent(label)
+
+    runs_dir_abs = os.path.join(PROJECT_ROOT, config["pipeline"]["runs_dir"])
+    run_dir = create_run_dir(runs_dir_abs, label)
+    print(f"\n📁 Run dir: {run_dir}\n")
+
+    manifest = {
+        "run_id": os.path.basename(run_dir),
+        "prompt": label,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "work_item_count": None,
+        "status": "in_progress",
+    }
+    write_manifest(run_dir, manifest)
+
+    if work_items is None:
+        print("🧠 Planning... (DesignAgent LLM call in progress, this can take a while)\n")
+        try:
+            work_items = design_agent.decompose(user_input)
+        except DesignParseError as e:
+            print(f"\n⚠️  DesignAgent failed to produce a valid plan: {e}\n")
+            manifest["status"] = "failed"
+            manifest["failure_reason"] = "design_parse_error"
+            manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+            write_manifest(run_dir, manifest)
+            append_index(runs_dir_abs, manifest)
+            write_instructions_md(
+                run_dir, config, [], [], None, "design_parse_error"
+            )
+            return False
+
+    manifest["work_item_count"] = len(work_items)
+    write_manifest(run_dir, manifest)
+
+    with open(os.path.join(run_dir, "design", "plan.json"), "w") as f:
+        json.dump([dataclasses.asdict(wi) for wi in work_items], f, indent=2)
+
+    print(f"✅ Plan ready: {len(work_items)} WorkItem(s) (see design/plan.json for full detail)\n")
+
+    print(f"🚀 Dispatching {len(work_items)} WorkItem(s)...\n")
+    try:
+        agent_results = dispatch_work_items(
+            work_items, config, run_dir, progress=_print_dispatch_progress
+        )
+    except CycleError as e:
+        print(f"\n⚠️  Dispatch failed — dependency cycle: {e}\n")
+        manifest["status"] = "failed"
+        manifest["failure_reason"] = "dispatch_cycle_error"
+        manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_manifest(run_dir, manifest)
+        append_index(runs_dir_abs, manifest)
+        write_instructions_md(
+            run_dir, config, work_items, [], None, "dispatch_cycle_error"
+        )
+        return False
+
+    print(f"Dispatch results ({len(agent_results)} agent(s) ran):\n")
+    for result in agent_results:
+        print_agent_result(result)
+    print_specialist_failures(agent_results)
+    print()
+
+    max_retries = config["pipeline"]["max_retries"]
+    test_runner = TestRunner()
+
+    current_work_items = work_items
+    all_agent_results: list[AgentResult] = list(agent_results)
+    test_result: TestResult = test_runner.run(config, work_items, run_dir)
+
+    attempt = 1
+    with open(
+        os.path.join(run_dir, "tests", "results", f"attempt-{attempt}.json"), "w"
+    ) as f:
+        json.dump(dataclasses.asdict(test_result), f, indent=2)
+
+    print(
+        f"Test run (attempt {attempt}): "
+        f"{test_result.total - test_result.failed}/{test_result.total} passed"
+    )
+    print()
+
+    while not test_result.passed and attempt < max_retries:
+        retry_context = master.map_failures_to_work_items(
+            test_result, all_agent_results, work_items
+        )
+        if not retry_context:
+            print("⚠️  Could not map any failures to WorkItems — stopping retries.\n")
+            break
+
+        current_work_items = [wi for wi in work_items if wi.id in retry_context]
+        attempt += 1
+
+        print(f"Retrying attempt {attempt} for WorkItems: "
+              f"{[wi.id for wi in current_work_items]}\n")
+
+        try:
+            retry_results = dispatch_work_items(
+                current_work_items, config, run_dir,
+                retry_context=retry_context, strict=False,
+                known_results=all_agent_results,
+                progress=_print_dispatch_progress,
+            )
+        except CycleError as e:
+            print(f"\n⚠️  Retry dispatch failed — dependency cycle: {e}\n")
+            break
+
+        print(f"Dispatch results ({len(retry_results)} agent(s) ran):\n")
+        for result in retry_results:
+            print_agent_result(result)
+        print_specialist_failures(retry_results)
+        print()
+
+        all_agent_results.extend(retry_results)
+
+        test_result = test_runner.run(config, work_items, run_dir)
+        with open(
+            os.path.join(run_dir, "tests", "results", f"attempt-{attempt}.json"), "w"
+        ) as f:
+            json.dump(dataclasses.asdict(test_result), f, indent=2)
+
+        print(
+            f"Test run (attempt {attempt}): "
+            f"{test_result.total - test_result.failed}/{test_result.total} passed"
+        )
+        print()
+
+    if test_result.passed:
+        print("✅ All tests passed.\n")
+        manifest["status"] = "passed"
+        manifest["attempts"] = attempt
+        manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_manifest(run_dir, manifest)
+        append_index(runs_dir_abs, manifest)
+        write_instructions_md(
+            run_dir, config, work_items, all_agent_results, test_result, "passed"
+        )
+        return True
+
+    # Recompute the mapping against the final failing test_result so
+    # "unresolved" reflects the WorkItems actually implicated by the
+    # last failure — not just whatever subset happened to be
+    # in-flight when the retry budget/mapping ran out (relevant
+    # when max_retries==1 and no retry loop iteration ever ran).
+    final_retry_context = master.map_failures_to_work_items(
+        test_result, all_agent_results, work_items
+    )
+    unresolved = sorted(final_retry_context) or [
+        wi.id for wi in current_work_items
+    ]
+    fail_report = master.build_fail_report(attempt, test_result, unresolved)
+    with open(
+        os.path.join(run_dir, "tests", "results", "fail_report.json"), "w"
+    ) as f:
+        json.dump(dataclasses.asdict(fail_report), f, indent=2)
+    print_fail_report(fail_report)
+    print()
+
+    manifest["status"] = "failed"
+    manifest["attempts"] = attempt
+    manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+    write_manifest(run_dir, manifest)
+    append_index(runs_dir_abs, manifest)
+    write_instructions_md(
+        run_dir, config, work_items, all_agent_results, test_result, "failed"
+    )
+    return False
+
+
 def main():
+    # Force line-buffered stdout: when stdout isn't a real TTY (piped,
+    # redirected, or run inside some wrapper/subprocess), Python defaults
+    # to full block-buffering, so progress prints (Planning.../dispatch
+    # "working..." lines) don't actually reach the terminal until the
+    # buffer fills or the process exits — they appear to "batch dump" at
+    # the end instead of streaming live. Forcing line-buffering here
+    # fixes that without needing flush=True on every individual print().
+    sys.stdout.reconfigure(line_buffering=True)
+
     config, config_path = load_config()
 
     errors = validate_config(config)
@@ -91,9 +321,6 @@ def main():
         for error in errors:
             print(f"  - {error}")
         sys.exit(1)
-
-    master = MasterAgent(config)
-    design_agent = DesignAgent(config)
 
     print("=" * 50)
     print("🤖 Agentic Pipeline Ready")
@@ -115,155 +342,7 @@ def main():
         if not user_input:
             continue
 
-        master.set_intent(user_input)
-
-        runs_dir_abs = os.path.join(PROJECT_ROOT, config["pipeline"]["runs_dir"])
-        run_dir = create_run_dir(runs_dir_abs, user_input)
-        print(f"\n📁 Run dir: {run_dir}\n")
-
-        manifest = {
-            "run_id": os.path.basename(run_dir),
-            "prompt": user_input,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "work_item_count": None,
-            "status": "in_progress",
-        }
-        write_manifest(run_dir, manifest)
-
-        try:
-            work_items = design_agent.decompose(user_input)
-        except DesignParseError as e:
-            print(f"\n⚠️  DesignAgent failed to produce a valid plan: {e}\n")
-            manifest["status"] = "failed"
-            manifest["failure_reason"] = "design_parse_error"
-            manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
-            write_manifest(run_dir, manifest)
-            append_index(runs_dir_abs, manifest)
-            continue
-
-        manifest["work_item_count"] = len(work_items)
-        write_manifest(run_dir, manifest)
-
-        with open(os.path.join(run_dir, "design", "plan.json"), "w") as f:
-            json.dump([dataclasses.asdict(wi) for wi in work_items], f, indent=2)
-
-        print(f"\nDesignAgent produced {len(work_items)} WorkItem(s):\n")
-        for item in work_items:
-            print_work_item(item)
-        print()
-
-        try:
-            agent_results = dispatch_work_items(work_items, config, run_dir)
-        except CycleError as e:
-            print(f"\n⚠️  Dispatch failed — dependency cycle: {e}\n")
-            manifest["status"] = "failed"
-            manifest["failure_reason"] = "dispatch_cycle_error"
-            manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
-            write_manifest(run_dir, manifest)
-            append_index(runs_dir_abs, manifest)
-            continue
-
-        print(f"Dispatch results ({len(agent_results)} agent(s) ran):\n")
-        for result in agent_results:
-            print_agent_result(result)
-        print_specialist_failures(agent_results)
-        print()
-
-        max_retries = config["pipeline"]["max_retries"]
-        test_runner = TestRunner()
-
-        current_work_items = work_items
-        all_agent_results: list[AgentResult] = list(agent_results)
-        test_result: TestResult = test_runner.run(config, work_items, run_dir)
-
-        attempt = 1
-        with open(
-            os.path.join(run_dir, "tests", "results", f"attempt-{attempt}.json"), "w"
-        ) as f:
-            json.dump(dataclasses.asdict(test_result), f, indent=2)
-
-        print(
-            f"Test run (attempt {attempt}): "
-            f"{test_result.total - test_result.failed}/{test_result.total} passed"
-        )
-        print()
-
-        while not test_result.passed and attempt < max_retries:
-            retry_context = master.map_failures_to_work_items(
-                test_result, all_agent_results, work_items
-            )
-            if not retry_context:
-                print("⚠️  Could not map any failures to WorkItems — stopping retries.\n")
-                break
-
-            current_work_items = [wi for wi in work_items if wi.id in retry_context]
-            attempt += 1
-
-            print(f"Retrying attempt {attempt} for WorkItems: "
-                  f"{[wi.id for wi in current_work_items]}\n")
-
-            try:
-                retry_results = dispatch_work_items(
-                    current_work_items, config, run_dir,
-                    retry_context=retry_context, strict=False,
-                    known_results=all_agent_results,
-                )
-            except CycleError as e:
-                print(f"\n⚠️  Retry dispatch failed — dependency cycle: {e}\n")
-                break
-
-            print(f"Dispatch results ({len(retry_results)} agent(s) ran):\n")
-            for result in retry_results:
-                print_agent_result(result)
-            print_specialist_failures(retry_results)
-            print()
-
-            all_agent_results.extend(retry_results)
-
-            test_result = test_runner.run(config, work_items, run_dir)
-            with open(
-                os.path.join(run_dir, "tests", "results", f"attempt-{attempt}.json"), "w"
-            ) as f:
-                json.dump(dataclasses.asdict(test_result), f, indent=2)
-
-            print(
-                f"Test run (attempt {attempt}): "
-                f"{test_result.total - test_result.failed}/{test_result.total} passed"
-            )
-            print()
-
-        if test_result.passed:
-            print("✅ All tests passed.\n")
-            manifest["status"] = "passed"
-            manifest["attempts"] = attempt
-            manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
-            write_manifest(run_dir, manifest)
-            append_index(runs_dir_abs, manifest)
-        else:
-            # Recompute the mapping against the final failing test_result so
-            # "unresolved" reflects the WorkItems actually implicated by the
-            # last failure — not just whatever subset happened to be
-            # in-flight when the retry budget/mapping ran out (relevant
-            # when max_retries==1 and no retry loop iteration ever ran).
-            final_retry_context = master.map_failures_to_work_items(
-                test_result, all_agent_results, work_items
-            )
-            unresolved = sorted(final_retry_context) or [
-                wi.id for wi in current_work_items
-            ]
-            fail_report = master.build_fail_report(attempt, test_result, unresolved)
-            with open(
-                os.path.join(run_dir, "tests", "results", "fail_report.json"), "w"
-            ) as f:
-                json.dump(dataclasses.asdict(fail_report), f, indent=2)
-            print_fail_report(fail_report)
-            print()
-
-            manifest["status"] = "failed"
-            manifest["attempts"] = attempt
-            manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
-            write_manifest(run_dir, manifest)
-            append_index(runs_dir_abs, manifest)
+        run_pipeline(config, user_input=user_input)
 
 
 if __name__ == "__main__":
