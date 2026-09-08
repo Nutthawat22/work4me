@@ -6,6 +6,7 @@ Config, Test) delegate to run_specialist() instead of duplicating the
 LLM-call + parse + write logic.
 """
 
+import json
 import os
 import re
 
@@ -136,7 +137,10 @@ def run_specialist(
         {"role": "user", "content": user_content},
     ]
 
-    raw = call_llm(messages, model, config, provider=provider)
+    raw = call_llm(
+        messages, model, config, provider=provider,
+        session_scope={"project": os.path.basename(run_dir.rstrip(os.sep)), "role": "specialist"},
+    )
 
     if raw.startswith(f"[{model}] Error:"):
         return AgentResult(
@@ -171,5 +175,141 @@ def run_specialist(
         agent_name=agent_name,
         success=True,
         files_written=[relative_path],
+        notes="",
+    )
+
+
+def run_multifile_specialist(
+    work_item: WorkItem,
+    config: dict,
+    run_dir: str,
+    system_prompt: str,
+    agent_name: str,
+    subdir_key: str,
+    retry_failures: list[TestFailure] | None = None,
+    dependency_context: dict[str, str] | None = None,
+) -> AgentResult:
+    """
+    Multi-file variant of run_specialist for the scaffold/integrate
+    specialists.
+
+    Unlike run_specialist (one WorkItem -> exactly one output file), the
+    scaffold and integrate stages each need to emit a whole set of files
+    at once: scaffold produces the project skeleton + shared foundation
+    (package.json, tsconfig.json, .gitignore, db/config/shared-types
+    modules), and integrate produces the composition/wiring files (server
+    entry point, frontend app shell, aggregation/index files). Rather than
+    forcing one file per WorkItem, this helper expects the LLM to return a
+    JSON object mapping relative file paths to complete file contents:
+
+        {"files": {"package.json": "...", "src/server/index.ts": "..."}}
+
+    A bare {path: content} object (no "files" wrapper) is also accepted.
+    Every file is written under run_dir/{subdir}/{path}, and all relative
+    paths are collected into the returned AgentResult.files_written.
+
+    Args mirror run_specialist exactly. The system_prompt is expected to
+    already instruct the model to output the {"files": {...}} shape; it is
+    still `.format(language=...)`-ed here for consistency (a no-op if the
+    prompt is already fully formatted).
+
+    Returns:
+        AgentResult with success=True and files_written populated on
+        success, or success=False and notes describing the failure
+        (LLM error, JSON parse error, wrong shape, or write error).
+    """
+    model_cfg = config["models"]["specialist"]
+    model = model_cfg["model"]
+    provider = model_cfg["provider"]
+    # .replace (not .format): the prompt contains literal JSON braces ({"files": ...}) that str.format would choke on.
+    formatted_system_prompt = system_prompt.replace("{language}", work_item.language)
+    user_content = (
+        f"Title: {work_item.title}\n"
+        f"Language: {work_item.language}\n"
+        f"Description: {work_item.description}\n"
+        f"Acceptance criteria:\n"
+        + "\n".join(f"- {c}" for c in work_item.acceptance_criteria)
+        + f"\nOutput path: {work_item.output_path}"
+    )
+    if retry_failures:
+        user_content += _build_retry_section(retry_failures)
+    if dependency_context:
+        user_content += _build_dependency_section(dependency_context)
+    messages = [
+        {"role": "system", "content": formatted_system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+    raw = call_llm(
+        messages, model, config, provider=provider,
+        session_scope={"project": os.path.basename(run_dir.rstrip(os.sep)), "role": "specialist"},
+    )
+
+    if raw.startswith(f"[{model}] Error:"):
+        return AgentResult(
+            work_item_id=work_item.id,
+            agent_name=agent_name,
+            success=False,
+            files_written=[],
+            notes=raw,
+        )
+
+    content = _strip_code_fences(raw)
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        return AgentResult(
+            work_item_id=work_item.id,
+            agent_name=agent_name,
+            success=False,
+            files_written=[],
+            notes=f"Failed to parse multi-file JSON response: {e}\nRaw response: {raw}",
+        )
+
+    if isinstance(parsed, dict) and "files" in parsed:
+        files = parsed["files"]
+    else:
+        files = parsed
+
+    if not isinstance(files, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in files.items()
+    ):
+        return AgentResult(
+            work_item_id=work_item.id,
+            agent_name=agent_name,
+            success=False,
+            files_written=[],
+            notes=(
+                "Multi-file response has wrong shape — expected "
+                '{"files": {path: content}} or {path: content} with string '
+                f"values.\nRaw response: {raw}"
+            ),
+        )
+
+    subdir = config["pipeline"][subdir_key]
+    files_written: list[str] = []
+    for path, file_content in files.items():
+        relative_path = os.path.join(subdir, path)
+        full_path = os.path.join(run_dir, subdir, path)
+        try:
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write(file_content)
+        except OSError as e:
+            return AgentResult(
+                work_item_id=work_item.id,
+                agent_name=agent_name,
+                success=False,
+                files_written=[],
+                notes=f"Failed to write file at {full_path}: {e}",
+            )
+        files_written.append(relative_path)
+
+    return AgentResult(
+        work_item_id=work_item.id,
+        agent_name=agent_name,
+        success=True,
+        files_written=files_written,
         notes="",
     )

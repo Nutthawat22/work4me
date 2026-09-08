@@ -33,6 +33,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from pipeline.config_validation import validate_config
 from pipeline.design import DesignAgent, DesignParseError
+from pipeline.file_manifest import FileManifestParseError
 from pipeline.runner import load_config, run_pipeline
 
 MANIFEST_FILENAME = "MANIFEST.sha256"
@@ -223,6 +224,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "(design_text — the full technical design doc — is always included).",
     )
     parser.add_argument(
+        "--mode",
+        choices=["handoff", "manifest"],
+        default="handoff",
+        help="Decomposition mode. 'handoff' (default): translate the "
+        "design's authored Work Packages into WorkItems via "
+        "decompose_handoff() (unchanged existing behavior). 'manifest': "
+        "decompose into features, plan a file-indexed manifest, group into "
+        "work items, then run the pipeline.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Assemble design_text/requirements_text and run manifest "
@@ -308,9 +319,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dry_run:
         print("─" * 50)
-        print("DRY RUN — stopping before decompose_handoff()/any LLM call.")
+        if args.mode == "manifest":
+            print("DRY RUN (manifest mode) — stopping before "
+                  "decompose_features()/any LLM call.")
+        else:
+            print("DRY RUN — stopping before decompose_handoff()/any LLM call.")
         print("─" * 50)
         print()
+        if args.mode == "manifest":
+            print("Mode: manifest (features → file manifest → groups → work items).")
+            print()
         print("design_text preview (first 1000 chars):")
         print(design_text[:1000])
         if len(design_text) > 1000:
@@ -334,13 +352,41 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     design_agent = DesignAgent(config)
+
+    label_base = os.path.basename(package_dir.rstrip(os.sep))
+
+    if args.mode == "manifest":
+        from pipeline.file_manifest import (
+            file_groups_to_work_items,
+            group_into_work_items,
+            plan_file_manifest,
+        )
+
+        try:
+            print("🧩 Decomposing into features...")
+            features = design_agent.decompose_features(design_text, requirements_text)
+            print(f"   → {len(features)} feature(s)")
+            print("🗂️  Planning file manifest...")
+            manifest = plan_file_manifest(features, config)
+            print(f"   → {len(manifest.files)} file(s)")
+            groups = group_into_work_items(manifest)
+            print(f"   → {len(groups)} group(s)")
+            work_items = file_groups_to_work_items(groups, manifest)
+        except (DesignParseError, FileManifestParseError) as e:
+            print(f"⚠️  manifest planning failed to produce a valid plan: {e}")
+            return 1
+
+        label = f"manifest-{label_base}"
+        passed = run_pipeline(config, work_items=work_items, label=label)
+        return 0 if passed else 1
+
     try:
         work_items = design_agent.decompose_handoff(design_text, requirements_text)
     except DesignParseError as e:
         print(f"⚠️  decompose_handoff() failed to produce a valid plan: {e}")
         return 1
 
-    label = f"handoff-{os.path.basename(package_dir.rstrip(os.sep))}"
+    label = f"handoff-{label_base}"
     passed = run_pipeline(config, work_items=work_items, label=label)
     return 0 if passed else 1
 

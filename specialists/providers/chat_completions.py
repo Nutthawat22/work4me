@@ -15,6 +15,7 @@ def chat_completions_call(
     config: dict[str, Any],
     timeout: int = 60,
     response_schema: Optional[dict[str, Any]] = None,
+    session_scope: Optional[dict] = None,
 ) -> str:
     """
     Send a chat-completions request to the configured LiteLLM proxy.
@@ -32,6 +33,11 @@ def chat_completions_call(
             response_schema, kept symmetric across both adapters even
             though today's config only routes through the "responses"
             provider. None (default) sends no format constraint.
+        session_scope: Accepted-but-ignored. This is a stateless HTTP call
+            with no session/conversation concept — the kwarg exists purely
+            so llm_client.py can call every registered provider with the
+            same signature (see specialists/providers/acp_client.py, the
+            only adapter that actually uses it).
 
     Returns:
         The assistant's response content string, or a formatted error string

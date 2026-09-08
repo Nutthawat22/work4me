@@ -4,3 +4,4 @@ requirements/
 app/
 __pycache__/
 .cachebro
+spike/venv/

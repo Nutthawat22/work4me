@@ -11,7 +11,11 @@ from typing import Callable
 
 from pipeline.state import AgentResult, TestFailure, WorkItem
 from specialists.config import ConfigAgent
+from specialists.feature import FeatureAgent
+from specialists.integrate import IntegrationAgent
 from specialists.logic import LogicAgent
+from specialists.scaffold import ScaffoldAgent
+from specialists.shared import SharedAgent
 from specialists.test_writer import TestAgent
 from specialists.ui import UIAgent
 
@@ -26,6 +30,11 @@ DispatchProgressCallback = Callable[[WorkItem, int, int], None]
 # WorkItem's prompt — avoids blowing up context on deeply-chained items.
 MAX_DEPENDENCY_FILES_SHOWN = 5
 MAX_DEPENDENCY_FILE_CHARS = 3000
+
+# Integration items must wire together EVERY feature module, so they need
+# the signatures/exports of ALL their dependencies (not truncated to the
+# first few) and more of each file's content than a normal dependent item.
+MAX_INTEGRATE_DEPENDENCY_FILE_CHARS = 12000
 
 
 class CycleError(Exception):
@@ -98,6 +107,7 @@ def _read_dependency_content(
     dep_id: str,
     result: AgentResult,
     run_dir: str,
+    max_chars: int = MAX_DEPENDENCY_FILE_CHARS,
 ) -> str | None:
     """Read (and truncate) the file content a dependency WorkItem wrote.
 
@@ -113,8 +123,8 @@ def _read_dependency_content(
             content = f.read()
     except OSError:
         return None
-    if len(content) > MAX_DEPENDENCY_FILE_CHARS:
-        content = content[:MAX_DEPENDENCY_FILE_CHARS] + "\n... (truncated)"
+    if len(content) > max_chars:
+        content = content[:max_chars] + "\n... (truncated)"
     return content
 
 
@@ -129,14 +139,23 @@ def build_dependency_context(
     Missing/failed/unreadable dependencies are noted inline rather than
     omitted silently, and the total number of dependency files shown is
     capped at MAX_DEPENDENCY_FILES_SHOWN.
+
+    Exception: "integrate" and "shared" items must wire together MULTIPLE
+    feature modules, so for them the file cap does NOT apply (all
+    depends_on are iterated) and each file is truncated at the larger
+    MAX_INTEGRATE_DEPENDENCY_FILE_CHARS limit.
     """
+    is_wiring = item.type in ("integrate", "shared")
+    dep_ids = item.depends_on if is_wiring else item.depends_on[:MAX_DEPENDENCY_FILES_SHOWN]
+    max_chars = MAX_INTEGRATE_DEPENDENCY_FILE_CHARS if is_wiring else MAX_DEPENDENCY_FILE_CHARS
+
     context: dict[str, str] = {}
-    for dep_id in item.depends_on[:MAX_DEPENDENCY_FILES_SHOWN]:
+    for dep_id in dep_ids:
         result = results_by_id.get(dep_id)
         if result is None:
             context[dep_id] = f"(dependency {dep_id} unavailable — not yet dispatched)"
             continue
-        content = _read_dependency_content(dep_id, result, run_dir)
+        content = _read_dependency_content(dep_id, result, run_dir, max_chars=max_chars)
         if content is None:
             reason = "specialist failed" if not result.success else "file unreadable"
             context[dep_id] = f"(dependency {dep_id} unavailable — {reason})"
@@ -199,6 +218,10 @@ def dispatch_work_items(
         "ui": UIAgent(),
         "config": ConfigAgent(),
         "test": TestAgent(),
+        "scaffold": ScaffoldAgent(),
+        "integrate": IntegrationAgent(),
+        "feature": FeatureAgent(),
+        "shared": SharedAgent(),
     }
 
     results_by_id: dict[str, AgentResult] = {

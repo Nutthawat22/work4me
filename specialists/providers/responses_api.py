@@ -15,6 +15,7 @@ def responses_call(
     config: dict[str, Any],
     timeout: int = 60,
     response_schema: Optional[dict[str, Any]] = None,
+    session_scope: Optional[dict] = None,
 ) -> str:
     """
     Send a Responses API request to the configured LiteLLM proxy.
@@ -36,6 +37,11 @@ def responses_call(
             array" failure mode entirely rather than just reducing its
             likelihood. None (default) sends no format constraint, same
             as before this parameter existed.
+        session_scope: Accepted-but-ignored. This is a stateless HTTP call
+            with no session/conversation concept — the kwarg exists purely
+            so llm_client.py can call every registered provider with the
+            same signature (see specialists/providers/acp_client.py, the
+            only adapter that actually uses it).
 
     Returns:
         The assistant's response content string, or a formatted error string
