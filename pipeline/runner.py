@@ -16,9 +16,8 @@ from datetime import datetime, timezone
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from pipeline.master import MasterAgent
+from pipeline.master import MasterAgent, MasterPlanError
 from pipeline.config_validation import validate_config
-from pipeline.design import DesignAgent, DesignParseError
 from pipeline.dispatch import dispatch_work_items, CycleError
 from pipeline.instructions import write_instructions_md
 from pipeline.run_paths import append_index, create_run_dir, write_manifest
@@ -99,17 +98,17 @@ def run_pipeline(
     Run one full pipeline pass end-to-end (run-dir creation -> decompose
     -> dispatch -> test/retry -> manifest finalize), driven either by a
     raw free-text prompt (REPL path, routed through
-    DesignAgent.decompose) or a pre-built WorkItem list (e.g. an
+    MasterAgent.decompose) or a pre-built WorkItem list (e.g. an
     ingestion tool — pipeline/ingest.py — that already called
-    DesignAgent.decompose_handoff()). Exactly one of user_input /
-    work_items must be given.
+    MasterAgent.plan_handoff()). Exactly one of user_input / work_items
+    must be given.
 
     This is a pure extraction of the former REPL while-loop body in
     main() — no behavioral change for the REPL path.
 
     Args:
         config: Loaded pipeline config (see load_config()).
-        user_input: Raw free-text prompt. Triggers design_agent.decompose().
+        user_input: Raw free-text prompt. Triggers master.decompose().
         work_items: Pre-built WorkItem list. Skips decompose() entirely
             and dispatches these directly.
         label: Human-readable label used for the run dir slug
@@ -120,7 +119,7 @@ def run_pipeline(
 
     Returns:
         True if the run's tests ultimately passed, False otherwise
-        (DesignParseError, a dependency-cycle CycleError, or test
+        (MasterPlanError, a dependency-cycle CycleError, or test
         failures surviving all retries all count as False) — callers
         can use this directly as a process exit-code signal.
     """
@@ -150,13 +149,12 @@ def _run_pipeline_body(
     The actual run_pipeline() body, extracted so run_pipeline() can wrap
     it in a try/finally that unconditionally tears down the ACP session
     pool (specialists.providers.acp_client) on every exit path — success,
-    test-failure, DesignParseError, or CycleError — without needing to
+    test-failure, MasterPlanError, or CycleError — without needing to
     duplicate the teardown call at each early return. See run_pipeline()
     for the public contract; this function's behavior/return value is
     identical to the pre-extraction run_pipeline() body.
     """
     master = MasterAgent(config)
-    design_agent = DesignAgent(config)
     master.set_intent(label)
 
     runs_dir_abs = os.path.join(PROJECT_ROOT, config["pipeline"]["runs_dir"])
@@ -173,11 +171,11 @@ def _run_pipeline_body(
     write_manifest(run_dir, manifest)
 
     if work_items is None:
-        print("🧠 Planning... (DesignAgent LLM call in progress, this can take a while)\n")
+        print("🧠 Planning... (MasterAgent LLM call in progress, this can take a while)\n")
         try:
-            work_items = design_agent.decompose(user_input)
-        except DesignParseError as e:
-            print(f"\n⚠️  DesignAgent failed to produce a valid plan: {e}\n")
+            work_items = master.decompose(user_input)
+        except MasterPlanError as e:
+            print(f"\n⚠️  MasterAgent failed to produce a valid plan: {e}\n")
             manifest["status"] = "failed"
             manifest["failure_reason"] = "design_parse_error"
             manifest["finished_at"] = datetime.now(timezone.utc).isoformat()

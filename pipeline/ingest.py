@@ -3,12 +3,12 @@ pipeline/ingest.py
 
 Non-interactive entry point that feeds a structured requirements-handoff
 package (e.g. requirements/cra-approval-system-handoff/) into the
-pipeline, driving DesignAgent.decompose_handoff() and then
+pipeline, driving MasterAgent.plan_handoff() and then
 runner.run_pipeline() without any REPL/input() interaction.
 
 See ~/dev-plans/agents/analysis/2026-09-04-cra-handoff-capability-audit.md
-for the gap analysis this implements, and pipeline/design.py's
-decompose_handoff() docstring for what design_text/requirements_text it
+for the gap analysis this implements, and pipeline/master.py's
+plan_handoff() docstring for what design_text/requirements_text it
 expects.
 
 Usage:
@@ -32,7 +32,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from pipeline.config_validation import validate_config
-from pipeline.design import DesignAgent, DesignParseError
+from pipeline.master import MasterAgent, MasterPlanError
 from pipeline.file_manifest import FileManifestParseError
 from pipeline.runner import load_config, run_pipeline
 
@@ -43,7 +43,9 @@ REQUIREMENTS_ROOT = os.path.join(PROJECT_ROOT, "requirements")
 
 # NOTE (2026-09-04, post-run-0007 finding): this tool used to extract only
 # Sections 16/19/20 (Tests, Work Packages, Traceability) from
-# 04-technical-design.md and feed that excerpt to decompose_handoff().
+# 04-technical-design.md and feed that excerpt to what was then
+# DesignAgent.decompose_handoff() (since renamed to
+# MasterAgent.plan_handoff() — see pipeline/master.py).
 # That silently dropped Section 7 (Component Design — the ONLY place
 # CMP-001 "React Web Client" and CMP-002 "Express/Bun HTTP Adapter" are
 # actually defined), so the LLM saw bare "CMP-001"/"CMP-002" labels with
@@ -132,7 +134,7 @@ def build_design_spec(package_dir: str, include_requirements: bool) -> tuple[str
     see module-level NOTE above for why this is no longer excerpted to
     just Sections 16/19/20), and optionally load 02-requirements.md in
     full as requirements_text — matching what
-    DesignAgent.decompose_handoff() expects (see its docstring).
+    MasterAgent.plan_handoff() expects (see its docstring).
 
     Returns:
         (design_text, requirements_text_or_None)
@@ -196,7 +198,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=(
             "Non-interactively feed a requirements-handoff package "
             "(e.g. requirements/cra-approval-system-handoff/) into the "
-            "pipeline via DesignAgent.decompose_handoff()."
+            "pipeline via MasterAgent.plan_handoff()."
         )
     )
     parser.add_argument(
@@ -227,9 +229,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mode",
         choices=["handoff", "manifest"],
         default="handoff",
-        help="Decomposition mode. 'handoff' (default): translate the "
-        "design's authored Work Packages into WorkItems via "
-        "decompose_handoff() (unchanged existing behavior). 'manifest': "
+        help="Decomposition mode. 'handoff' (default): plan the design's "
+        "scope into WorkItems via plan_handoff() (dynamic team "
+        "composition — see pipeline/master.py). 'manifest': "
         "decompose into features, plan a file-indexed manifest, group into "
         "work items, then run the pipeline.",
     )
@@ -238,14 +240,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Assemble design_text/requirements_text and run manifest "
         "verification (if enabled), then print a summary and exit "
-        "WITHOUT calling decompose_handoff() or making any LLM call.",
+        "WITHOUT calling plan_handoff() or making any LLM call.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     # See pipeline/runner.py's main() for why this is needed: without it,
-    # progress output (manifest checks, DesignAgent/dispatch progress
+    # progress output (manifest checks, MasterAgent/dispatch progress
     # printed inside run_pipeline) can sit in a full stdout buffer and
     # only appear once the whole process finishes, instead of streaming
     # live — especially likely here since this entry point is often run
@@ -323,7 +325,7 @@ def main(argv: list[str] | None = None) -> int:
             print("DRY RUN (manifest mode) — stopping before "
                   "decompose_features()/any LLM call.")
         else:
-            print("DRY RUN — stopping before decompose_handoff()/any LLM call.")
+            print("DRY RUN — stopping before plan_handoff()/any LLM call.")
         print("─" * 50)
         print()
         if args.mode == "manifest":
@@ -351,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {error}")
         return 1
 
-    design_agent = DesignAgent(config)
+    master = MasterAgent(config)
 
     label_base = os.path.basename(package_dir.rstrip(os.sep))
 
@@ -364,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             print("🧩 Decomposing into features...")
-            features = design_agent.decompose_features(design_text, requirements_text)
+            features = master.decompose_features(design_text, requirements_text)
             print(f"   → {len(features)} feature(s)")
             print("🗂️  Planning file manifest...")
             manifest = plan_file_manifest(features, config)
@@ -372,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
             groups = group_into_work_items(manifest)
             print(f"   → {len(groups)} group(s)")
             work_items = file_groups_to_work_items(groups, manifest)
-        except (DesignParseError, FileManifestParseError) as e:
+        except (MasterPlanError, FileManifestParseError) as e:
             print(f"⚠️  manifest planning failed to produce a valid plan: {e}")
             return 1
 
@@ -381,9 +383,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if passed else 1
 
     try:
-        work_items = design_agent.decompose_handoff(design_text, requirements_text)
-    except DesignParseError as e:
-        print(f"⚠️  decompose_handoff() failed to produce a valid plan: {e}")
+        work_items = master.plan_handoff(design_text, requirements_text)
+    except MasterPlanError as e:
+        print(f"⚠️  plan_handoff() failed to produce a valid plan: {e}")
         return 1
 
     label = f"handoff-{label_base}"

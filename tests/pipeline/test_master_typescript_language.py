@@ -1,16 +1,17 @@
 """
-tests/pipeline/test_design_typescript_language.py
+tests/pipeline/test_master_typescript_language.py
 
 HO-4 known-issue verification (no live LLM calls): confirms that once
 "typescript" is registered in config["languages"] (as this handoff adds
-to config.example.json), DesignAgent._validate_and_build resolves
+to config.example.json), MasterAgent._validate_and_build resolves
 WorkItems with language="typescript" successfully, and that
-DesignAgent.decompose_handoff's system prompt correctly lists
-"typescript" as a valid language once it's present in the config.
+MasterAgent.plan_handoff's system prompt correctly lists "typescript" as
+a valid language once it's present in the config.
 
-Prior to this handoff, DesignAgent.decompose_handoff() would raise
-DesignParseError for language="typescript" because config.example.json
-had no such entry (see pipeline/design.py module docstring / HO-2's
+Prior to this handoff, MasterAgent.plan_handoff() (then
+DesignAgent.decompose_handoff()) would raise MasterPlanError (then
+DesignParseError) for language="typescript" because config.example.json
+had no such entry (see pipeline/master.py module docstring / HO-2's
 documented known issue). This test hand-crafts an LLM JSON response and
 feeds it directly to _validate_and_build — it never calls the real LLM.
 """
@@ -24,7 +25,7 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_ROOT)
 
-from pipeline.design import DesignAgent, DesignParseError, HANDOFF_SYSTEM_PROMPT_TEMPLATE
+from pipeline.master import MasterAgent, MasterPlanError, PLAN_HANDOFF_SYSTEM_PROMPT_TEMPLATE
 
 
 def load_real_example_config() -> dict:
@@ -76,7 +77,7 @@ class TestTypescriptResolvesAgainstUpdatedConfig:
         config = load_real_example_config()
         valid_languages = set(config["languages"].keys())
 
-        work_items = DesignAgent._validate_and_build(
+        work_items = MasterAgent._validate_and_build(
             MOCK_HANDOFF_LLM_RESPONSE, valid_languages
         )
 
@@ -94,8 +95,8 @@ class TestTypescriptResolvesAgainstUpdatedConfig:
         """
         valid_languages = {"python", "javascript"}  # pre-HO-4 config shape
 
-        with pytest.raises(DesignParseError, match="invalid language 'typescript'"):
-            DesignAgent._validate_and_build(MOCK_HANDOFF_LLM_RESPONSE, valid_languages)
+        with pytest.raises(MasterPlanError, match="invalid language 'typescript'"):
+            MasterAgent._validate_and_build(MOCK_HANDOFF_LLM_RESPONSE, valid_languages)
 
 
 class TestHandoffSystemPromptListsTypescript:
@@ -103,7 +104,7 @@ class TestHandoffSystemPromptListsTypescript:
         config = load_real_example_config()
         valid_languages = set(config["languages"].keys())
 
-        system_prompt = HANDOFF_SYSTEM_PROMPT_TEMPLATE.format(
+        system_prompt = PLAN_HANDOFF_SYSTEM_PROMPT_TEMPLATE.format(
             valid_languages=", ".join(sorted(valid_languages))
         )
 

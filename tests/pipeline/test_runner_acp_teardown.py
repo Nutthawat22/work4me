@@ -3,7 +3,7 @@ tests/pipeline/test_runner_acp_teardown.py
 
 Confirms pipeline/runner.py::run_pipeline() calls
 specialists.providers.acp_client.teardown() exactly once at the end of
-every run, regardless of which exit path is taken (DesignParseError,
+every run, regardless of which exit path is taken (MasterPlanError,
 CycleError, test-failure, or success). No real LLM/subprocess/test-suite
 work happens here — every collaborator run_pipeline() calls is mocked or
 stubbed so each test isolates the exit path under test.
@@ -18,7 +18,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, REPO_ROOT)
 
 from pipeline import runner
-from pipeline.design import DesignParseError
+from pipeline.master import MasterPlanError
 from pipeline.dispatch import CycleError
 from pipeline.state import TestResult as PipelineTestResult
 
@@ -50,8 +50,8 @@ def teardown_spy(monkeypatch):
 
 def test_teardown_called_on_design_parse_error(tmp_path, monkeypatch, teardown_spy):
     monkeypatch.setattr(
-        "pipeline.design.DesignAgent.decompose",
-        lambda self, user_prompt: (_ for _ in ()).throw(DesignParseError("bad plan")),
+        "pipeline.master.MasterAgent.decompose",
+        lambda self, user_prompt: (_ for _ in ()).throw(MasterPlanError("bad plan")),
     )
 
     result = runner.run_pipeline(_config(tmp_path), user_input="build a thing")

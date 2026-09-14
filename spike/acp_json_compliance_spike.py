@@ -3,7 +3,7 @@ spike/acp_json_compliance_spike.py
 
 Phase 0 GATING spike (see design doc:
 dev-plans/agents/features/2026-09-14-acp-native-master-architecture.md).
-Standalone, throwaway. Does NOT modify acp_client.py, design.py, or any
+Standalone, throwaway. Does NOT modify acp_client.py, master.py, or any
 other spike file.
 
 Measures the REAL JSON schema-compliance rate of ACP's prompt-only
@@ -25,21 +25,21 @@ that's what this spike targets.
 Reuses, unmodified:
   - acp_call() / AcpSessionPool (_POOL) / teardown() from
     specialists/providers/acp_client.py.
-  - pipeline.design's REAL WorkItem/Feature response schemas
+  - pipeline.master's REAL WorkItem/Feature response schemas
     (_build_work_items_response_schema, _build_features_response_schema),
     system prompt templates (SYSTEM_PROMPT_TEMPLATE,
     FEATURES_SYSTEM_PROMPT_TEMPLATE), and parse/validate static methods
-    (DesignAgent._parse_json/_validate_and_build,
-    DesignAgent._parse_features_json/_validate_and_build_features) --
-    imported directly since pipeline/design.py imports cleanly without
+    (MasterAgent._parse_json/_validate_and_build,
+    MasterAgent._parse_features_json/_validate_and_build_features) --
+    imported directly since pipeline/master.py imports cleanly without
     needing a live config at import time. (Its import chain does trigger
     specialists/providers/acp_client.py's `import acp`, so this script
     must be run with spike/venv's interpreter, which has
     agent-client-protocol installed -- see Run instructions below.)
 
 For each of 2 representative schemas (WorkItem array via
-DesignAgent.decompose()'s schema, Feature array via
-DesignAgent.decompose_features()'s schema), runs N_TRIALS trials
+MasterAgent.decompose()'s schema, Feature array via
+MasterAgent.decompose_features()'s schema), runs N_TRIALS trials
 against claude-sonnet-5 over ACP:
 
   1st attempt: acp_call(..., response_schema=<real schema>) with a
@@ -81,17 +81,17 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-# pipeline/design.py and specialists/providers/acp_client.py live at the
+# pipeline/master.py and specialists/providers/acp_client.py live at the
 # repo root (one level up from spike/); add it to sys.path so this
-# script can `import pipeline.design` / `import specialists.providers...`
+# script can `import pipeline.master` / `import specialists.providers...`
 # regardless of the cwd it's invoked from.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from pipeline.design import (  # noqa: E402
-    DesignAgent,
-    DesignParseError,
+from pipeline.master import (  # noqa: E402
+    MasterAgent,
+    MasterPlanError,
     FEATURES_SYSTEM_PROMPT_TEMPLATE,
     SYSTEM_PROMPT_TEMPLATE,
     _build_features_response_schema,
@@ -157,12 +157,12 @@ class TrialResult:
 
 def _attempt_work_items(raw: str, valid_languages: set[str]) -> tuple[bool, bool, str | None]:
     try:
-        parsed = DesignAgent._parse_json(raw)
-    except DesignParseError as e:
+        parsed = MasterAgent._parse_json(raw)
+    except MasterPlanError as e:
         return False, False, f"PARSE_ERROR: {e}"
     try:
-        DesignAgent._validate_and_build(parsed, valid_languages)
-    except DesignParseError as e:
+        MasterAgent._validate_and_build(parsed, valid_languages)
+    except MasterPlanError as e:
         return True, False, f"VALIDATE_ERROR: {e}"
     except Exception as e:  # defensive -- unexpected shape (e.g. non-dict items)
         return True, False, f"VALIDATE_ERROR (unexpected {type(e).__name__}): {e}"
@@ -171,12 +171,12 @@ def _attempt_work_items(raw: str, valid_languages: set[str]) -> tuple[bool, bool
 
 def _attempt_features(raw: str, valid_languages: set[str]) -> tuple[bool, bool, str | None]:
     try:
-        parsed = DesignAgent._parse_features_json(raw)
-    except DesignParseError as e:
+        parsed = MasterAgent._parse_features_json(raw)
+    except MasterPlanError as e:
         return False, False, f"PARSE_ERROR: {e}"
     try:
-        DesignAgent._validate_and_build_features(parsed, valid_languages)
-    except DesignParseError as e:
+        MasterAgent._validate_and_build_features(parsed, valid_languages)
+    except MasterPlanError as e:
         return True, False, f"VALIDATE_ERROR: {e}"
     except Exception as e:
         return True, False, f"VALIDATE_ERROR (unexpected {type(e).__name__}): {e}"
@@ -343,7 +343,7 @@ def main() -> None:
 
     all_results: dict[str, list[TrialResult]] = {}
 
-    print("--- Schema 1: WorkItem array (DesignAgent.decompose()'s schema) ---")
+    print("--- Schema 1: WorkItem array (MasterAgent.decompose()'s schema) ---")
     all_results["work_items"] = run_schema_trials(
         "work_items", config, valid_languages,
         work_items_system_prompt, WORKITEM_USER_PROMPT,
@@ -351,7 +351,7 @@ def main() -> None:
     )
 
     print()
-    print("--- Schema 2: Feature array (DesignAgent.decompose_features()'s schema) ---")
+    print("--- Schema 2: Feature array (MasterAgent.decompose_features()'s schema) ---")
     all_results["features"] = run_schema_trials(
         "features", config, valid_languages,
         features_system_prompt, FEATURES_USER_PROMPT,

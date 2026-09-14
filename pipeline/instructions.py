@@ -8,8 +8,9 @@ the actual files written to run_dir/{output_dir} (looking for a
 recognized dependency manifest and reading its "scripts"/entry point) so
 the commands given are concrete and copy-pasteable, not a generic report.
 
-UPDATE (2026-09-04, post-run-0008 finding): pipeline/design.py's
-RUNNABILITY rule used to ask for a single "[ASSEMBLY]" WorkItem to
+UPDATE (2026-09-04, post-run-0008 finding): the planning system prompt's
+(then pipeline/design.py's, now pipeline/master.py's) RUNNABILITY rule
+used to ask for a single "[ASSEMBLY]" WorkItem to
 produce BOTH a dependency manifest (package.json) AND an entry-point
 source file. That's impossible — every WorkItem in this pipeline writes
 to exactly one output_path (see specialists/base.py's run_specialist),
@@ -171,7 +172,7 @@ def generate_instructions_md(
         agent_results: All AgentResults produced across every dispatch
             round (initial + retries).
         test_result: The final TestResult, or None if the run never
-            reached the test phase (e.g. DesignParseError/CycleError).
+            reached the test phase (e.g. MasterPlanError/CycleError).
         run_status: One of "passed", "failed", "design_parse_error",
             "dispatch_cycle_error" — mirrors manifest["status"]/
             manifest["failure_reason"].

@@ -2,7 +2,7 @@
 tests/pipeline/test_manifest_wiring.py
 
 Tests for wiring the file-manifest planning stage into the live pipeline:
-the file_groups_to_work_items adapter and DesignAgent.decompose_features.
+the file_groups_to_work_items adapter and MasterAgent.decompose_features.
 No network / no real LLM calls.
 """
 
@@ -20,7 +20,7 @@ from pipeline.file_manifest import (
     file_groups_to_work_items,
     group_into_work_items,
 )
-from pipeline.design import DesignAgent, DesignParseError
+from pipeline.master import MasterAgent, MasterPlanError
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -164,15 +164,15 @@ def test_decompose_features_happy_path(monkeypatch):
             },
         ]
     })
-    monkeypatch.setattr("pipeline.design.call_llm", lambda *a, **k: features_json)
+    monkeypatch.setattr("pipeline.master.acp_call_with_retry", lambda *a, **k: features_json)
 
-    features = DesignAgent(_config()).decompose_features("design text")
+    features = MasterAgent(_config()).decompose_features("design text")
     assert [f.id for f in features] == ["FEAT-auth", "FEAT-requests"]
     assert all(isinstance(f, Feature) for f in features)
     assert features[1].depends_on == ["FEAT-auth"]
 
 
 def test_decompose_features_invalid_json_raises(monkeypatch):
-    monkeypatch.setattr("pipeline.design.call_llm", lambda *a, **k: "not json")
-    with pytest.raises(DesignParseError):
-        DesignAgent(_config()).decompose_features("design text")
+    monkeypatch.setattr("pipeline.master.acp_call_with_retry", lambda *a, **k: "not json")
+    with pytest.raises(MasterPlanError):
+        MasterAgent(_config()).decompose_features("design text")
