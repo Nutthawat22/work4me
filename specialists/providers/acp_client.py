@@ -482,6 +482,18 @@ class AcpSessionPool:
 _POOL = AcpSessionPool()
 
 
+def teardown() -> None:
+    """
+    Public accessor for pipeline/runner.py (and any other caller outside
+    this module) to tear down the module-level session pool without
+    reaching into the "private" _POOL directly. Delegates to
+    AcpSessionPool.teardown_all() — see its docstring for behavior.
+    Safe to call even if no ACP sessions were ever created (e.g. no role
+    is configured with provider: "acp" yet).
+    """
+    _POOL.teardown_all()
+
+
 def _role_key_for(model: str, config: dict[str, Any], session_scope: Optional[dict] = None) -> str:
     """
     Derive a pooling key distinguishing "agent instances" for the

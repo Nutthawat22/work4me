@@ -8,7 +8,7 @@ what keys/types every part of the pipeline actually reads.
 """
 
 VALID_RESULT_FORMATS = {"junit", "jest_json", "vitest_json"}
-VALID_PROVIDERS = {"chat_completions", "responses"}
+VALID_PROVIDERS = {"chat_completions", "responses", "acp"}
 
 REQUIRED_TOP_LEVEL: dict[str, type] = {
     "litellm_url": str,

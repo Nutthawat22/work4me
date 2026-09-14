@@ -2,6 +2,7 @@
   "litellm_url": "https://opencode.ai/zen/go/v1",
   "litellm_key": "YOUR_OPENCODE_GO_API_KEY_HERE",
   "models": {
+    "_comment": "provider is one of chat_completions, responses, or acp (routes through a pooled `opencode acp` subprocess instead of a direct LiteLLM HTTP call — see specialists/providers/acp_client.py; not schema-enforcement-capable yet, avoid for design/scaffold/integrate roles)",
     "code": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
     "default": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
     "master": {"model": "kimi-k2.7-code", "provider": "chat_completions"},

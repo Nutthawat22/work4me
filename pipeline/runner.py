@@ -24,6 +24,7 @@ from pipeline.instructions import write_instructions_md
 from pipeline.run_paths import append_index, create_run_dir, write_manifest
 from pipeline.state import AgentResult, FailReport, TestResult, WorkItem
 from pipeline.test_runner import TestRunner
+from specialists.providers import acp_client
 
 
 def load_config() -> tuple[dict, str]:
@@ -133,6 +134,27 @@ def run_pipeline(
             raise ValueError("label is required when work_items is given")
         label = user_input
 
+    try:
+        return _run_pipeline_body(config, user_input, work_items, label)
+    finally:
+        acp_client.teardown()
+
+
+def _run_pipeline_body(
+    config: dict,
+    user_input: str | None,
+    work_items: list[WorkItem] | None,
+    label: str,
+) -> bool:
+    """
+    The actual run_pipeline() body, extracted so run_pipeline() can wrap
+    it in a try/finally that unconditionally tears down the ACP session
+    pool (specialists.providers.acp_client) on every exit path — success,
+    test-failure, DesignParseError, or CycleError — without needing to
+    duplicate the teardown call at each early return. See run_pipeline()
+    for the public contract; this function's behavior/return value is
+    identical to the pre-extraction run_pipeline() body.
+    """
     master = MasterAgent(config)
     design_agent = DesignAgent(config)
     master.set_intent(label)

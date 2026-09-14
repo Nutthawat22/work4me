@@ -1,0 +1,6 @@
+# Runtime deps (specialists/providers/*.py)
+requests==2.34.2
+agent-client-protocol==0.12.1
+
+# Test deps (tests/, output/scripts/run_tests_report.py)
+pytest==9.1.1
