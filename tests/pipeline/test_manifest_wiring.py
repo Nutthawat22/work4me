@@ -79,7 +79,7 @@ def _manifest() -> FileManifest:
 def _config() -> dict:
     return {
         "languages": {"typescript": {}},
-        "models": {"design": {"model": "m", "provider": "responses"}},
+        "models": {"design": {"model": "m", "provider": "acp"}},
     }
 
 

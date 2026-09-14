@@ -23,6 +23,7 @@ from specialists.providers.acp_client import (
     AcpSessionPool,
     _build_minimal_opencode_config,
     acp_call,
+    acp_call_with_retry,
 )
 
 
@@ -350,3 +351,165 @@ def test_acp_call_no_session_scope_falls_back_to_model_url_key(monkeypatch, fres
     assert r1 == "mocked response text"
     assert r2 == "mocked response text"
     assert backend.spawn_count == 1  # no session_scope -- reused via model+url fallback key
+
+
+# ── acp_call_with_retry: Option A (same-session retry-with-error-feedback) ──
+
+def _sequenced_behavior(*texts):
+    """Build a prompt_behavior that emits `texts[i]` on the i-th call
+    (0-indexed), for tests asserting a specific sequence of ACP responses
+    across successive prompt() calls against the SAME pooled session."""
+    call_count = {"n": 0}
+
+    async def _behavior(conn, session_id):
+        idx = min(call_count["n"], len(texts) - 1)
+        call_count["n"] += 1
+        await conn._client.session_update(
+            session_id,
+            SimpleNamespace(sessionUpdate="agent_message_chunk", content=SimpleNamespace(text=texts[idx])),
+        )
+        return FakePromptResponse()
+
+    return _behavior
+
+
+def _validate_json_object(raw: str) -> dict:
+    """Minimal parse_and_validate_fn for tests: raises on non-JSON or
+    missing "ok" key, mirroring the shape of design.py's
+    _parse_json/_validate_and_build chain (parse then validate, raise a
+    descriptive exception on either failure)."""
+    import json as _json
+    parsed = _json.loads(raw)
+    if not isinstance(parsed, dict) or "ok" not in parsed:
+        raise ValueError(f"missing required field 'ok' in {parsed!r}")
+    return parsed
+
+
+def test_acp_call_with_retry_success_first_attempt_no_retry(monkeypatch, fresh_pool):
+    backend = FakeAcpBackend(prompt_behavior=_sequenced_behavior('{"ok": true}'))
+    _patch_backend(monkeypatch, backend)
+
+    result = acp_call_with_retry(
+        MESSAGES, "claude-sonnet-5", BASE_CONFIG, timeout=5,
+        parse_and_validate_fn=_validate_json_object,
+        session_scope={"project": "0001-project-a", "role": "design"},
+    )
+
+    assert result == '{"ok": true}'
+    assert backend.spawn_count == 1  # only ever needed one pooled session
+
+
+def test_acp_call_with_retry_failure_then_success_reuses_same_session(monkeypatch, fresh_pool):
+    backend = FakeAcpBackend(
+        prompt_behavior=_sequenced_behavior("not json at all", '{"ok": true}'),
+    )
+    _patch_backend(monkeypatch, backend)
+
+    scope = {"project": "0001-project-a", "role": "design"}
+    result = acp_call_with_retry(
+        MESSAGES, "claude-sonnet-5", BASE_CONFIG, timeout=5,
+        parse_and_validate_fn=_validate_json_object,
+        session_scope=scope,
+        max_attempts=3,
+    )
+
+    assert result == '{"ok": true}'
+    # Same-session retry: still exactly ONE pooled subprocess/session spawned
+    # across both attempts -- this is what makes it "same-session" per
+    # Option A, not a fresh session per retry.
+    assert backend.spawn_count == 1
+
+
+def test_acp_call_with_retry_second_attempt_sees_error_feedback_in_prompt(monkeypatch, fresh_pool):
+    """Assert the retry's prompt actually carries the failure reason
+    (not just that a second call happened) -- the core of Option A's
+    self-correction signal."""
+    seen_prompts = []
+    behavior = _sequenced_behavior("not json at all", '{"ok": true}')
+
+    async def _capturing_behavior(conn, session_id):
+        return await behavior(conn, session_id)
+
+    class _CapturingConnection(FakeConnection):
+        async def prompt(self, session_id, prompt):
+            seen_prompts.append(prompt[0].text if hasattr(prompt[0], "text") else str(prompt[0]))
+            return await self._prompt_behavior(self, session_id)
+
+    class _CapturingBackend(FakeAcpBackend):
+        def spawn_agent_process(self, client, *args, cwd=None, env=None, **kwargs):
+            backend = self
+
+            @asynccontextmanager
+            async def _cm():
+                backend.spawn_count += 1
+                process = FakeProcess()
+                backend.processes.append(process)
+                conn = _CapturingConnection(client, backend.prompt_behavior, backend.init_behavior)
+                yield conn, process
+
+            return _cm()
+
+    backend = _CapturingBackend(prompt_behavior=_capturing_behavior)
+    _patch_backend(monkeypatch, backend)
+
+    result = acp_call_with_retry(
+        MESSAGES, "claude-sonnet-5", BASE_CONFIG, timeout=5,
+        parse_and_validate_fn=_validate_json_object,
+        session_scope={"project": "0001-project-a", "role": "design"},
+        max_attempts=3,
+    )
+
+    assert result == '{"ok": true}'
+    assert len(seen_prompts) == 2
+    assert "hello" in seen_prompts[0]  # first attempt sent the original message
+    assert "invalid" in seen_prompts[1].lower()
+    assert "Expecting value" in seen_prompts[1]  # json.JSONDecodeError message surfaced as feedback
+
+
+def test_acp_call_with_retry_all_attempts_fail_returns_final_error_with_count(monkeypatch, fresh_pool):
+    backend = FakeAcpBackend(prompt_behavior=_sequenced_behavior("still not json"))
+    _patch_backend(monkeypatch, backend)
+
+    result = acp_call_with_retry(
+        MESSAGES, "claude-sonnet-5", BASE_CONFIG, timeout=5,
+        parse_and_validate_fn=_validate_json_object,
+        session_scope={"project": "0001-project-a", "role": "design"},
+        max_attempts=3,
+    )
+
+    assert result.startswith("[claude-sonnet-5] Error:")
+    assert "failed after 3 attempts" in result
+    assert "last error" in result
+    assert backend.spawn_count == 1  # still same session across every failed attempt
+
+
+def test_acp_call_with_retry_acp_error_string_triggers_retry(monkeypatch, fresh_pool):
+    """An acp_call-level error (e.g. transient timeout) should also
+    trigger a retry, not just parse/validate failures."""
+    backend = FakeAcpBackend()  # default success behavior once actually invoked
+    _patch_backend(monkeypatch, backend)
+
+    call_count = {"n": 0}
+    real_acp_call = acp_client.acp_call
+
+    def _flaky_acp_call(messages, model, config, timeout=60, response_schema=None, session_scope=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return f"[{model}] Error: ACP prompt timed out after {timeout}s."
+        return real_acp_call(messages, model, config, timeout=timeout, response_schema=response_schema, session_scope=session_scope)
+
+    monkeypatch.setattr(acp_client, "acp_call", _flaky_acp_call)
+
+    result = acp_client.acp_call_with_retry(
+        MESSAGES, "claude-sonnet-5", BASE_CONFIG, timeout=5,
+        session_scope={"project": "0001-project-a", "role": "design"},
+        max_attempts=3,
+    )
+
+    assert result == "mocked response text"
+    assert call_count["n"] == 2
+
+
+def test_acp_call_with_retry_max_attempts_less_than_one_raises():
+    with pytest.raises(ValueError):
+        acp_call_with_retry(MESSAGES, "claude-sonnet-5", BASE_CONFIG, max_attempts=0)

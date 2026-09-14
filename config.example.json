@@ -2,12 +2,12 @@
   "litellm_url": "https://opencode.ai/zen/go/v1",
   "litellm_key": "YOUR_OPENCODE_GO_API_KEY_HERE",
   "models": {
-    "_comment": "provider is one of chat_completions, responses, or acp (routes through a pooled `opencode acp` subprocess instead of a direct LiteLLM HTTP call — see specialists/providers/acp_client.py; not schema-enforcement-capable yet, avoid for design/scaffold/integrate roles)",
-    "code": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
-    "default": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
-    "master": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
-    "design": {"model": "gpt-5.6-luna", "provider": "responses"},
-    "specialist": {"model": "kimi-k2.7-code", "provider": "chat_completions"}
+    "_comment": "provider is always \"acp\" (routes through a pooled `opencode acp` subprocess — see specialists/providers/acp_client.py). ACP has no token-level schema enforcement; JSON reliability is handled via a prompt-embedded schema instruction plus same-session retry-with-error-feedback (acp_call_with_retry), not a hard guarantee.",
+    "code": {"model": "kimi-k2.7-code", "provider": "acp"},
+    "default": {"model": "kimi-k2.7-code", "provider": "acp"},
+    "master": {"model": "kimi-k2.7-code", "provider": "acp"},
+    "design": {"model": "gpt-5.6-luna", "provider": "acp"},
+    "specialist": {"model": "kimi-k2.7-code", "provider": "acp"}
   },
   "pipeline": {
     "max_retries": 3,

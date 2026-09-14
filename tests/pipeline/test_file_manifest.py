@@ -256,7 +256,7 @@ def test_validate_cycle_detection():
 def _config() -> dict:
     return {
         "languages": {"typescript": {}},
-        "models": {"design": {"model": "m", "provider": "responses"}},
+        "models": {"design": {"model": "m", "provider": "acp"}},
     }
 
 

@@ -28,8 +28,8 @@ def _config(tmp_path) -> dict:
         "litellm_url": "https://litellm.example.test/v1",
         "litellm_key": "sk-test-key",
         "models": {
-            "design": {"model": "gpt-5.6-luna", "provider": "responses"},
-            "specialist": {"model": "kimi-k2.7-code", "provider": "chat_completions"},
+            "design": {"model": "gpt-5.6-luna", "provider": "acp"},
+            "specialist": {"model": "kimi-k2.7-code", "provider": "acp"},
         },
         "pipeline": {
             "max_retries": 1,

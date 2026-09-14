@@ -16,7 +16,7 @@ def call_llm(
     messages: list[dict],
     model: str,
     config: dict[str, Any],
-    provider: str = "chat_completions",
+    provider: str = "acp",
     timeout: int = 60,
     response_schema: Optional[dict[str, Any]] = None,
     session_scope: Optional[dict] = None,
@@ -29,26 +29,21 @@ def call_llm(
         model: Model name string (e.g. config["models"]["design"]["model"]).
         config: Loaded config dict, must contain "litellm_url" and "litellm_key".
         provider: Key into specialists.providers.PROVIDERS selecting which
-            adapter/API shape to use.
+            adapter/API shape to use. "acp" is currently the only
+            registered provider (see specialists/providers/__init__.py).
         timeout: Request timeout in seconds.
         response_schema: Optional dict with keys "name" and "schema" (a
-            JSON Schema object) forwarded to the resolved adapter to
-            request structured-output enforcement (the model's token
-            generation is constrained to match the schema, eliminating
-            malformed/missing-field JSON as a failure mode rather than
-            just discouraging it via prompt text). None (default) — no
-            adapters currently in PROVIDERS require this, and passing
-            None preserves prior behavior exactly.
+            JSON Schema object) forwarded to the resolved adapter. ACP
+            has no token-level schema enforcement -- this is only
+            prepended as a best-effort prompt instruction (see
+            acp_client.py's _build_schema_instruction). None (default)
+            sends no schema instruction at all.
         session_scope: Optional dict of shape {"project": str, "role": str}
             identifying which pipeline run ("project") and config role
-            this call belongs to. Only meaningful to session-based
-            adapters (currently just specialists/providers/acp_client.py's
-            acp_call, not yet registered in PROVIDERS — see the ACP
-            migration design doc); stateless HTTP adapters
-            (chat_completions_call, responses_call) accept and ignore it.
-            None (default) — callers that don't have a project identifier
-            available simply omit it, and session-based adapters fall
-            back to their pre-existing pooling behavior.
+            this call belongs to. Forwarded to acp_call, which uses it
+            to select the pooled ACP session (see acp_client.py's
+            _role_key_for). None (default) falls back to acp_call's own
+            (model, litellm_url) pooling key.
 
     Returns:
         The assistant's response content string, or a formatted error string

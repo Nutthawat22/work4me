@@ -1,16 +1,14 @@
 """
 specialists/providers/acp_client.py
 
-Agent Client Protocol (ACP) adapter. Routes LLM calls through a spawned
-`opencode acp` subprocess speaking JSON-RPC over stdio, instead of a
-direct HTTP request to the LiteLLM proxy (see chat_completions.py /
-responses_api.py). Uses the `agent-client-protocol` PyPI package
-(imports as `acp`).
-
-Not registered in specialists/providers/__init__.py's PROVIDERS yet --
-that's Phase 3 of the ACP migration (see
-dev-plans/agents/features/2026-09-08-acp-migration.md). This module is
-standalone-importable and unit-testable ahead of that registration.
+Agent Client Protocol (ACP) adapter -- the sole LLM provider (see
+specialists/providers/__init__.py's PROVIDERS registry; the former
+chat_completions/responses HTTP adapters were removed in Phase 1 of
+the ACP-native rearchitecture, see
+dev-plans/agents/features/2026-09-14-acp-native-master-architecture.md).
+Routes LLM calls through a spawned `opencode acp` subprocess speaking
+JSON-RPC over stdio, instead of a direct HTTP request to a LiteLLM
+proxy. Uses the `agent-client-protocol` PyPI package (imports as `acp`).
 
 Session lifecycle: each config["models"][role] gets its own pooled
 `opencode acp` subprocess + ACP session, spawned once and reused across
@@ -35,7 +33,7 @@ import os
 import tempfile
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import acp
 
@@ -116,17 +114,16 @@ def _build_minimal_opencode_config(config: dict[str, Any], model: str) -> dict[s
 
 def _build_schema_instruction(response_schema: dict[str, Any]) -> str:
     """
-    Phase 2 placeholder for structured-output enforcement over ACP.
+    Best-effort structured-output instruction for ACP.
 
-    ACP has no analog to the chat_completions/responses providers'
-    token-constrained `response_format: json_schema, strict: true` (see
-    design doc's Technical Design > Structured-output fallback). The
-    real parse-validate-retry loop is explicit Phase 4 scope. For Phase
-    2 this just prepends a clearly-labeled, best-effort prompt
-    instruction -- no retry, no validation, no guarantee the model
-    actually complies. Callers relying on hard schema guarantees
-    (DesignAgent, scaffold/integrate multi-file specialists) should not
-    be routed through "acp" until Phase 4 lands.
+    ACP has no token-constrained `response_format: json_schema,
+    strict: true` mechanism like the removed chat_completions/responses
+    HTTP adapters had (see the ACP-native rearchitecture design doc's
+    "Accepted Risk: No Hard Schema Enforcement, Anywhere"). This
+    function only prepends a clearly-labeled prompt instruction -- no
+    enforcement, no guarantee the model actually complies. The
+    reliability fallback is acp_call_with_retry's same-session
+    retry-with-error-feedback loop (Option A), not this function.
     """
     return (
         "Respond with valid JSON matching this schema: "
@@ -546,13 +543,13 @@ def acp_call(
             in a few seconds per Phase 1 spike measurements); only the
             session/prompt round-trip is bounded by it.
         response_schema: Optional dict with keys "name" and "schema" (a
-            JSON Schema object). Phase 2 placeholder only: unlike
-            chat_completions_call/responses_call, ACP has no
-            token-constrained structured-output primitive, so this is
-            NOT enforced -- it's merely prepended to the prompt text as
-            a best-effort instruction. No parse-validate-retry loop
-            exists yet (that's explicit Phase 4 scope per the design
-            doc). None (default) sends no schema instruction at all.
+            JSON Schema object). ACP has no token-constrained
+            structured-output primitive, so this is NOT enforced --
+            it's merely prepended to the prompt text as a best-effort
+            instruction (see _build_schema_instruction). This function
+            has no retry loop of its own -- see acp_call_with_retry for
+            the reliability fallback (Option A). None (default) sends
+            no schema instruction at all.
         session_scope: Optional dict {"project": str, "role": str}
             identifying which pipeline run ("project", e.g. the run
             dir's basename) and config role ("design"/"specialist"/
@@ -564,9 +561,10 @@ def acp_call(
         Accumulated agent_message_chunk text on success, or a formatted
         f"[{model}] Error: ..." string (never raises) on: subprocess
         spawn failure, handshake failure, prompt timeout, or any other
-        unrecoverable error -- matching chat_completions_call /
-        responses_call's error-string-not-exception convention that
-        specialists/base.py depends on via raw.startswith(...).
+        unrecoverable error -- this error-string-not-exception
+        convention is what specialists/base.py depends on via
+        raw.startswith(...), and what acp_call_with_retry's failure
+        detection relies on.
     """
     prompt_text = _messages_to_prompt_text(messages)
     if response_schema is not None:
@@ -587,3 +585,163 @@ def acp_call(
         return f"[{model}] Error: no agent_message_chunk text received (stopReason={getattr(prompt_resp, 'stopReason', None)!r})"
 
     return accumulated_text
+
+
+def _build_retry_feedback_prompt(response_schema: Optional[dict[str, Any]], failure_reason: str) -> str:
+    """
+    Build the short follow-up prompt sent for a same-session retry
+    attempt (see acp_call_with_retry). Deliberately does NOT resend the
+    original messages -- the pooled ACP session already has the prior
+    (malformed) turn in its own conversation history, since retries
+    reuse the same session_scope/role_key. Only the specific failure
+    reason is sent here; the schema instruction itself is NOT
+    duplicated in this text -- acp_call already re-appends it via
+    _build_schema_instruction whenever response_schema is passed (which
+    acp_call_with_retry does on every attempt, including retries), so
+    embedding it again here would send the schema twice in one prompt.
+    Matches the design doc's Option A description ("the original schema
+    instruction plus the specific parse/validation error message") --
+    acp_call contributes the schema half, this function contributes the
+    error half.
+    """
+    if response_schema is not None:
+        return f"Your previous response was invalid: {failure_reason}\n\nCorrect your response accordingly."
+    return (
+        f"Your previous response was invalid: {failure_reason}\n\n"
+        "Correct your response and output ONLY the corrected content, no other text."
+    )
+
+
+def _first_failure_reason(
+    result: str,
+    model: str,
+    parse_and_validate_fn: Optional[Callable[[str], Any]],
+) -> Optional[str]:
+    """
+    Classify a single acp_call result as success or failure for
+    acp_call_with_retry's loop.
+
+    Returns:
+        None if `result` is a success (not an acp_call error string, and
+        -- if parse_and_validate_fn was given -- it did not raise).
+        Otherwise a human-readable failure reason string: either the
+        acp_call error string itself (stripped of the "[model] Error:"
+        prefix is NOT done here -- the raw error is descriptive enough
+        as-is), or str(exception) from a failing parse_and_validate_fn.
+    """
+    if result.startswith(f"[{model}] Error:"):
+        return result
+
+    if parse_and_validate_fn is not None:
+        try:
+            parse_and_validate_fn(result)
+        except Exception as e:
+            return str(e)
+
+    return None
+
+
+def acp_call_with_retry(
+    messages: list[dict],
+    model: str,
+    config: dict[str, Any],
+    timeout: int = 60,
+    response_schema: Optional[dict[str, Any]] = None,
+    session_scope: Optional[dict] = None,
+    parse_and_validate_fn: Optional[Callable[[str], Any]] = None,
+    max_attempts: int = 3,
+) -> str:
+    """
+    acp_call wrapped in Option A's retry-with-error-feedback loop (see
+    the ACP-native rearchitecture design doc's "Recommended Approach" >
+    Option A). Compensates for ACP having no token-level schema
+    enforcement (unlike the now-removed chat_completions/responses
+    providers' `response_format: json_schema, strict: true`): on
+    failure, re-invokes acp_call in the SAME pooled session (same
+    session_scope, so AcpSessionPool reuses the existing subprocess/ACP
+    session) with the schema instruction plus the specific failure
+    reason appended, up to `max_attempts` total tries. This lets the
+    model see its own prior malformed output directly in the session's
+    conversation history alongside the concrete error -- the strongest
+    available self-correction signal, per the design doc's rationale for
+    choosing Option A over fresh-session or parallel-attempt retries.
+
+    Args:
+        messages: Full list of {"role": ..., "content": ...} messages for
+            the FIRST attempt only. Retry attempts send a short new
+            message instead of resending these (see
+            _build_retry_feedback_prompt) -- the same-session reuse
+            means the prior turn is already in context.
+        model: Model name string, forwarded to acp_call unchanged.
+        config: Loaded config dict, forwarded to acp_call unchanged.
+        timeout: Per-attempt prompt timeout in seconds, forwarded to
+            every acp_call invocation (including retries).
+        response_schema: Optional dict with keys "name" and "schema" (a
+            JSON Schema object). Forwarded to acp_call on EVERY attempt
+            (including retries) -- acp_call itself re-appends the schema
+            instruction each time via _build_schema_instruction, so the
+            schema is always restated alongside the failure reason on a
+            retry without this function duplicating it. None (default)
+            disables the schema instruction on every attempt.
+        session_scope: Optional dict {"project": str, "role": str}
+            forwarded unchanged to every acp_call invocation across all
+            attempts -- this is what makes retries "same-session":
+            identical session_scope means AcpSessionPool resolves the
+            same role_key and thus the same pooled subprocess/session on
+            every attempt (see _role_key_for). None falls back to
+            acp_call's own (model, litellm_url) pooling key, which is
+            equally stable across retries.
+        parse_and_validate_fn: Optional callable taking the raw response
+            string and returning anything (return value is discarded --
+            only used to detect success/failure). Should raise on
+            invalid input (e.g. a chained
+            `lambda raw: DesignAgent._validate_and_build(DesignAgent._parse_json(raw), valid_languages)`)
+            with a descriptive exception message, which becomes the
+            failure reason appended to the next retry's feedback prompt.
+            None (default) means only acp_call's own error-string
+            convention is checked -- any non-error-string result is
+            treated as success without further validation.
+        max_attempts: Total attempts including the first (not additional
+            retries on top of it). Must be >= 1.
+
+    Returns:
+        The successful raw response string on the first attempt that
+        both (a) is not an acp_call error string and (b) passes
+        parse_and_validate_fn (if given) -- same contract as acp_call
+        itself, so callers still do their own parsing/construction
+        afterward exactly as they do today. If every attempt fails, a
+        single f"[{model}] Error: acp_call_with_retry failed after
+        {max_attempts} attempts, last error: {last_error}" string is
+        returned (never raises), preserving acp_call's
+        error-string-not-exception convention.
+
+    Raises:
+        ValueError: if max_attempts < 1.
+    """
+    if max_attempts < 1:
+        raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+
+    current_messages = messages
+    last_error: Optional[str] = None
+
+    for attempt in range(1, max_attempts + 1):
+        result = acp_call(
+            current_messages, model, config, timeout=timeout,
+            response_schema=response_schema, session_scope=session_scope,
+        )
+
+        failure_reason = _first_failure_reason(result, model, parse_and_validate_fn)
+        if failure_reason is None:
+            return result
+
+        last_error = failure_reason
+        if attempt == max_attempts:
+            break
+
+        retry_prompt = _build_retry_feedback_prompt(response_schema, failure_reason)
+        current_messages = [{"role": "user", "content": retry_prompt}]
+
+    return (
+        f"[{model}] Error: acp_call_with_retry failed after {max_attempts} attempts, "
+        f"last error: {last_error}"
+    )
