@@ -173,9 +173,11 @@ def generate_instructions_md(
             round (initial + retries).
         test_result: The final TestResult, or None if the run never
             reached the test phase (e.g. MasterPlanError/CycleError).
-        run_status: One of "passed", "failed", "design_parse_error",
-            "dispatch_cycle_error" — mirrors manifest["status"]/
-            manifest["failure_reason"].
+        run_status: One of "passed", "passed_with_test_failures", "failed",
+            "design_parse_error", "dispatch_cycle_error" — mirrors
+            manifest["status"]/manifest["failure_reason"].
+            "passed_with_test_failures" is the tests_blocking=false
+            non-blocking-test-failure case (see pipeline/runner.py).
         run_id: The run directory's basename, for the header.
         run_dir: Absolute path to the run directory, needed to actually
             read a written package.json's "scripts" off disk. If None
@@ -194,6 +196,16 @@ def generate_instructions_md(
     lines.append("")
     if run_status == "passed":
         lines.append("✅ All configured tests passed.")
+    elif run_status == "passed_with_test_failures":
+        total = test_result.total if test_result else 0
+        failed = test_result.failed if test_result else 0
+        lines.append(
+            f"⚠️ Tests failed but were not enforced this run "
+            f"(tests_blocking=false) — {failed} of {total} test(s) "
+            "failed. Files were written and specialist dispatch "
+            "succeeded, but automated test results should be treated "
+            "as unverified/advisory only."
+        )
     elif run_status == "failed":
         total = test_result.total if test_result else 0
         failed = test_result.failed if test_result else 0

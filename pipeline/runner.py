@@ -180,12 +180,22 @@ def _run_pipeline_body(
     run_dir = create_run_dir(runs_dir_abs, label)
     print(f"\n📁 Run dir: {run_dir}\n")
 
+    # tests_blocking defaults to True (absent key == today's behavior):
+    # explicit False makes test-*content* failures advisory-only for the
+    # run's final pass/fail decision and the retry loop's test-driven
+    # trigger — it does NOT touch the vacuous-pass guard further down
+    # (specialist dispatch failures always block, regardless of this
+    # flag). See _run_pipeline_body's retry loop and final decision
+    # block below for where this is actually consumed.
+    tests_blocking = config["pipeline"].get("tests_blocking", True)
+
     manifest = {
         "run_id": os.path.basename(run_dir),
         "prompt": label,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "work_item_count": None,
         "status": "in_progress",
+        "tests_blocking": tests_blocking,
     }
     write_manifest(run_dir, manifest)
 
@@ -255,7 +265,36 @@ def _run_pipeline_body(
     )
     print()
 
-    while not test_result.passed and attempt < max_retries:
+    while attempt < max_retries:
+        # tests_blocking=True (default): unchanged — any test failure
+        # (content or vacuous-pass-adjacent) drives a retry attempt, same
+        # as before this flag existed.
+        #
+        # tests_blocking=False: a *pure* test-content failure (every
+        # specialist's final dispatch succeeded) is advisory-only and
+        # must not burn a retry — the known jest/dynamic-path-matching
+        # issue (see module docstring context) can produce false test
+        # failures unrelated to actual code quality. But if some
+        # WorkItem's specialist dispatch is still unresolved (failed),
+        # that's a real problem worth retrying regardless of
+        # tests_blocking — retries are fundamentally about fixing failed
+        # WorkItems, not about satisfying the test suite.
+        if not test_result.passed:
+            if tests_blocking:
+                should_retry = True
+            else:
+                unresolved_specialist_ids = {
+                    r.work_item_id
+                    for r in _final_agent_results_by_work_item(all_agent_results)
+                    if not r.success
+                }
+                should_retry = bool(unresolved_specialist_ids)
+        else:
+            should_retry = False
+
+        if not should_retry:
+            break
+
         retry_context = master.map_failures_to_work_items(
             test_result, all_agent_results, work_items
         )
@@ -332,7 +371,9 @@ def _run_pipeline_body(
         # because the failed WorkItems above never got far enough to
         # write test files — not because there was genuinely nothing to
         # test. Report this as a failed run rather than "✅ All tests
-        # passed.".
+        # passed.". This guard is NOT affected by tests_blocking: a
+        # specialist dispatch failure is a specialist-failure signal, not
+        # a test-content signal, and always blocks.
         print(
             f"⚠️  {len(failed_work_item_ids)} of {len(final_agent_results)} "
             "WorkItem(s) failed dispatch and produced no output — the "
@@ -367,6 +408,32 @@ def _run_pipeline_body(
             run_dir, config, work_items, all_agent_results, test_result, "failed"
         )
         return False
+
+    if not tests_blocking and not failed_work_item_ids:
+        # Non-blocking mode: test *content* failed, but every specialist's
+        # final dispatch succeeded — the vacuous-pass guard above doesn't
+        # apply (failed_work_item_ids is empty), so this is a genuine
+        # test-content failure, not a specialist failure. Per this run's
+        # explicit config, that's advisory-only: don't fail the run, but
+        # don't silently report "✅ passed" either — a distinct status
+        # string keeps this traceable/queryable separately from a real
+        # "passed" run.
+        print(
+            "⚠️  Tests failed but tests_blocking=false — treating as "
+            "advisory-only. Specialist dispatch succeeded for all "
+            "WorkItems; automated test results should be treated as "
+            "unverified.\n"
+        )
+        manifest["status"] = "passed_with_test_failures"
+        manifest["attempts"] = attempt
+        manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_manifest(run_dir, manifest)
+        append_index(runs_dir_abs, manifest)
+        write_instructions_md(
+            run_dir, config, work_items, all_agent_results, test_result,
+            "passed_with_test_failures",
+        )
+        return True
 
     # Recompute the mapping against the final failing test_result so
     # "unresolved" reflects the WorkItems actually implicated by the

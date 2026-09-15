@@ -384,8 +384,26 @@ def run_specialist(
         base_user_content += _build_dependency_section(dependency_context)
 
     subdir = config["pipeline"][subdir_key]
-    relative_path = os.path.join(subdir, work_item.output_path)
-    full_path = os.path.join(run_dir, subdir, work_item.output_path)
+    output_path = work_item.output_path
+    if subdir_key == "tests_dir":
+        # TestAgent (the only subdir_key="tests_dir" caller) prompts the
+        # LLM with the WorkItem's output_path but no explicit instruction
+        # on whether it's relative to run_dir or to tests_dir itself —
+        # in practice the LLM (mirroring how plan.json's own test
+        # WorkItems name their output_path, e.g. "tests/foo.test.js")
+        # consistently includes a leading "{tests_dir}/" prefix. Since
+        # this path is then joined with subdir=tests_dir below, keeping
+        # that prefix would double it up into
+        # run_dir/tests/tests/foo.test.js. Strip one matching leading
+        # prefix here so output_path is always treated as relative to
+        # tests_dir directly, same convention as output_dir-relative
+        # WorkItems (ui/logic/config/scaffold/integrate) already use.
+        normalized = output_path.replace("\\", "/")
+        prefix = subdir.rstrip("/") + "/"
+        if normalized.startswith(prefix):
+            output_path = normalized[len(prefix):]
+    relative_path = os.path.join(subdir, output_path)
+    full_path = os.path.join(run_dir, subdir, output_path)
 
     self_check_feedback: ReviewResult | None = None
 

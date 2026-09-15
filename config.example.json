@@ -13,7 +13,8 @@
     "max_retries": 3,
     "runs_dir": "runs/",
     "output_dir": "product",
-    "tests_dir": "tests"
+    "tests_dir": "tests",
+    "tests_blocking": true
   },
   "languages": {
     "python": {
@@ -24,14 +25,14 @@
       "test_framework_name": "pytest"
     },
     "javascript": {
-      "test_command": ["npx", "jest", "--ci", "--json", "--outputFile", "{result_path}"],
+      "test_command": ["npx", "jest", "--ci", "--json", "--outputFile", "{result_path}", "--roots", "{tests_dir}"],
       "test_file_patterns": ["*.test.js", "*.spec.js", "*.test.jsx", "*.spec.jsx"],
       "result_format": "jest_json",
       "file_extension": [".js", ".jsx"],
       "test_framework_name": "jest"
     },
     "typescript": {
-      "test_command": ["bunx", "vitest", "run", "--reporter=json", "--outputFile={result_path}"],
+      "test_command": ["bunx", "vitest", "run", "{tests_dir}", "--reporter=json", "--outputFile={result_path}"],
       "test_file_patterns": ["*.test.ts", "*.spec.ts", "*.test.tsx", "*.spec.tsx"],
       "result_format": "vitest_json",
       "file_extension": [".ts", ".tsx"],
