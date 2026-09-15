@@ -64,6 +64,13 @@ PLAN_HANDOFF_TIMEOUT_SECONDS = 240
 # plan_handoff, so reuse the same generous budget.
 DECOMPOSE_FEATURES_TIMEOUT_SECONDS = 240
 
+# Longer timeout: decompose takes a short free-text prompt (much less
+# input than plan_handoff/decompose_features's full design docs), so it
+# doesn't need the full 240s budget, but the 60s acp_call_with_retry
+# default is still risky for an LLM call producing a structured WorkItem
+# array — split the difference.
+DECOMPOSE_TIMEOUT_SECONDS = 120
+
 # Retry-with-error-feedback attempt cap for every planning call in this
 # module (see acp_call_with_retry's max_attempts). Not yet exposed as a
 # config value — see the design doc's Open Questions > "Where does the
@@ -385,6 +392,37 @@ def _build_features_response_schema(valid_languages: set[str]) -> dict:
     }
 
 
+def _check_no_extra_json_data(stripped: str, exc: json.JSONDecodeError) -> None:
+    """
+    Detect the "two JSON documents concatenated with no separator"
+    failure mode (e.g. a retry attempt whose response is the previous
+    bad attempt's JSON immediately followed by a new one, with no
+    comma/whitespace/newline between them). json.loads() surfaces this
+    as a JSONDecodeError with msg "Extra data" at the offset where the
+    first complete value ended — but that generic message doesn't tell
+    a human (or a model reading it back as a retry failure_reason) what
+    actually went wrong. If `exc` is such an error, raise a specific
+    MasterPlanError instead of letting the generic one propagate.
+    """
+    if exc.msg != "Extra data":
+        return
+
+    try:
+        _, end_index = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError:
+        return
+
+    trailing = stripped[end_index:].strip()
+    if trailing:
+        raise MasterPlanError(
+            "Response contained more than one JSON document (extra data "
+            "after the first complete JSON value) — the model likely "
+            "repeated/concatenated multiple attempts. This should not "
+            "happen; if it recurs, the retry-feedback prompt may need "
+            "further strengthening."
+        )
+
+
 class MasterPlanError(Exception):
     """
     Raised when MasterAgent's planning LLM response cannot be turned
@@ -432,10 +470,14 @@ class MasterAgent:
 
         raw = acp_call_with_retry(
             messages, model, self.config,
+            timeout=DECOMPOSE_TIMEOUT_SECONDS,
             response_schema=response_schema,
             parse_and_validate_fn=_parse_and_validate,
             max_attempts=PLANNING_MAX_ATTEMPTS,
         )
+
+        if raw.startswith(f"[{model}] Error:"):
+            raise MasterPlanError(raw)
 
         parsed = self._parse_json(raw)
         return self._validate_and_build(parsed, valid_languages)
@@ -512,6 +554,9 @@ class MasterAgent:
             max_attempts=PLANNING_MAX_ATTEMPTS,
         )
 
+        if raw.startswith(f"[{model}] Error:"):
+            raise MasterPlanError(raw)
+
         parsed = self._parse_json(raw)
         work_items = self._validate_and_build(parsed, valid_languages)
         self._check_dependency_graph(work_items)
@@ -572,6 +617,9 @@ class MasterAgent:
             max_attempts=PLANNING_MAX_ATTEMPTS,
         )
 
+        if raw.startswith(f"[{model}] Error:"):
+            raise MasterPlanError(raw)
+
         parsed = self._parse_features_json(raw)
         return self._validate_and_build_features(parsed, valid_languages)
 
@@ -605,6 +653,7 @@ class MasterAgent:
         try:
             parsed = json.loads(stripped)
         except json.JSONDecodeError as e:
+            _check_no_extra_json_data(stripped, e)
             raise MasterPlanError(f"Failed to parse MasterAgent response as JSON: {e}\nRaw response: {raw}")
 
         if isinstance(parsed, dict) and "items" in parsed:
@@ -684,6 +733,7 @@ class MasterAgent:
         try:
             parsed = json.loads(stripped)
         except json.JSONDecodeError as e:
+            _check_no_extra_json_data(stripped, e)
             raise MasterPlanError(
                 f"Failed to parse decompose_features response as JSON: {e}\nRaw response: {raw}"
             )

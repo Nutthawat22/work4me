@@ -68,6 +68,25 @@ def print_specialist_failures(results: list[AgentResult]) -> None:
         print(f"    notes: {r.notes}")
 
 
+def _final_agent_results_by_work_item(
+    agent_results: list[AgentResult],
+) -> list[AgentResult]:
+    """
+    Reduce a chronologically-ordered list of AgentResults (initial
+    dispatch + every retry round, in call order) down to one
+    AgentResult per work_item_id: whichever result for that id was
+    produced LAST. A WorkItem that failed on an early attempt but
+    succeeded on a later retry round is represented by its (successful)
+    later result here, not its earlier failure — this is what lets the
+    dispatch-success check below correctly reflect "final state after
+    all retries", not just the very first dispatch round.
+    """
+    by_id: dict[str, AgentResult] = {}
+    for result in agent_results:
+        by_id[result.work_item_id] = result
+    return list(by_id.values())
+
+
 def print_fail_report(report: FailReport) -> None:
     print("═" * 50)
     print(f"PIPELINE FAILED after {report.run_number} attempts")
@@ -281,7 +300,22 @@ def _run_pipeline_body(
         )
         print()
 
-    if test_result.passed:
+    # test_result.passed alone isn't sufficient evidence of a real pass:
+    # TestRunner.run() returns passed=True, total=0 both when a run
+    # legitimately needed no tests (fine) AND when every specialist
+    # failed before writing anything, so no test files existed to run
+    # (NOT fine — see _final_agent_results_by_work_item's docstring).
+    # TestResult has no visibility into AgentResults, so this
+    # combination has to be checked here, where both are in scope —
+    # reduce all_agent_results (initial dispatch + every retry round)
+    # down to one final AgentResult per work_item_id and confirm every
+    # one of them actually succeeded before trusting test_result.passed.
+    final_agent_results = _final_agent_results_by_work_item(all_agent_results)
+    failed_work_item_ids = sorted(
+        r.work_item_id for r in final_agent_results if not r.success
+    )
+
+    if test_result.passed and not failed_work_item_ids:
         print("✅ All tests passed.\n")
         manifest["status"] = "passed"
         manifest["attempts"] = attempt
@@ -292,6 +326,47 @@ def _run_pipeline_body(
             run_dir, config, work_items, all_agent_results, test_result, "passed"
         )
         return True
+
+    if test_result.passed and failed_work_item_ids:
+        # Vacuous pass: test_result.passed is True (0 tests ran) only
+        # because the failed WorkItems above never got far enough to
+        # write test files — not because there was genuinely nothing to
+        # test. Report this as a failed run rather than "✅ All tests
+        # passed.".
+        print(
+            f"⚠️  {len(failed_work_item_ids)} of {len(final_agent_results)} "
+            "WorkItem(s) failed dispatch and produced no output — the "
+            "0/0 vacuous test pass does not mean this run succeeded.\n"
+        )
+        fail_report = FailReport(
+            run_number=attempt,
+            failures=[],
+            unresolved_items=failed_work_item_ids,
+            summary=(
+                f"{len(failed_work_item_ids)} of {len(final_agent_results)} "
+                f"WorkItem(s) failed dispatch (specialist errors) after "
+                f"{attempt} attempt(s); no test files were produced for "
+                "them, so the 0/0 vacuous test pass cannot be treated as "
+                "a real pass."
+            ),
+        )
+        with open(
+            os.path.join(run_dir, "tests", "results", "fail_report.json"), "w"
+        ) as f:
+            json.dump(dataclasses.asdict(fail_report), f, indent=2)
+        print_fail_report(fail_report)
+        print()
+
+        manifest["status"] = "failed"
+        manifest["failure_reason"] = "specialist_dispatch_failure"
+        manifest["attempts"] = attempt
+        manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_manifest(run_dir, manifest)
+        append_index(runs_dir_abs, manifest)
+        write_instructions_md(
+            run_dir, config, work_items, all_agent_results, test_result, "failed"
+        )
+        return False
 
     # Recompute the mapping against the final failing test_result so
     # "unresolved" reflects the WorkItems actually implicated by the

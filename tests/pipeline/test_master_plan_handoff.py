@@ -257,6 +257,22 @@ class TestStructuralInvariants:
 # ── Parse/validation error paths ────────────────────────────────────────────
 
 class TestParseAndValidationErrors:
+    def test_retry_exhaustion_error_string_raises_clean_master_plan_error(self, monkeypatch):
+        """Bug A: plan_handoff must detect acp_call_with_retry's
+        error-string-on-exhaustion return BEFORE parsing it as JSON."""
+        error_string = (
+            "[m] Error: acp_call_with_retry failed after 3 attempts, "
+            "last error: [m] Error: ACP prompt timed out after 240s."
+        )
+        monkeypatch.setattr(
+            "pipeline.master.acp_call_with_retry", lambda *a, **k: error_string
+        )
+        with pytest.raises(MasterPlanError) as exc_info:
+            MasterAgent(_config()).plan_handoff("design doc")
+
+        assert str(exc_info.value) == error_string
+        assert "Failed to parse" not in str(exc_info.value)
+
     def test_invalid_json_raises_master_plan_error(self, monkeypatch):
         monkeypatch.setattr(
             "pipeline.master.acp_call_with_retry", lambda *a, **k: "not json"

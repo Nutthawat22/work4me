@@ -2,7 +2,7 @@
 pipeline/state.py
 
 Data structures shared across the agentic pipeline: WorkItem, AgentResult,
-TestResult, TestFailure, FailReport, PipelineState.
+TestResult, TestFailure, ReviewResult, FailReport, PipelineState.
 
 See ~/dev-plans/agents/features/2026-08-10-agentic-pipeline.md for the
 full design spec these are derived from.
@@ -56,6 +56,22 @@ class TestResult:
     total: int
     failed: int
     failures: list[TestFailure]
+
+
+# ── Review Result ────────────────────────────────────────────────────────────
+
+@dataclass
+class ReviewResult:
+    """Accept/reject verdict shape used by specialists/base.py's internal
+    self-check loop (see run_specialist/run_multifile_specialist): after
+    writing its own output, a specialist verifies it against the
+    WorkItem's acceptance_criteria/dependency_context via a separate
+    self-check LLM call, and this is that call's parsed response. Not a
+    separate Master-owned review step — the whole self-check-and-retry
+    loop lives inside one specialist's execute() call."""
+    accepted: bool
+    issues: list[str]
+    reasoning: str
 
 
 # ── Fail Report ──────────────────────────────────────────────────────────────

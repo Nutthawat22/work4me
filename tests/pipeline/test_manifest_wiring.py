@@ -176,3 +176,27 @@ def test_decompose_features_invalid_json_raises(monkeypatch):
     monkeypatch.setattr("pipeline.master.acp_call_with_retry", lambda *a, **k: "not json")
     with pytest.raises(MasterPlanError):
         MasterAgent(_config()).decompose_features("design text")
+
+
+def test_decompose_features_retry_exhaustion_error_string_raises_clean_master_plan_error(monkeypatch):
+    """Bug A: decompose_features must detect acp_call_with_retry's
+    error-string-on-exhaustion return BEFORE parsing it as JSON."""
+    error_string = (
+        "[m] Error: acp_call_with_retry failed after 3 attempts, "
+        "last error: [m] Error: ACP prompt timed out after 240s."
+    )
+    monkeypatch.setattr("pipeline.master.acp_call_with_retry", lambda *a, **k: error_string)
+
+    with pytest.raises(MasterPlanError) as exc_info:
+        MasterAgent(_config()).decompose_features("design text")
+
+    assert str(exc_info.value) == error_string
+    assert "Failed to parse" not in str(exc_info.value)
+
+
+def test_parse_features_json_concatenated_documents_raises_specific_error():
+    """Bug B: same "extra data" detection applies to
+    _parse_features_json as _parse_json."""
+    concatenated = '{"features": []}{"features": []}'
+    with pytest.raises(MasterPlanError, match="more than one JSON document"):
+        MasterAgent._parse_features_json(concatenated)

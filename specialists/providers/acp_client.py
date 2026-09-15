@@ -605,10 +605,18 @@ def _build_retry_feedback_prompt(response_schema: Optional[dict[str, Any]], fail
     error half.
     """
     if response_schema is not None:
-        return f"Your previous response was invalid: {failure_reason}\n\nCorrect your response accordingly."
+        return (
+            f"Your previous response was invalid: {failure_reason}\n\n"
+            "Correct your response accordingly. Output EXACTLY ONE JSON document "
+            "-- do not repeat, restate, prepend, or append your previous attempt "
+            "alongside the corrected one; return ONLY the single corrected result."
+        )
     return (
         f"Your previous response was invalid: {failure_reason}\n\n"
-        "Correct your response and output ONLY the corrected content, no other text."
+        "Correct your response and output ONLY the corrected content, no other "
+        "text. Output EXACTLY ONE document -- do not repeat, restate, prepend, "
+        "or append your previous attempt alongside the corrected one; return "
+        "ONLY the single corrected result."
     )
 
 

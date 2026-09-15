@@ -365,10 +365,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         try:
-            print("🧩 Decomposing into features...")
+            print("🧩 Decomposing into features... (MasterAgent LLM call in progress, this can take a while)")
             features = master.decompose_features(design_text, requirements_text)
             print(f"   → {len(features)} feature(s)")
-            print("🗂️  Planning file manifest...")
+            print("🗂️  Planning file manifest... (LLM call in progress, this can take a while)")
             manifest = plan_file_manifest(features, config)
             print(f"   → {len(manifest.files)} file(s)")
             groups = group_into_work_items(manifest)
@@ -383,6 +383,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if passed else 1
 
     try:
+        print("🧠 Planning... (MasterAgent.plan_handoff() LLM call in progress — "
+              "this can take a few minutes for a large design doc, this can take a while)\n")
         work_items = master.plan_handoff(design_text, requirements_text)
     except MasterPlanError as e:
         print(f"⚠️  plan_handoff() failed to produce a valid plan: {e}")

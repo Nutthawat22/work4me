@@ -167,11 +167,28 @@ class TestRunner:
 
         command = [token.format(**format_context) for token in test_command]
 
+        # jest/vitest must run from the run's own product dir (output_dir):
+        # that's where package.json, jest.config.js/vitest config, and
+        # node_modules live — the repo root (PROJECT_ROOT) has none of
+        # that, so jest/vitest would hang trying to resolve themselves.
+        # pytest keeps using PROJECT_ROOT since it already works via the
+        # absolute tests_dir path plus PYTHONPATH=output_dir above.
+        run_cwd = output_dir if result_format in ("jest_json", "vitest_json") else PROJECT_ROOT
+
+        if result_format in ("jest_json", "vitest_json"):
+            install_failure = self._ensure_node_modules_installed(
+                language, test_command, output_dir, env
+            )
+            if install_failure is not None:
+                if os.path.exists(result_path):
+                    os.remove(result_path)
+                return install_failure
+
         try:
             try:
                 subprocess.run(
                     command,
-                    cwd=PROJECT_ROOT,
+                    cwd=run_cwd,
                     env=env,
                     capture_output=True,
                     text=True,
@@ -216,6 +233,99 @@ class TestRunner:
         finally:
             if os.path.exists(result_path):
                 os.remove(result_path)
+
+    def _ensure_node_modules_installed(
+        self, language: str, test_command: list[str], output_dir: str, env: dict
+    ) -> TestResult | None:
+        """
+        Before running jest/vitest, make sure output_dir (the run's
+        product dir) actually has node_modules installed — a fresh run's
+        generated package.json has never had `npm install`/`bun install`
+        run against it, so node_modules simply doesn't exist yet and
+        jest/vitest would fail immediately (or, pre-cwd-fix, hang trying
+        to resolve themselves from the repo root instead).
+
+        Toolchain choice mirrors pipeline/instructions.py's `uses_bun`
+        heuristic: bun if the configured test_command itself invokes
+        bun/bunx (e.g. typescript's `["bunx", "vitest", ...]`), npm
+        otherwise (e.g. javascript's `["npx", "jest", ...]`).
+
+        Returns None if no install was needed or it succeeded; returns a
+        failure TestResult (to short-circuit _run_language_suite) if
+        install was needed and failed.
+        """
+        package_json_path = os.path.join(output_dir, "package.json")
+        node_modules_path = os.path.join(output_dir, "node_modules")
+
+        if not os.path.isfile(package_json_path) or os.path.isdir(node_modules_path):
+            return None
+
+        uses_bun = test_command[0] in ("bun", "bunx")
+        install_command = ["bun", "install"] if uses_bun else ["npm", "install"]
+
+        try:
+            result = subprocess.run(
+                install_command,
+                cwd=output_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except FileNotFoundError:
+            return TestResult(
+                passed=False,
+                total=0,
+                failed=0,
+                failures=[
+                    TestFailure(
+                        test_name=f"<{install_command[0]} install failed>",
+                        work_item_id="",
+                        error_output=(
+                            f"{install_command[0]} executable not found — "
+                            f"is it installed? (language: {language})"
+                        ),
+                    )
+                ],
+            )
+        except subprocess.TimeoutExpired:
+            return TestResult(
+                passed=False,
+                total=0,
+                failed=0,
+                failures=[
+                    TestFailure(
+                        test_name=f"<{install_command[0]} install failed>",
+                        work_item_id="",
+                        error_output=(
+                            f"{' '.join(install_command)} in {output_dir} "
+                            "exceeded 120s timeout"
+                        ),
+                    )
+                ],
+            )
+
+        if result.returncode != 0:
+            error_text = (result.stderr or result.stdout or "").strip()
+            if len(error_text) > MAX_ERROR_OUTPUT_LEN:
+                error_text = error_text[:MAX_ERROR_OUTPUT_LEN] + "...[truncated]"
+            return TestResult(
+                passed=False,
+                total=0,
+                failed=0,
+                failures=[
+                    TestFailure(
+                        test_name=f"<{install_command[0]} install failed>",
+                        work_item_id="",
+                        error_output=(
+                            f"{' '.join(install_command)} in {output_dir} "
+                            f"exited with code {result.returncode}:\n{error_text}"
+                        ),
+                    )
+                ],
+            )
+
+        return None
 
     @staticmethod
     def _find_test_files(tests_dir: str, patterns: list[str]) -> bool:

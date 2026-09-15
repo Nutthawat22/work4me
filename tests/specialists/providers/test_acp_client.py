@@ -22,6 +22,7 @@ from specialists.providers import acp_client
 from specialists.providers.acp_client import (
     AcpSessionPool,
     _build_minimal_opencode_config,
+    _build_retry_feedback_prompt,
     acp_call,
     acp_call_with_retry,
 )
@@ -513,3 +514,23 @@ def test_acp_call_with_retry_acp_error_string_triggers_retry(monkeypatch, fresh_
 def test_acp_call_with_retry_max_attempts_less_than_one_raises():
     with pytest.raises(ValueError):
         acp_call_with_retry(MESSAGES, "claude-sonnet-5", BASE_CONFIG, max_attempts=0)
+
+
+# ── _build_retry_feedback_prompt: forbids repeating/concatenating attempts ──
+
+def test_retry_feedback_prompt_forbids_repeating_previous_attempt_with_schema():
+    prompt = _build_retry_feedback_prompt(
+        {"name": "x", "schema": {"type": "object"}}, "some failure reason"
+    )
+    assert "some failure reason" in prompt
+    assert "exactly one" in prompt.lower()
+    assert "repeat" in prompt.lower()
+    assert "previous attempt" in prompt.lower()
+
+
+def test_retry_feedback_prompt_forbids_repeating_previous_attempt_without_schema():
+    prompt = _build_retry_feedback_prompt(None, "some failure reason")
+    assert "some failure reason" in prompt
+    assert "exactly one" in prompt.lower()
+    assert "repeat" in prompt.lower()
+    assert "previous attempt" in prompt.lower()

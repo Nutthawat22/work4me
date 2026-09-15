@@ -74,12 +74,44 @@ class TestDecomposeHappyPath:
 
 
 class TestDecomposeErrors:
+    def test_retry_exhaustion_error_string_raises_clean_master_plan_error(self, monkeypatch):
+        """
+        Bug A: acp_call_with_retry never raises -- on total exhaustion it
+        returns an f"[{model}] Error: ..." string. decompose() must detect
+        that BEFORE calling _parse_json, raising a clean MasterPlanError
+        whose message IS that error string, not a nested "failed to parse
+        as JSON" wrapper around it.
+        """
+        error_string = (
+            "[m] Error: acp_call_with_retry failed after 3 attempts, "
+            "last error: [m] Error: ACP prompt timed out after 120s."
+        )
+        monkeypatch.setattr(
+            "pipeline.master.acp_call_with_retry", lambda *a, **k: error_string
+        )
+        with pytest.raises(MasterPlanError) as exc_info:
+            MasterAgent(_config()).decompose("build something")
+
+        assert str(exc_info.value) == error_string
+        assert "Failed to parse" not in str(exc_info.value)
+
     def test_invalid_json_raises_master_plan_error(self, monkeypatch):
         monkeypatch.setattr(
             "pipeline.master.acp_call_with_retry", lambda *a, **k: "not json"
         )
         with pytest.raises(MasterPlanError):
             MasterAgent(_config()).decompose("build something")
+
+    def test_concatenated_json_documents_raises_specific_master_plan_error(self):
+        """
+        Bug B: two complete JSON documents concatenated with no separator
+        must raise a MasterPlanError that specifically calls out "more
+        than one JSON document" / extra data, not a generic
+        json.JSONDecodeError-derived message.
+        """
+        concatenated = '{"items": []}{"items": []}'
+        with pytest.raises(MasterPlanError, match="more than one JSON document"):
+            MasterAgent._parse_json(concatenated)
 
     def test_invalid_language_raises_master_plan_error(self, monkeypatch):
         bad_json = json.dumps({
