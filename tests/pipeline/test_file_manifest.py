@@ -286,7 +286,7 @@ def test_plan_file_manifest_happy_path(monkeypatch):
     def fake(*args, **kwargs):
         return manifest_json
 
-    monkeypatch.setattr("pipeline.file_manifest.call_llm", fake)
+    monkeypatch.setattr("pipeline.file_manifest.acp_call_with_retry", fake)
 
     manifest = plan_file_manifest(_features(), _config())
     assert len(manifest.files) == 5
@@ -295,7 +295,7 @@ def test_plan_file_manifest_happy_path(monkeypatch):
 
 
 def test_plan_file_manifest_invalid_json_raises(monkeypatch):
-    monkeypatch.setattr("pipeline.file_manifest.call_llm", lambda *a, **k: "not json")
+    monkeypatch.setattr("pipeline.file_manifest.acp_call_with_retry", lambda *a, **k: "not json")
     with pytest.raises(FileManifestParseError):
         plan_file_manifest(_features(), _config())
 
@@ -311,12 +311,12 @@ def test_plan_file_manifest_validation_failure_raises(monkeypatch):
              "contributing_features": ["FEAT-requests"], "requirements": [], "depends_on_files": []},
         ]
     })
-    monkeypatch.setattr("pipeline.file_manifest.call_llm", lambda *a, **k: bad_json)
+    monkeypatch.setattr("pipeline.file_manifest.acp_call_with_retry", lambda *a, **k: bad_json)
     with pytest.raises(FileManifestParseError):
         plan_file_manifest(_features(), _config())
 
 
 def test_plan_file_manifest_llm_error_sentinel(monkeypatch):
-    monkeypatch.setattr("pipeline.file_manifest.call_llm", lambda *a, **k: "[m] Error: boom")
+    monkeypatch.setattr("pipeline.file_manifest.acp_call_with_retry", lambda *a, **k: "[m] Error: boom")
     with pytest.raises(FileManifestParseError):
         plan_file_manifest(_features(), _config())

@@ -1,21 +1,23 @@
 """
 pipeline/file_manifest.py
 
-Additive, NOT-YET-WIRED scaffold for the feature-oriented / file-indexed
-planning stage. Nothing in the live pipeline (dispatch.py, design.py,
-runner.py) calls into this module yet — it exists so the planning flow
+Feature-oriented / file-indexed planning stage — one of Master's
+selectable layout strategies (Phase 4 of the ACP-native rearchitecture,
+see dev-plans/agents/features/2026-09-14-acp-native-master-architecture.md).
+pipeline/master.py's MasterAgent.plan_layout(strategy="llm_decided")
+drives the flow below; ingest.py's --mode manifest branch is the CLI
+entry point that reaches it via plan_layout.
 
-    Features  ->  FileManifest  ->  FileGroups
-
-can be built up and tested in isolation before being wired in.
+    Features  ->  FileManifest  ->  FileGroups  ->  WorkItems
 
 The stage works in three steps:
 
   1. plan_file_manifest(features, config)   -- turn feature intents into a
      file-indexed plan where every physical path appears exactly once with
-     its requirements merged across all contributing features. This is a
-     deliberate STUB: it will eventually make ONE structured LLM call, but
-     that call is intentionally not implemented here.
+     its requirements merged across all contributing features, via ONE
+     acp_call_with_retry LLM call (same-session retry-with-error-feedback,
+     Option A — mirrors pipeline/master.py's plan_handoff()/
+     decompose_features() pattern).
 
   2. group_into_work_items(manifest)        -- cluster FileSpecs into
      FileGroups (cohesion units) that a single multi-file specialist call
@@ -39,11 +41,19 @@ from pipeline.state import (
     FileSpec,
     WorkItem,
 )
-from specialists.llm_client import call_llm
+from specialists.providers.acp_client import acp_call_with_retry
+
+# Retry-with-error-feedback attempt cap for this module's one planning
+# call, reusing pipeline.master's shared constant. pipeline/master.py does
+# not import anything from pipeline/file_manifest.py (verified: its only
+# pipeline-internal imports are pipeline.dispatch and pipeline.state), so
+# importing PLANNING_MAX_ATTEMPTS from pipeline.master here is not
+# circular.
+from pipeline.master import PLANNING_MAX_ATTEMPTS
 
 
 # Longer timeout: the feature list plus the model's file-planning reasoning
-# can be large, well past call_llm's 60s default.
+# can be large, well past acp_call_with_retry's 60s default.
 PLAN_FILE_MANIFEST_TIMEOUT_SECONDS = 240
 
 VALID_FILE_ROLES: list[str] = ["scaffold", "feature", "shared", "entrypoint"]
@@ -187,15 +197,20 @@ def plan_file_manifest(features: list[Feature], config: dict) -> FileManifest:
     bundle, or a schema is never written twice by competing features). The
     result is validated with validate_file_manifest() before being returned.
 
+    Routes through specialists.providers.acp_client.acp_call_with_retry
+    (same-session retry-with-error-feedback, Option A — see
+    pipeline/master.py's plan_handoff()/decompose_features() for the exact
+    pattern this mirrors), not the old provider-dispatch call_llm() wrapper.
+
     Raises:
         FileManifestParseError: if the response is not valid JSON, is
-            structurally malformed, or fails manifest validation.
+            structurally malformed, or fails manifest validation, on every
+            retry attempt (see acp_call_with_retry).
     """
     valid_languages = set(config["languages"].keys())
 
     model_cfg = config["models"]["design"]
     model = model_cfg["model"]
-    provider = model_cfg["provider"]
 
     system_prompt = PLAN_FILE_MANIFEST_SYSTEM_PROMPT.format(
         valid_languages=", ".join(sorted(valid_languages))
@@ -205,10 +220,23 @@ def plan_file_manifest(features: list[Feature], config: dict) -> FileManifest:
         {"role": "user", "content": _render_features(features)},
     ]
     response_schema = _build_file_manifest_response_schema(valid_languages)
-    raw = call_llm(
-        messages, model, config, provider=provider,
+
+    def _parse_and_validate(raw: str) -> FileManifest:
+        file_dicts = _parse_file_manifest_json(raw)
+        manifest = FileManifest(files=[_build_file_spec(idx, d) for idx, d in enumerate(file_dicts)])
+        errors = validate_file_manifest(manifest, features)
+        if errors:
+            raise FileManifestParseError(
+                "plan_file_manifest produced an invalid manifest:\n" + "\n".join(errors)
+            )
+        return manifest
+
+    raw = acp_call_with_retry(
+        messages, model, config,
         timeout=PLAN_FILE_MANIFEST_TIMEOUT_SECONDS,
         response_schema=response_schema,
+        parse_and_validate_fn=_parse_and_validate,
+        max_attempts=PLANNING_MAX_ATTEMPTS,
     )
 
     if raw.startswith(f"[{model}] Error:"):

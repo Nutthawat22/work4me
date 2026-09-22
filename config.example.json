@@ -14,7 +14,8 @@
     "runs_dir": "runs/",
     "output_dir": "product",
     "tests_dir": "tests",
-    "tests_blocking": true
+    "tests_blocking": true,
+    "max_prompt_content_chars": 200000
   },
   "languages": {
     "python": {

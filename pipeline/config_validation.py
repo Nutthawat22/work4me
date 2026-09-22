@@ -32,6 +32,15 @@ REQUIRED_PIPELINE_KEYS: dict[str, type] = {
     "tests_dir": str,
 }
 
+# Keys that MAY be present under pipeline.* but are not required -- if
+# present, their type is still validated (same style as
+# REQUIRED_PIPELINE_KEYS); if absent, no error is raised. See
+# pipeline/acp_content.py's DEFAULT_MAX_PROMPT_CONTENT_CHARS for the
+# default a caller should use when this key is omitted.
+OPTIONAL_PIPELINE_KEYS: dict[str, type] = {
+    "max_prompt_content_chars": int,
+}
+
 REQUIRED_LANGUAGE_KEYS: dict[str, tuple] = {
     "test_command": (list,),
     "test_file_patterns": (list,),
@@ -111,6 +120,17 @@ def validate_config(config: dict) -> list[str]:
             if key not in pipeline_cfg:
                 errors.append(f"Missing required key: pipeline.{key}")
             elif not isinstance(pipeline_cfg[key], expected_type) or (
+                expected_type is int and isinstance(pipeline_cfg[key], bool)
+            ):
+                errors.append(
+                    f"pipeline.{key} must be {_article(expected_type)} {_type_name(expected_type)}, "
+                    f"got {type(pipeline_cfg[key]).__name__}"
+                )
+
+        for key, expected_type in OPTIONAL_PIPELINE_KEYS.items():
+            if key not in pipeline_cfg:
+                continue
+            if not isinstance(pipeline_cfg[key], expected_type) or (
                 expected_type is int and isinstance(pipeline_cfg[key], bool)
             ):
                 errors.append(

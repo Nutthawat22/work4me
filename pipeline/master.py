@@ -51,7 +51,15 @@ import os
 import re
 
 from pipeline.dispatch import CycleError, topological_sort
-from pipeline.state import AgentResult, FailReport, Feature, TestFailure, TestResult, WorkItem
+from pipeline.state import (
+    AgentResult,
+    FailReport,
+    Feature,
+    FileManifest,
+    TestFailure,
+    TestResult,
+    WorkItem,
+)
 from specialists.providers.acp_client import acp_call_with_retry
 
 VALID_TYPES: set[str] = {"logic", "ui", "config", "test", "scaffold", "integrate"}
@@ -622,6 +630,119 @@ class MasterAgent:
 
         parsed = self._parse_features_json(raw)
         return self._validate_and_build_features(parsed, valid_languages)
+
+    def plan_layout(
+        self,
+        features: list[Feature],
+        strategy: str = "llm_decided",
+        external_layout: dict | None = None,
+    ) -> list[WorkItem]:
+        """
+        Plan file/component layout for the given features, then adapt the
+        result into dispatchable WorkItems. Two selectable strategies (see
+        the design doc's Phase 4 — "file_manifest.py as a Selectable
+        Strategy"):
+
+        - "llm_decided" (default): calls file_manifest.plan_file_manifest()
+          (one LLM call, itself retry-with-error-feedback wrapped — see
+          plan_file_manifest's own docstring) to derive the file plan from
+          features, exactly as pipeline/ingest.py's --mode manifest branch
+          used to do by hand before this method existed.
+        - "external": accepts a pre-built layout via `external_layout`
+          (see the Implementation notes below for the exact shape
+          expected) instead of making any LLM call for the layout step —
+          still runs the result through the same
+          group_into_work_items()/validate_file_manifest() pipeline as the
+          llm_decided path, since those are pure, strategy-agnostic
+          functions.
+
+        Both strategies converge on the same group_into_work_items() ->
+        file_groups_to_work_items() pipeline afterward — WorkItem output
+        shape is identical regardless of which strategy produced the
+        FileManifest.
+
+        Local (not module-level) imports of pipeline.file_manifest below
+        are required, not stylistic: file_manifest.py imports
+        PLANNING_MAX_ATTEMPTS from this module at its own module level
+        (see file_manifest.py's plan_file_manifest), so a module-level
+        `from pipeline.file_manifest import ...` here would be a genuine
+        circular import (verified: triggers ImportError on
+        partially-initialized module). Deferring the import into this
+        method's body avoids it, matching the existing precedent already
+        used by pipeline/ingest.py's --mode manifest branch.
+
+        Args:
+            features: Feature list (e.g. from decompose_features()) that
+                the layout must cover.
+            strategy: "llm_decided" or "external".
+            external_layout: Required when strategy="external". Minimal
+                input contract (deliberately not over-built for a caller
+                that doesn't exist yet): a dict of shape
+                `{"files": [<file_spec_dict>, ...]}` where each
+                file_spec_dict has the same keys FileSpec requires (path,
+                role, language, contributing_features, requirements,
+                depends_on_files) — the same shape
+                file_manifest._parse_file_manifest_json/_build_file_spec
+                already parse from LLM JSON responses. Reused directly here
+                (via _build_file_spec) so there is exactly one code path
+                turning a raw file-spec dict list into FileSpec objects
+                regardless of strategy.
+
+        Raises:
+            MasterPlanError: if strategy is not one of "llm_decided"/
+                "external", if strategy="external" and external_layout is
+                None or malformed, or if the underlying FileManifest fails
+                validate_file_manifest() (surfaced as
+                FileManifestParseError from file_manifest.py, wrapped/
+                re-raised as MasterPlanError for a consistent exception
+                type at the MasterAgent boundary — callers of Master's
+                other planning methods already only need to catch
+                MasterPlanError, this should be no different).
+        """
+        from pipeline.file_manifest import (
+            FileManifestParseError,
+            _build_file_spec,
+            file_groups_to_work_items,
+            group_into_work_items,
+            plan_file_manifest,
+            validate_file_manifest,
+        )
+
+        if strategy == "llm_decided":
+            try:
+                manifest = plan_file_manifest(features, self.config)
+            except FileManifestParseError as e:
+                raise MasterPlanError(str(e)) from e
+
+        elif strategy == "external":
+            if external_layout is None:
+                raise MasterPlanError(
+                    "strategy='external' requires external_layout to be provided"
+                )
+
+            file_dicts = external_layout.get("files", [])
+            try:
+                manifest = FileManifest(
+                    files=[_build_file_spec(idx, d) for idx, d in enumerate(file_dicts)]
+                )
+            except FileManifestParseError as e:
+                raise MasterPlanError(str(e)) from e
+
+            errors = validate_file_manifest(manifest, features)
+            if errors:
+                raise MasterPlanError(
+                    "plan_layout(strategy='external') produced an invalid manifest:\n"
+                    + "\n".join(errors)
+                )
+
+        else:
+            raise MasterPlanError(
+                f"Unknown layout strategy: {strategy!r}. Valid strategies: "
+                f"'llm_decided', 'external'"
+            )
+
+        groups = group_into_work_items(manifest)
+        return file_groups_to_work_items(groups, manifest)
 
     @staticmethod
     def _check_dependency_graph(work_items: list[WorkItem]) -> None:

@@ -33,7 +33,6 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from pipeline.config_validation import validate_config
 from pipeline.master import MasterAgent, MasterPlanError
-from pipeline.file_manifest import FileManifestParseError
 from pipeline.runner import load_config, run_pipeline
 
 MANIFEST_FILENAME = "MANIFEST.sha256"
@@ -358,23 +357,15 @@ def main(argv: list[str] | None = None) -> int:
     label_base = os.path.basename(package_dir.rstrip(os.sep))
 
     if args.mode == "manifest":
-        from pipeline.file_manifest import (
-            file_groups_to_work_items,
-            group_into_work_items,
-            plan_file_manifest,
-        )
-
         try:
             print("🧩 Decomposing into features... (MasterAgent LLM call in progress, this can take a while)")
             features = master.decompose_features(design_text, requirements_text)
             print(f"   → {len(features)} feature(s)")
-            print("🗂️  Planning file manifest... (LLM call in progress, this can take a while)")
-            manifest = plan_file_manifest(features, config)
-            print(f"   → {len(manifest.files)} file(s)")
-            groups = group_into_work_items(manifest)
-            print(f"   → {len(groups)} group(s)")
-            work_items = file_groups_to_work_items(groups, manifest)
-        except (MasterPlanError, FileManifestParseError) as e:
+            print("🗂️  Planning layout via MasterAgent.plan_layout(strategy='llm_decided')... "
+                  "(LLM call in progress, this can take a while)")
+            work_items = master.plan_layout(features, strategy="llm_decided")
+            print(f"   → {len(work_items)} work item(s)")
+        except MasterPlanError as e:
             print(f"⚠️  manifest planning failed to produce a valid plan: {e}")
             return 1
 
