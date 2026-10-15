@@ -25,7 +25,7 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_ROOT)
 
-from pipeline.master import MasterAgent, MasterPlanError, PLAN_HANDOFF_SYSTEM_PROMPT_TEMPLATE
+from pipeline.master import MasterAgent, MasterPlanError, TASK_PLANNING_PROMPT_TEMPLATE
 
 
 def load_real_example_config() -> dict:
@@ -37,29 +37,37 @@ def load_real_example_config() -> dict:
 MOCK_HANDOFF_LLM_RESPONSE = [
     {
         "id": "WI-001",
-        "type": "logic",
+        "category": "feature",
         "language": "typescript",
+        "module": "request-draft",
+        "scope": "Implement the request draft API",
         "title": "[WP-002] Request draft API",
         "description": (
             "Source IDs: REQ-003 | Test IDs: TEST-001 | "
             "Completion criteria: endpoint returns 201 on valid draft request"
         ),
         "acceptance_criteria": ["POST /drafts returns 201 with a draft id"],
-        "output_path": "src/api/drafts.ts",
+        "requirement_refs": ["REQ-003", "TEST-001"],
+        "owned_files": [{"path": "src/api/drafts.ts", "language": "typescript", "area": "product"}],
         "depends_on": [],
+        "expected_interfaces": ["POST /drafts"],
     },
     {
         "id": "WI-002",
-        "type": "test",
+        "category": "validation",
         "language": "typescript",
+        "module": "request-draft-tests",
+        "scope": "Validate the request draft API",
         "title": "[WP-002] Request draft API tests",
         "description": (
             "Source IDs: REQ-003 | Test IDs: TEST-001 | "
             "Completion criteria: endpoint returns 201 on valid draft request"
         ),
         "acceptance_criteria": ["POST /drafts returns 201 with a draft id"],
-        "output_path": "tests/api/drafts.test.ts",
+        "requirement_refs": ["REQ-003", "TEST-001"],
+        "owned_files": [{"path": "tests/api/drafts.test.ts", "language": "typescript", "area": "tests"}],
         "depends_on": ["WI-001"],
+        "expected_interfaces": [],
     },
 ]
 
@@ -104,7 +112,7 @@ class TestHandoffSystemPromptListsTypescript:
         config = load_real_example_config()
         valid_languages = set(config["languages"].keys())
 
-        system_prompt = PLAN_HANDOFF_SYSTEM_PROMPT_TEMPLATE.format(
+        system_prompt = TASK_PLANNING_PROMPT_TEMPLATE.format(
             valid_languages=", ".join(sorted(valid_languages))
         )
 

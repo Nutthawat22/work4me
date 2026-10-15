@@ -286,6 +286,7 @@ class AcpSession:
     _home_dir: tempfile.TemporaryDirectory
     _config_dir: tempfile.TemporaryDirectory
     _cwd_dir: tempfile.TemporaryDirectory
+    _closed: bool = field(default=False, init=False, repr=False)
 
     def is_alive(self) -> bool:
         returncode = getattr(self.process, "returncode", None)
@@ -304,17 +305,24 @@ class AcpSession:
         return prompt_resp, accumulator.accumulated_text()
 
     async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         try:
-            await self.conn.close()
-        except Exception:
-            pass
-        try:
-            await self._cm.__aexit__(None, None, None)
-        except Exception:
-            pass
-        self._home_dir.cleanup()
-        self._config_dir.cleanup()
-        self._cwd_dir.cleanup()
+            try:
+                await self.conn.close()
+            except Exception:
+                pass
+        finally:
+            try:
+                try:
+                    await self._cm.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            finally:
+                self._home_dir.cleanup()
+                self._config_dir.cleanup()
+                self._cwd_dir.cleanup()
 
 
 class AcpSessionPool:
@@ -335,14 +343,18 @@ class AcpSessionPool:
     def __init__(self) -> None:
         self._sessions: dict[str, AcpSession] = {}
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
+        self._stopping = False
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
-        if self._loop is not None:
-            return self._loop
         with self._lock:
+            if self._stopping:
+                raise RuntimeError("ACP session pool is shutting down")
             if self._loop is not None:
+                if not self._loop.is_running():
+                    raise RuntimeError("ACP session pool event loop is not accepting work")
                 return self._loop
             ready = threading.Event()
 
@@ -351,7 +363,18 @@ class AcpSessionPool:
                 asyncio.set_event_loop(loop)
                 self._loop = loop
                 ready.set()
-                loop.run_forever()
+                try:
+                    loop.run_forever()
+                finally:
+                    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.run_until_complete(loop.shutdown_default_executor())
+                    loop.close()
+                    asyncio.set_event_loop(None)
 
             thread = threading.Thread(target=_run, name="acp-session-pool-loop", daemon=True)
             thread.start()
@@ -366,45 +389,59 @@ class AcpSessionPool:
         return future.result(timeout=timeout)
 
     async def _create_session(self, config: dict[str, Any], model: str) -> AcpSession:
-        home_dir = tempfile.TemporaryDirectory(prefix="acp-pool-home-")
-        config_dir = tempfile.TemporaryDirectory(prefix="acp-pool-config-")
-        cwd_dir = tempfile.TemporaryDirectory(prefix="acp-pool-cwd-")
+        home_dir = config_dir = cwd_dir = None
+        cm = None
+        entered = False
+        try:
+            home_dir = tempfile.TemporaryDirectory(prefix="acp-pool-home-")
+            config_dir = tempfile.TemporaryDirectory(prefix="acp-pool-config-")
+            cwd_dir = tempfile.TemporaryDirectory(prefix="acp-pool-cwd-")
 
-        opencode_config = _build_minimal_opencode_config(config, model)
-        config_path = os.path.join(config_dir.name, "opencode.json")
-        with open(config_path, "w") as f:
-            json.dump(opencode_config, f)
+            opencode_config = _build_minimal_opencode_config(config, model)
+            config_path = os.path.join(config_dir.name, "opencode.json")
+            with open(config_path, "w") as f:
+                json.dump(opencode_config, f)
 
-        env = {
-            **os.environ,
-            "HOME": home_dir.name,
-            "OPENCODE_CONFIG": config_path,
-        }
+            env = {
+                **os.environ,
+                "HOME": home_dir.name,
+                "OPENCODE_CONFIG": config_path,
+            }
 
-        client = _ForwardingClient()
+            client = _ForwardingClient()
+            cm = acp.spawn_agent_process(client, "opencode", "acp", cwd=cwd_dir.name, env=env)
+            conn, process = await cm.__aenter__()
+            entered = True
 
-        cm = acp.spawn_agent_process(client, "opencode", "acp", cwd=cwd_dir.name, env=env)
-        conn, process = await cm.__aenter__()
+            await conn.initialize(
+                protocol_version=acp.PROTOCOL_VERSION,
+                client_capabilities=acp.schema.ClientCapabilities(
+                    fs=acp.schema.FileSystemCapabilities(read_text_file=False, write_text_file=False),
+                    terminal=False,
+                ),
+            )
+            session_resp = await conn.new_session(cwd=cwd_dir.name, mcp_servers=[])
 
-        await conn.initialize(
-            protocol_version=acp.PROTOCOL_VERSION,
-            client_capabilities=acp.schema.ClientCapabilities(
-                fs=acp.schema.FileSystemCapabilities(read_text_file=False, write_text_file=False),
-                terminal=False,
-            ),
-        )
-        session_resp = await conn.new_session(cwd=cwd_dir.name, mcp_servers=[])
-
-        return AcpSession(
-            conn=conn,
-            process=process,
-            session_id=session_resp.session_id,
-            client=client,
-            _cm=cm,
-            _home_dir=home_dir,
-            _config_dir=config_dir,
-            _cwd_dir=cwd_dir,
-        )
+            return AcpSession(
+                conn=conn,
+                process=process,
+                session_id=session_resp.session_id,
+                client=client,
+                _cm=cm,
+                _home_dir=home_dir,
+                _config_dir=config_dir,
+                _cwd_dir=cwd_dir,
+            )
+        except BaseException as error:
+            if entered and cm is not None:
+                try:
+                    await cm.__aexit__(type(error), error, error.__traceback__)
+                except BaseException:
+                    pass
+            for directory in (home_dir, config_dir, cwd_dir):
+                if directory is not None:
+                    directory.cleanup()
+            raise
 
     def get_or_create(self, role_key: str, config: dict[str, Any], model: str) -> AcpSession:
         """
@@ -415,21 +452,23 @@ class AcpSessionPool:
         fails, the exception propagates to the caller (acp_call), which
         converts it to the standard error-string format.
         """
-        with self._lock:
-            existing = self._sessions.get(role_key)
-
-        if existing is not None and existing.is_alive():
-            return existing
-
-        if existing is not None and not existing.is_alive():
-            # Stale entry from a dead subprocess -- drop it before respawning.
+        with self._lifecycle_lock:
             with self._lock:
-                self._sessions.pop(role_key, None)
+                existing = self._sessions.get(role_key)
 
-        new_session = self._run_coro(self._create_session(config, model))
-        with self._lock:
-            self._sessions[role_key] = new_session
-        return new_session
+            if existing is not None and existing.is_alive():
+                return existing
+
+            if existing is not None and not existing.is_alive():
+                # Stale entry from a dead subprocess -- drop it before respawning.
+                with self._lock:
+                    self._sessions.pop(role_key, None)
+                self._run_coro(existing.close(), timeout=10)
+
+            new_session = self._run_coro(self._create_session(config, model))
+            with self._lock:
+                self._sessions[role_key] = new_session
+            return new_session
 
     def prompt_sync(self, role_key: str, config: dict[str, Any], model: str, prompt_text: str, timeout: int):
         """
@@ -439,41 +478,76 @@ class AcpSessionPool:
         respawn once and retry the prompt; if that second attempt also
         fails, the exception propagates to the caller.
         """
-        session = self.get_or_create(role_key, config, model)
-        try:
-            return self._run_coro(session.prompt(prompt_text, timeout), timeout=timeout + 5)
-        except Exception:
-            if session.is_alive():
-                raise
-            # Session died mid-call -- respawn once and retry.
-            with self._lock:
-                self._sessions.pop(role_key, None)
-            respawned = self.get_or_create(role_key, config, model)
-            return self._run_coro(respawned.prompt(prompt_text, timeout), timeout=timeout + 5)
+        with self._lifecycle_lock:
+            session = self.get_or_create(role_key, config, model)
+            try:
+                return self._run_coro(session.prompt(prompt_text, timeout), timeout=timeout + 5)
+            except Exception:
+                if session.is_alive():
+                    raise
+                # Session died mid-call -- respawn once and retry.
+                with self._lock:
+                    self._sessions.pop(role_key, None)
+                respawned = self.get_or_create(role_key, config, model)
+                return self._run_coro(respawned.prompt(prompt_text, timeout), timeout=timeout + 5)
 
     def teardown_all(self) -> None:
         """
-        Cleanly shut down every pooled subprocess/session. Safe to call
-        at pipeline-run end (wiring this into pipeline/runner.py's
-        actual run lifecycle is Phase 3 scope, not done here).
+        Cleanly shut down every pooled subprocess/session, then stop and
+        close the background event loop and its executor. The lifecycle
+        lock prevents teardown from racing an active prompt or session
+        creation; repeated calls after shutdown are no-ops.
         """
+        with self._lifecycle_lock:
+            self._teardown_all_locked()
+
+    def _teardown_all_locked(self) -> None:
         with self._lock:
+            if self._stopping:
+                return
+            loop = self._loop
+            thread = self._thread
+            if loop is None:
+                return
+            self._stopping = True
             sessions = list(self._sessions.values())
             self._sessions.clear()
 
-        if self._loop is not None:
+        close_errors: list[Exception] = []
+        try:
             for session in sessions:
+                future = None
                 try:
-                    self._run_coro(session.close(), timeout=10)
-                except Exception:
-                    pass
+                    future = asyncio.run_coroutine_threadsafe(session.close(), loop)
+                    future.result(timeout=10)
+                except Exception as error:
+                    close_errors.append(error)
+                    process = session.process
+                    if getattr(process, "returncode", None) is None and hasattr(process, "kill"):
+                        loop.call_soon_threadsafe(process.kill)
+                        try:
+                            asyncio.run_coroutine_threadsafe(process.wait(), loop).result(timeout=5)
+                        except Exception as wait_error:
+                            close_errors.append(wait_error)
+                        if future is not None:
+                            try:
+                                future.result(timeout=5)
+                            except Exception as closing_error:
+                                close_errors.append(closing_error)
 
-            loop = self._loop
             loop.call_soon_threadsafe(loop.stop)
-            if self._thread is not None:
-                self._thread.join(timeout=5)
-            self._loop = None
-            self._thread = None
+            if thread is not None:
+                thread.join(timeout=15)
+                if thread.is_alive():
+                    raise RuntimeError("ACP session pool event loop did not shut down")
+            if close_errors:
+                raise RuntimeError(f"Failed to close {len(close_errors)} ACP resource(s)") from close_errors[0]
+        finally:
+            with self._lock:
+                if self._thread is thread and (thread is None or not thread.is_alive()):
+                    self._loop = None
+                    self._thread = None
+                self._stopping = False
 
 
 _POOL = AcpSessionPool()

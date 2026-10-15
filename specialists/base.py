@@ -1,18 +1,16 @@
 """
 specialists/base.py
 
-Shared specialist execution helper. All eight specialists (Logic, UI,
-Config, Test, Scaffold, Integrate, Feature, Shared) delegate to
-run_specialist()/run_multifile_specialist() instead of duplicating the
-LLM-call + parse + write logic.
+Shared multi-file task execution helper. Category workers delegate to
+run_multifile_specialist() so output ownership and validation stay uniform.
 
 Self-check loop: after generating and writing its output, a specialist
 verifies its OWN work against the WorkItem's acceptance_criteria (and
 dependency_context, if given) via a SEPARATE self-check LLM call in the
 same pooled session. On rejection, the specialist regenerates with the
-self-check's issues appended as feedback, up to SELF_CHECK_MAX_ATTEMPTS
-extra attempts. This is entirely contained within one run_specialist()/
-run_multifile_specialist() call — callers (specialists/*.py's execute(),
+    self-check's issues appended as feedback, up to SELF_CHECK_MAX_ATTEMPTS
+extra attempts. This is entirely contained within one run_multifile_specialist()
+call — callers (specialists/*.py's execute(),
 and in turn pipeline/dispatch.py) see a single call in, a single
 AgentResult out, same as before this loop existed.
 """
@@ -22,14 +20,14 @@ import os
 import re
 
 from pipeline.state import AgentResult, ReviewResult, TestFailure, WorkItem
+from pipeline.task_validation import normalize_relative_path, truncate_with_marker
 from specialists.llm_client import call_llm
-
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MAX_RETRY_FAILURES_SHOWN = 5
 MAX_ERROR_OUTPUT_CHARS_IN_PROMPT = 500
-MAX_DEPENDENCY_FILES_SHOWN = 5
+MAX_DEPENDENCY_FILES_SHOWN = 20
 MAX_DEPENDENCY_CHARS_IN_PROMPT = 3000
+MAX_DEPENDENCY_TOTAL_CHARS_IN_PROMPT = 30000
 
 # Timeout for every call_llm() in this module (generation AND self-check
 # — see _self_check's own call below). The old implicit 60s default
@@ -67,6 +65,24 @@ SELF_CHECK_MAX_ATTEMPTS = 2
 MAX_SELF_CHECK_OUTPUT_CHARS = 6000
 MAX_SELF_CHECK_FILES_SHOWN = 8
 MAX_SELF_CHECK_ISSUES_SHOWN = 10
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _has_symlink_component(root: str, relative_path: str) -> bool:
+    current = root
+    for component in relative_path.split(os.sep):
+        current = os.path.join(current, component)
+        if os.path.islink(current):
+            return True
+    return False
 
 SELF_CHECK_SYSTEM_PROMPT = (
     "You are reviewing your OWN previous output for a work item, before "
@@ -121,11 +137,27 @@ def _build_dependency_section(dependency_context: dict[str, str]) -> str:
     """Build the '\\n\\nThis WorkItem depends on...' prompt section from
     already-implemented dependency file contents. Caps the number of
     files shown and truncates each to avoid bloating context."""
-    shown = list(dependency_context.items())[:MAX_DEPENDENCY_FILES_SHOWN]
-    blocks = [
-        f"--- {path} ---\n{content[:MAX_DEPENDENCY_CHARS_IN_PROMPT]}"
-        for path, content in shown
-    ]
+    blocks: list[str] = []
+    omitted: list[str] = []
+    total_chars = 0
+    for path, content in dependency_context.items():
+        if len(blocks) >= MAX_DEPENDENCY_FILES_SHOWN or total_chars >= MAX_DEPENDENCY_TOTAL_CHARS_IN_PROMPT:
+            omitted.append(path)
+            continue
+        remaining = MAX_DEPENDENCY_TOTAL_CHARS_IN_PROMPT - total_chars
+        shown_content = truncate_with_marker(
+            content,
+            min(MAX_DEPENDENCY_CHARS_IN_PROMPT, remaining),
+            "\n... (truncated by dependency context budget)",
+        )
+        blocks.append(f"--- {path} ---\n{shown_content}")
+        total_chars += len(shown_content)
+    if omitted:
+        blocks.append(
+            f"({len(omitted)} dependency file(s) omitted by prompt budget: "
+            + ", ".join(omitted)
+            + ")"
+        )
     return (
         "\n\nThis WorkItem depends on the following already-implemented "
         "files. Use their actual function/class names, signatures, and "
@@ -163,19 +195,37 @@ def _build_self_check_user_content(
     questions (acceptance criteria, interoperability) need to judge
     against."""
     lines = [
-        f"WorkItem: {work_item.id} ({work_item.type})",
+        f"Task: {work_item.id} ({work_item.category})",
+        f"Module: {work_item.module}",
+        f"Scope: {work_item.scope}",
         f"Title: {work_item.title}",
         f"Description: {work_item.description}",
         "Acceptance criteria:",
     ]
     lines.extend(f"- {c}" for c in work_item.acceptance_criteria)
+    lines.append(f"Requirement references: {', '.join(work_item.requirement_refs) or '(none)'}")
+    lines.extend(f"Expected interface: {contract}" for contract in work_item.expected_interfaces)
 
     lines.append(
         "\n--- Dependency context (already-implemented files this WorkItem depends on) ---"
     )
     if dependency_context:
+        total_chars = 0
+        shown_count = 0
+        omitted: list[str] = []
         for path, content in dependency_context.items():
-            lines.append(f"\n--- {path} ---\n{content[:MAX_DEPENDENCY_CHARS_IN_PROMPT]}")
+            if shown_count >= MAX_DEPENDENCY_FILES_SHOWN or total_chars >= MAX_DEPENDENCY_TOTAL_CHARS_IN_PROMPT:
+                omitted.append(path)
+                continue
+            remaining = MAX_DEPENDENCY_TOTAL_CHARS_IN_PROMPT - total_chars
+            shown = content[:min(MAX_DEPENDENCY_CHARS_IN_PROMPT, remaining)]
+            if len(shown) < len(content):
+                shown += "\n... (truncated by self-check dependency budget)"
+            lines.append(f"\n--- {path} ---\n{shown}")
+            total_chars += len(shown)
+            shown_count += 1
+        if omitted:
+            lines.append("\nDependency files omitted by self-check budget: " + ", ".join(omitted))
     else:
         lines.append("(none — this WorkItem has no dependencies)")
 
@@ -301,184 +351,30 @@ def _self_check(
         return None
 
 
-def _build_base_user_content(work_item: WorkItem) -> str:
+def _build_base_user_content(work_item: WorkItem, config: dict) -> str:
+    files = []
+    for owned_file in work_item.owned_files:
+        area_key = "tests_dir" if owned_file.area == "tests" else "output_dir"
+        configured_dir = normalize_relative_path(config["pipeline"][area_key])
+        path = normalize_relative_path(owned_file.path)
+        prefix = configured_dir + "/"
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+        files.append(f"- {owned_file.area}/{path} ({owned_file.language})")
     return (
+        f"Module: {work_item.module}\n"
+        f"Scope: {work_item.scope}\n"
         f"Title: {work_item.title}\n"
-        f"Language: {work_item.language}\n"
+        f"Primary language: {work_item.language}\n"
         f"Description: {work_item.description}\n"
+        f"Requirement references: {', '.join(work_item.requirement_refs) or '(none)'}\n"
         f"Acceptance criteria:\n"
         + "\n".join(f"- {c}" for c in work_item.acceptance_criteria)
-        + f"\nOutput path: {work_item.output_path}"
+        + f"\nExpected interfaces:\n"
+        + ("\n".join(f"- {contract}" for contract in work_item.expected_interfaces) or "- (none specified)")
+        + f"\nOwned files (create exactly this set; do not repeat the area directory prefix):\n"
+        + "\n".join(files)
     )
-
-
-def run_specialist(
-    work_item: WorkItem,
-    config: dict,
-    run_dir: str,
-    system_prompt: str,
-    agent_name: str,
-    subdir_key: str,
-    retry_failures: list[TestFailure] | None = None,
-    dependency_context: dict[str, str] | None = None,
-) -> AgentResult:
-    """
-    Call the LLM for a single WorkItem, write its output file, self-check
-    the result against the WorkItem's acceptance_criteria/
-    dependency_context, and return an AgentResult describing what
-    happened.
-
-    On self-check rejection, regenerates (re-running the same LLM call
-    with the self-check's issues appended as feedback) up to
-    SELF_CHECK_MAX_ATTEMPTS extra times before giving up and returning
-    success=False with the self-check's final rejection reasoning in
-    notes.
-
-    Args:
-        work_item: The WorkItem to implement.
-        config: Loaded config dict.
-        run_dir: Path to this pipeline run's output directory (see
-            pipeline/run_paths.py). Output files are written under
-            run_dir/{subdir}/... instead of PROJECT_ROOT.
-        system_prompt: Specialist-specific system prompt template. May
-            contain a `{language}` placeholder, which is filled in with
-            work_item.language. If the prompt has already been fully
-            formatted (no placeholders left, e.g. TestAgent pre-formats
-            both {language} and {test_framework} itself), formatting here
-            is a no-op.
-        agent_name: Name to record in the returned AgentResult.
-        subdir_key: Which config["pipeline"][...] key to resolve the output
-            directory from ("output_dir" or "tests_dir").
-        retry_failures: TestFailures (if any) that implicated this
-            WorkItem on a previous attempt (from the SEPARATE post-test
-            retry loop in pipeline/runner.py — orthogonal to this
-            function's own internal self-check loop). When non-empty, a
-            labeled section is appended to the user prompt describing
-            what broke, so the LLM has retry context. None/empty for the
-            initial (non-retry) dispatch.
-        dependency_context: Optional map of output_path -> file content
-            for this WorkItem's already-implemented dependencies (see
-            pipeline/dispatch.py's build_dependency_context()). When
-            non-empty, a separate labeled section is appended to the
-            user prompt so the LLM writes against the real dependency
-            API instead of inventing one, and the self-check loop also
-            uses it to check interoperability. Composed independently of
-            the retry-failure section above — both may be present at
-            once.
-
-    Returns:
-        AgentResult with success=True and files_written populated once
-        self-checked and accepted, or success=False and notes describing
-        the failure (LLM/write error, or self-check rejection exhausting
-        all attempts).
-    """
-    model_cfg = config["models"]["specialist"]
-    model = model_cfg["model"]
-    provider = model_cfg["provider"]
-    formatted_system_prompt = system_prompt.format(language=work_item.language)
-
-    base_user_content = _build_base_user_content(work_item)
-    if retry_failures:
-        base_user_content += _build_retry_section(retry_failures)
-    if dependency_context:
-        base_user_content += _build_dependency_section(dependency_context)
-
-    subdir = config["pipeline"][subdir_key]
-    output_path = work_item.output_path
-    if subdir_key == "tests_dir":
-        # TestAgent (the only subdir_key="tests_dir" caller) prompts the
-        # LLM with the WorkItem's output_path but no explicit instruction
-        # on whether it's relative to run_dir or to tests_dir itself —
-        # in practice the LLM (mirroring how plan.json's own test
-        # WorkItems name their output_path, e.g. "tests/foo.test.js")
-        # consistently includes a leading "{tests_dir}/" prefix. Since
-        # this path is then joined with subdir=tests_dir below, keeping
-        # that prefix would double it up into
-        # run_dir/tests/tests/foo.test.js. Strip one matching leading
-        # prefix here so output_path is always treated as relative to
-        # tests_dir directly, same convention as output_dir-relative
-        # WorkItems (ui/logic/config/scaffold/integrate) already use.
-        normalized = output_path.replace("\\", "/")
-        prefix = subdir.rstrip("/") + "/"
-        if normalized.startswith(prefix):
-            output_path = normalized[len(prefix):]
-    relative_path = os.path.join(subdir, output_path)
-    full_path = os.path.join(run_dir, subdir, output_path)
-
-    self_check_feedback: ReviewResult | None = None
-
-    for attempt in range(SELF_CHECK_MAX_ATTEMPTS + 1):
-        user_content = base_user_content
-        if self_check_feedback is not None:
-            user_content += _build_self_check_feedback_section(self_check_feedback)
-
-        messages = [
-            {"role": "system", "content": formatted_system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-
-        raw = call_llm(
-            messages, model, config, provider=provider,
-            timeout=SPECIALIST_TIMEOUT_SECONDS,
-            session_scope={"project": os.path.basename(run_dir.rstrip(os.sep)), "role": "specialist"},
-        )
-
-        if raw.startswith(f"[{model}] Error:"):
-            return AgentResult(
-                work_item_id=work_item.id,
-                agent_name=agent_name,
-                success=False,
-                files_written=[],
-                notes=raw,
-            )
-
-        content = _strip_code_fences(raw)
-
-        try:
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "w") as f:
-                f.write(content)
-        except OSError as e:
-            return AgentResult(
-                work_item_id=work_item.id,
-                agent_name=agent_name,
-                success=False,
-                files_written=[],
-                notes=f"Failed to write file at {full_path}: {e}",
-            )
-
-        check = _self_check(work_item, {relative_path: content}, dependency_context, config, run_dir)
-
-        if check is None or check.accepted:
-            return AgentResult(
-                work_item_id=work_item.id,
-                agent_name=agent_name,
-                success=True,
-                files_written=[relative_path],
-                notes="",
-            )
-
-        if attempt == SELF_CHECK_MAX_ATTEMPTS:
-            issues_text = "; ".join(check.issues) if check.issues else check.reasoning
-            return AgentResult(
-                work_item_id=work_item.id,
-                agent_name=agent_name,
-                success=False,
-                files_written=[],
-                notes=(
-                    f"Self-check rejected after {attempt + 1} attempt(s): "
-                    f"{issues_text}. Reasoning: {check.reasoning}"
-                ),
-            )
-
-        print(
-            f"  🔎 [{work_item.id}] self-check rejected — regenerating "
-            f"(attempt {attempt + 2}/{SELF_CHECK_MAX_ATTEMPTS + 1})..."
-        )
-        self_check_feedback = check
-
-    # Unreachable: the loop above always returns on its final iteration.
-    raise AssertionError("run_specialist's self-check loop exited without returning")
 
 
 def run_multifile_specialist(
@@ -487,37 +383,26 @@ def run_multifile_specialist(
     run_dir: str,
     system_prompt: str,
     agent_name: str,
-    subdir_key: str,
     retry_failures: list[TestFailure] | None = None,
     dependency_context: dict[str, str] | None = None,
 ) -> AgentResult:
     """
-    Multi-file variant of run_specialist for the scaffold/integrate/
-    feature/shared specialists.
+    Generate the exact set of files owned by one category task.
 
-    Unlike run_specialist (one WorkItem -> exactly one output file), the
-    scaffold/integrate/feature/shared stages each need to emit a whole
-    set of files at once. Rather than forcing one file per WorkItem, this
-    helper expects the LLM to return a JSON object mapping relative file
-    paths to complete file contents:
+    The LLM returns a JSON object mapping relative file paths to complete
+    file contents:
 
         {"files": {"package.json": "...", "src/server/index.ts": "..."}}
 
-    A bare {path: content} object (no "files" wrapper) is also accepted.
-    Every file is written under run_dir/{subdir}/{path}, and all relative
-    paths are collected into the returned AgentResult.files_written.
+    Every response path must exactly match one of the WorkItem's owned
+    files. Each file is written under its configured product/tests area.
 
-    Same self-check loop as run_specialist: after a successful write, a
-    separate self-check LLM call verifies the written files against
+    After a successful write, a separate self-check LLM call verifies the written files against
     acceptance_criteria/dependency_context, regenerating (all files, from
     the same original prompt plus self-check feedback) up to
     SELF_CHECK_MAX_ATTEMPTS extra times on rejection.
 
-    Args mirror run_specialist exactly (minus review_feedback, which
-    never existed on this function). The system_prompt is expected to
-    already instruct the model to output the {"files": {...}} shape; it
-    is still `.format(language=...)`-ed here for consistency (a no-op if
-    the prompt is already fully formatted).
+    The system_prompt instructs the model to output the `{"files": {...}}` shape.
 
     Returns:
         AgentResult with success=True and files_written populated once
@@ -531,13 +416,79 @@ def run_multifile_specialist(
     # .replace (not .format): the prompt contains literal JSON braces ({"files": ...}) that str.format would choke on.
     formatted_system_prompt = system_prompt.replace("{language}", work_item.language)
 
-    base_user_content = _build_base_user_content(work_item)
+    try:
+        base_user_content = _build_base_user_content(work_item, config)
+    except (KeyError, TypeError, ValueError) as exc:
+        return AgentResult(
+            work_item_id=work_item.id,
+            agent_name=agent_name,
+            success=False,
+            files_written=[],
+            notes=f"Invalid task file ownership: {exc}",
+        )
     if retry_failures:
         base_user_content += _build_retry_section(retry_failures)
     if dependency_context:
         base_user_content += _build_dependency_section(dependency_context)
 
-    subdir = config["pipeline"][subdir_key]
+    pipeline_config = config["pipeline"]
+    run_root = os.path.realpath(run_dir)
+    owned_paths: dict[str, tuple[str, str, str]] = {}
+    output_aliases: dict[str, str] = {}
+    for owned_file in work_item.owned_files:
+        area_key = "tests_dir" if owned_file.area == "tests" else "output_dir"
+        try:
+            configured_dir = normalize_relative_path(pipeline_config[area_key])
+            path = normalize_relative_path(owned_file.path)
+        except (KeyError, TypeError, ValueError) as exc:
+            return AgentResult(
+                work_item_id=work_item.id,
+                agent_name=agent_name,
+                success=False,
+                files_written=[],
+                notes=f"Invalid output ownership configuration: {exc}",
+            )
+        prefix = configured_dir + "/"
+        if path.startswith(prefix):
+            path = path[len(prefix):]
+        try:
+            path = normalize_relative_path(path)
+        except ValueError as exc:
+            return AgentResult(
+                work_item_id=work_item.id,
+                agent_name=agent_name,
+                success=False,
+                files_written=[],
+                notes=f"Invalid owned path {owned_file.path!r}: {exc}",
+            )
+        key = path.casefold()
+        if key in owned_paths:
+            return AgentResult(
+                work_item_id=work_item.id,
+                agent_name=agent_name,
+                success=False,
+                files_written=[],
+                notes=f"Duplicate normalized path in task ownership: {owned_file.path!r}",
+            )
+        area_dir = os.path.realpath(os.path.join(run_root, configured_dir))
+        if (
+            os.path.commonpath((run_root, area_dir)) != run_root
+            or _has_symlink_component(run_root, configured_dir)
+        ):
+            return AgentResult(
+                work_item_id=work_item.id,
+                agent_name=agent_name,
+                success=False,
+                files_written=[],
+                notes=f"Configured output directory escapes the run: {configured_dir!r}",
+            )
+        owned_paths[key] = (
+            os.path.join(configured_dir, path),
+            os.path.join(area_dir, path),
+            area_dir,
+        )
+        output_aliases[normalize_relative_path(owned_file.path).casefold()] = key
+        output_aliases[(configured_dir + "/" + path).casefold()] = key
 
     self_check_feedback: ReviewResult | None = None
 
@@ -569,8 +520,8 @@ def run_multifile_specialist(
         content = _strip_code_fences(raw)
 
         try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError as e:
+            parsed = json.loads(content, object_pairs_hook=_unique_json_object)
+        except (json.JSONDecodeError, ValueError) as e:
             return AgentResult(
                 work_item_id=work_item.id,
                 agent_name=agent_name,
@@ -579,11 +530,7 @@ def run_multifile_specialist(
                 notes=f"Failed to parse multi-file JSON response: {e}\nRaw response: {raw}",
             )
 
-        if isinstance(parsed, dict) and "files" in parsed:
-            files = parsed["files"]
-        else:
-            files = parsed
-
+        files = parsed.get("files") if isinstance(parsed, dict) and set(parsed) == {"files"} else None
         if not isinstance(files, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in files.items()
         ):
@@ -594,35 +541,98 @@ def run_multifile_specialist(
                 files_written=[],
                 notes=(
                     "Multi-file response has wrong shape — expected "
-                    '{"files": {path: content}} or {path: content} with string '
+                    '{"files": {path: content}} with string '
                     f"values.\nRaw response: {raw}"
                 ),
             )
 
-        files_written: list[str] = []
-        written_content: dict[str, str] = {}
-        write_error: AgentResult | None = None
+        normalized_files: dict[str, str] = {}
         for path, file_content in files.items():
-            relative_path = os.path.join(subdir, path)
-            full_path = os.path.join(run_dir, subdir, path)
             try:
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                with open(full_path, "w") as f:
-                    f.write(file_content)
-            except OSError as e:
-                write_error = AgentResult(
+                normalized = normalize_relative_path(path)
+            except ValueError as exc:
+                return AgentResult(
                     work_item_id=work_item.id,
                     agent_name=agent_name,
                     success=False,
                     files_written=[],
-                    notes=f"Failed to write file at {full_path}: {e}",
+                    notes=f"Unsafe output path {path!r}: {exc}",
                 )
-                break
-            files_written.append(relative_path)
+            key = output_aliases.get(normalized.casefold(), normalized.casefold())
+            if key in normalized_files:
+                return AgentResult(
+                    work_item_id=work_item.id,
+                    agent_name=agent_name,
+                    success=False,
+                    files_written=[],
+                    notes=f"Duplicate normalized output path: {path!r}",
+                )
+            normalized_files[key] = file_content
+
+        expected = set(owned_paths)
+        actual = set(normalized_files)
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        if missing or extra or not files:
+            return AgentResult(
+                work_item_id=work_item.id,
+                agent_name=agent_name,
+                success=False,
+                files_written=[],
+                notes=f"Output file set mismatch: missing={missing}, extra={extra}",
+            )
+        empty = sorted(path for path, value in normalized_files.items() if not value.strip())
+        if empty:
+            return AgentResult(
+                work_item_id=work_item.id,
+                agent_name=agent_name,
+                success=False,
+                files_written=[],
+                notes=f"Output contains empty file content: {empty}",
+            )
+
+        files_written: list[str] = []
+        written_content: dict[str, str] = {}
+        write_targets: list[tuple[str, str, str, str]] = []
+        for key, file_content in normalized_files.items():
+            relative_path, full_path, area_root = owned_paths[key]
+            resolved_target = os.path.realpath(full_path)
+            area_relative_path = os.path.relpath(full_path, area_root)
+            if (
+                os.path.commonpath((area_root, resolved_target)) != area_root
+                or _has_symlink_component(area_root, area_relative_path)
+            ):
+                return AgentResult(
+                    work_item_id=work_item.id,
+                    agent_name=agent_name,
+                    success=False,
+                    files_written=[],
+                    notes=f"Output path escapes or aliases its configured area: {relative_path}",
+                )
+            write_targets.append((relative_path, full_path, area_root, file_content))
             written_content[relative_path] = file_content
 
-        if write_error is not None:
-            return write_error
+        try:
+            for relative_path, full_path, area_root, file_content in write_targets:
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                resolved_parent = os.path.realpath(os.path.dirname(full_path))
+                area_relative_path = os.path.relpath(full_path, area_root)
+                if (
+                    os.path.commonpath((area_root, resolved_parent)) != area_root
+                    or _has_symlink_component(area_root, area_relative_path)
+                ):
+                    raise OSError(f"Output parent escapes or aliases configured area: {relative_path}")
+                with open(full_path, "w") as output_file:
+                    output_file.write(file_content)
+                files_written.append(relative_path)
+        except OSError as exc:
+            return AgentResult(
+                work_item_id=work_item.id,
+                agent_name=agent_name,
+                success=False,
+                files_written=files_written,
+                notes=f"Failed to write owned output: {exc}",
+            )
 
         check = _self_check(work_item, written_content, dependency_context, config, run_dir)
 

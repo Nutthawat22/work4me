@@ -92,8 +92,10 @@ class TestRunner:
 
         seen_languages: list[str] = []
         for item in work_items:
-            if item.language not in seen_languages:
-                seen_languages.append(item.language)
+            owned_languages = [owned_file.language for owned_file in item.owned_files]
+            for language in owned_languages or [item.language]:
+                if language not in seen_languages:
+                    seen_languages.append(language)
 
         ran_results: list[TestResult] = []
 

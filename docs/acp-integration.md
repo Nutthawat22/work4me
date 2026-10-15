@@ -4,7 +4,7 @@ This document describes how to invoke this repository's automated multi-agent co
 
 ## 1. What this is
 
-This repository implements an automated multi-agent code-generation pipeline (planning → work-item dispatch → specialist code generation → test execution/retry). That pipeline is exposed as a standard **ACP Agent** — a subprocess that any ACP-compliant client can spawn, initialize, and drive through a `new_session` → `prompt` handshake to run one end-to-end pipeline run, with progress streamed back live as the run executes.
+This repository implements an automated multi-agent code-generation pipeline (category-based multi-file task planning → sequential task dispatch → specialist code generation → test execution/retry). That pipeline is exposed as a standard **ACP Agent** — a subprocess that any ACP-compliant client can spawn, initialize, and drive through a `new_session` → `prompt` handshake to run one end-to-end pipeline run, with progress streamed back live as the run executes. See [Task Planning And Execution](task-workflow.md) for task categories, ownership, retries, and artifacts.
 
 If you already have (or are building) your own ACP client, you can drive this pipeline the same way you'd drive any other ACP agent (e.g. an editor plugin driving a coding assistant). If you don't, [section 4](#4-minimal-example-client-python) has a minimal working example.
 
@@ -24,9 +24,11 @@ pip install -r requirements.txt
 
 This installs, among other things, `agent-client-protocol==0.12.1` — the Python ACP library the server is built on.
 
+Also install `opencode` with `acp` support and put its executable on the server process's `PATH`. Internal model calls spawn `opencode acp` with a temporary HOME/cwd and generated `OPENCODE_CONFIG` using this pipeline's proxy/model settings, not your normal home configuration or credentials. The executable must remain discoverable with that temporary HOME.
+
 ### 2.2 Create your config file
 
-The server loads its config from **`~/.config/Agents/config.json`** first; if that file doesn't exist, it falls back to the repo's own `config.json` at the project root. **You must place your config at `~/.config/Agents/config.json`** on the machine/environment where you run the server — placing it anywhere else (or relying on the repo's own `config.json`) will not pick it up unless the repo's own `config.json` is what you intend to use.
+The server loads its config from **`~/.config/Agents/config.json`** first; if that file doesn't exist, it falls back to the repo's own `config.json` at the project root. Configure one of these locations on the machine/environment where you run the server; the home config takes precedence.
 
 Base your config on `config.example.json` in this repo. Shape and fields:
 
@@ -63,7 +65,7 @@ Field-by-field, what you need to fill in:
 - **`models.<role>.model`** — the model name to use for each role (`code`, `default`, `master`, `design`, `specialist`). Set these to whatever models your proxy exposes.
 - **`models.<role>.provider`** — must always be the literal string `"acp"` for every role. This is **not configurable**; there is no other valid value (older `chat_completions`/`responses` provider modes have been removed from this codebase). All model calls in this pipeline route through an ACP-based provider internally, regardless of which underlying LLM you point at via `litellm_url`.
 - **`pipeline.max_retries`** — max dispatch/test retry attempts per run.
-- **`pipeline.runs_dir`** — directory (relative to the repo root) where per-run output directories are created. See [section 6](#6-where-output-lands).
+- **`pipeline.runs_dir`** — directory where per-run output directories are created; relative paths resolve from the server repo root, and absolute paths are honored. See [section 6](#6-where-output-lands).
 - **`pipeline.output_dir`** — subdirectory name (inside each run dir) where generated product code is written.
 - **`pipeline.tests_dir`** — subdirectory name (inside each run dir) where generated tests are written.
 - **`pipeline.tests_blocking`** — whether test failures block a run from being reported as passed (`true`) or are advisory-only once all specialists have dispatched successfully (`false`).
@@ -102,13 +104,13 @@ Use the interpreter from the venv you created in step 2.1 (it needs `agent-clien
 **`prompt`** — sent once per session, with your task description.
 
 - Request: `session_id` (from `new_session`), `prompt` (a list of content blocks — see [3.3](#33-prompt-contract-v1)).
-- Response (`PromptResponse`): `stop_reason` — see [3.6](#36-final-response).
+- Response (`PromptResponse`): `stop_reason` — see [3.7](#37-final-response).
 
 ### 3.3 Prompt contract (v1)
 
 **Free-text only.** The `prompt` request's list of content blocks is scanned for `TextContentBlock` entries; their `.text` values are joined together (space-separated) and passed to the pipeline as the task description (equivalent to typing a request into this pipeline's own interactive REPL).
 
-**Other content block types are ignored in this version** — images, embedded resources/files, and any other non-text block type in the `prompt` list are silently skipped. This is a known v1 limitation. If no text content is found at all, the server responds with `stop_reason: "refusal"` (see [3.6](#36-final-response)) rather than starting a pipeline run.
+**Other content block types are ignored in this version** — images, embedded resources/files, and any other non-text block type in the `prompt` list are silently skipped. This is a known v1 limitation. If no text content is found at all, the server responds with `stop_reason: "refusal"` (see [3.7](#37-final-response)) rather than starting a pipeline run.
 
 File-attachment support (e.g. passing a design document alongside a task prompt) is a likely near-future addition, but is **not available yet**.
 
@@ -120,25 +122,63 @@ There is no multi-turn steering or follow-up prompting within a session.
 
 ### 3.5 Progress streaming
 
-While a pipeline run executes — this can take anywhere from roughly 20 seconds to several minutes depending on task complexity — the server sends `session_update` notifications on the connection, each carrying an `agent_message_chunk` update. These chunks contain the pipeline's live console output: planning progress, per-work-item dispatch progress, and test results, streamed as they're produced (not batched at the end).
+While a pipeline run executes — this can take anywhere from roughly 20 seconds to several minutes depending on task complexity — the server sends `session_update` notifications carrying `agent_message_chunk` updates. These chunks contain live console output: planning progress, per-task dispatch progress, and test results.
 
-Your client should listen for these notifications and surface them (display/relay/log) rather than waiting silently for the final `PromptResponse` — this is the only place run progress is visible before the run finishes.
+Listen for these updates to display human-readable output. For machine-readable, queryable state, use the extension in section 3.6.
 
-### 3.6 Final response
+### 3.6 Structured run status
+
+The server advertises a custom status request through `agentCapabilities._meta["agents-pipeline"].runStatus`. Query it during or after a prompt turn using the ACP extension method `_agents-pipeline/run/status` and `{ "sessionId": "<session id>" }`.
+
+With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {"sessionId": session_id})`. The SDK adds the required leading underscore to the JSON-RPC method name. A response has this stable shape:
+
+```json
+{
+  "schema_version": 1,
+  "session_id": "<session id>",
+  "run_id": "0001-build-a-cli",
+  "status": "running",
+  "phase": "dispatch",
+  "outcome": null,
+  "cancel_requested": false,
+  "queue_position": null,
+  "tasks_total": 3,
+  "tasks_started": 2,
+  "tasks_completed": 1,
+  "tasks_blocked": 0,
+  "current_task": {
+    "id": "TASK-auth",
+    "category": "feature",
+    "status": "running",
+    "attempt": 1
+  },
+  "attempt_round": 1,
+  "max_attempts": 3,
+  "tests_blocking": true
+}
+```
+
+`status` is `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean passed.** `phase` describes the current stage (`queued`, `planning`, `dispatch`, `testing`, `retrying`, `teardown`, and terminal/initial states). `outcome` is null until known, then `passed`, `failed`, `passed_with_test_failures`, `error`, `cancelled`, or `invalid_prompt`. A test failure with `tests_blocking: false` is reported as `passed_with_test_failures`, not as a clean pass. Require `outcome == "passed"` for a clean pipeline pass and handle cancellation separately: cancelled status can retain a known underlying outcome. `PromptResponse.stop_reason` remains a protocol turn status, not the pipeline outcome.
+
+`queue_position` is one-based among waiting runs and null for the active run or a run without a queue ticket. Task counts describe specialist attempts: `tasks_total` counts planned work items; `tasks_started` counts attempts that began; `tasks_completed` counts attempts that returned passed or failed; retries increment these counters rather than resetting them, so completed attempts may exceed `tasks_total`. Dependency-blocked tasks are counted separately and do not count as started/completed attempts. `current_task` is null when no specialist task is active. `run_id` becomes available after run artifacts are created; `session_id` is available from session creation and remains the correlation key while queued.
+
+### 3.7 Final response
 
 When `prompt` resolves, `PromptResponse.stop_reason` is one of:
 
-- **`"end_turn"`** — the pipeline ran to completion. This does **not** by itself mean the run succeeded — check the streamed `session_update` text for `"✅ Pipeline passed"` or `"❌ Pipeline failed"` to determine the actual outcome. There is no separate structured pass/fail field on the response; the outcome is communicated only via the streamed text.
-- **`"refusal"`** — either no usable text was found in the prompt's content blocks, or an unexpected internal error occurred while running the pipeline. In the error case, an error message is streamed via `session_update` before this response is returned.
-- **`"cancelled"`** — a `session/cancel` notification was received for this session before/during the run. See the cancellation caveat below — this does **not** mean the pipeline was stopped early.
+- **`"end_turn"`** — the ACP prompt turn completed. Query structured run status to determine whether the pipeline passed, failed, or completed with advisory test failures.
+- **`"refusal"`** — no usable text was found, or an unexpected pipeline error occurred. Status reports `invalid_prompt` or `error` respectively.
+- **`"cancelled"`** — the ACP prompt turn was cancelled. See section 3.9; this does not imply early termination of the pipeline.
 
-### 3.7 Concurrency
+### 3.8 Run serialization
 
-Multiple sessions/prompts can run concurrently against the same server process — there is no artificial serialization forcing one run to wait for another.
+Prompts submitted to one server process are queued FIFO. Only one full pipeline run executes at a time, covering planning, sequential task dispatch, tests/retries, progress delivery, and run teardown. Independent work items also remain sequential. This is process-local coordination only; separate server processes do not share the queue.
 
-### 3.8 Cancellation caveat
+### 3.9 Cancellation caveat
 
-Calling `session/cancel` on a session is **best-effort only**. It does **not** preemptively stop an in-flight pipeline run — the pipeline runs to completion regardless. Cancellation only affects how the *eventual* response is labeled: if `cancel` was called before the run's `prompt` call returns, that call's `PromptResponse.stop_reason` will be reported as `"cancelled"` instead of `"end_turn"`, but the run itself will have executed in full (including any files it wrote). **True abort/early-termination behavior does not exist in this version.** Do not rely on cancel to stop resource usage or side effects from an in-flight run.
+Calling `session/cancel` is **best-effort only**. It sets `cancel_requested`, but does not stop the active pipeline or remove a queued run. The pipeline completes, including file writes and teardown, before the prompt responds with `stop_reason: "cancelled"`; structured status becomes `cancelled` and retains a known pipeline outcome where available. Cancelling the ACP request itself while queued removes that queue entry. Cancelling it while active waits for the blocking pipeline to finish before releasing the queue slot.
+
+An unexpected pipeline error can still produce `status: "failed"`, `outcome: "error"` and `stop_reason: "refusal"` even when cancellation was requested.
 
 ## 4. Minimal example client (Python)
 
@@ -146,6 +186,7 @@ This is a minimal, self-contained example showing the full round-trip: spawn →
 
 ```python
 import asyncio
+import json
 import acp
 
 
@@ -156,10 +197,9 @@ async def main() -> None:
 
     class Client:
         async def session_update(self, session_id, update, **kwargs):
-            if getattr(update, "sessionUpdate", None) == "agent_message_chunk":
-                text = getattr(update.content, "text", None)
-                if text:
-                    print(text, end="", flush=True)
+            if isinstance(update, acp.schema.AgentMessageChunk):
+                if isinstance(update.content, acp.schema.TextContentBlock):
+                    print(update.content.text, end="", flush=True)
 
         def on_connect(self, conn):
             return None
@@ -182,7 +222,12 @@ async def main() -> None:
             prompt=[acp.text_block(task_prompt)],
         )
 
+        run_status = await conn.ext_method(
+            "agents-pipeline/run/status", {"sessionId": session_id}
+        )
+
     print(f"\n\nstop_reason: {prompt_resp.stop_reason}")
+    print(json.dumps(run_status, indent=2))
 
 
 if __name__ == "__main__":
@@ -191,24 +236,29 @@ if __name__ == "__main__":
 
 This example is Python-specific, but the underlying protocol — JSON-RPC over stdio — is language-agnostic; an equivalent client can be implemented in any language with JSON-RPC and subprocess support.
 
+For live status polling while `prompt` is in flight, see [AGENTS.md](../AGENTS.md#handshake-and-live-status-python-sdk-0121). Query final status before closing the session or server: session state is in memory and is discarded by `close_session` or a server restart; historical artifacts remain on disk.
+
 ## 5. Known limitations (v1)
 
 - **Free-text prompts only** — no file/document attachment support yet.
 - **Best-effort cancellation only** — no preemptive abort of an in-flight run.
 - **1 session = 1 pipeline run** — no multi-turn steering or follow-up prompting within a session.
 - **Config loaded once at server process start** — restart the server process to pick up changes to `~/.config/Agents/config.json`.
-- **No structured pass/fail field** — the run outcome must be parsed from streamed text (`"✅ Pipeline passed"` / `"❌ Pipeline failed"`), not from `PromptResponse` fields.
+- **Structured run status is an extension** — clients should check the advertised `_agents-pipeline/run/status` method; it is not a field on standard `PromptResponse`.
+- **Queue scope is one process** — separate server processes may run independently and are not coordinated.
+- **Per-run ACP cleanup** — each run closes its pooled ACP connections/subprocesses, temporary directories, and background event loop before the next queued run starts.
 
 ## 6. Where output lands
 
-Each pipeline run creates a new directory under this repo's `runs/` directory (e.g. `runs/0007-build-a-cli-that-reverses-a-string/`), containing:
+Each pipeline run creates `<runs-root>/<run-id>/`. `pipeline.runs_dir` resolves relative to the server repo root (default `runs/`); an absolute configured path is honored. Neither subprocess cwd nor `new_session.cwd` relocates that root. Status returns `run_id`, not an absolute path, so clients must know the server repo/config location. With default `pipeline.output_dir` and `pipeline.tests_dir`, the directory contains:
 
 - **`product/`** — the generated code.
 - **`tests/`** — the generated tests, plus `tests/results/` with per-attempt JSON test-result files.
 - **`manifest.json`** — run status (`passed`, `failed`, `passed_with_test_failures`, etc.), timestamps, attempt count, and the original prompt/label.
+- **`design/plan.json`** — version-2 task plan, explicit category and file ownership, dependencies, current task status, attempt results, and failure details.
 - **`instructions.md`** — a human-readable summary of the run.
 
-This directory lives **on your own machine/environment**, alongside wherever you're running the pipeline server — it is not something you fetch remotely. If your automated flow needs the actual generated files (not just the streamed text summary), read them from this run directory after the `prompt` call returns.
+This directory lives **on the server's filesystem**, at the configured location — it is not returned inline through ACP. If your automated flow needs the actual generated files (not just the streamed text summary), read them from this run directory after the `prompt` call returns.
 
 ## 7. Support / contact
 

@@ -8,27 +8,14 @@ the actual files written to run_dir/{output_dir} (looking for a
 recognized dependency manifest and reading its "scripts"/entry point) so
 the commands given are concrete and copy-pasteable, not a generic report.
 
-UPDATE (2026-09-04, post-run-0008 finding): the planning system prompt's
-(then pipeline/design.py's, now pipeline/master.py's) RUNNABILITY rule
-used to ask for a single "[ASSEMBLY]" WorkItem to
-produce BOTH a dependency manifest (package.json) AND an entry-point
-source file. That's impossible — every WorkItem in this pipeline writes
-to exactly one output_path (see specialists/base.py's run_specialist),
-so the LLM could only pick one file to actually write and a package.json
-never got generated (run 0008: 18/18 WorkItems succeeded but the
-"[ASSEMBLY]" WorkItem only produced src/server/main.ts, no manifest).
-The rule now asks for TWO WorkItems — "[ASSEMBLY-MANIFEST]" for the
-dependency manifest and "[ASSEMBLY-ENTRYPOINT]" for the entry-point file
-— and this module looks for both markers plus known manifest filenames
-directly, so it can report accurately even if the LLM's titling drifts.
+Tasks own multiple declared files; run instructions inspect the complete
+successful output set instead of relying on single-file task labels.
 """
 
 import json
 import os
 
 from pipeline.state import AgentResult, TestResult, WorkItem
-
-ASSEMBLY_TITLE_MARKERS = ("[ASSEMBLY-MANIFEST]", "[ASSEMBLY-ENTRYPOINT]", "[ASSEMBLY]")
 
 # Recognized dependency manifest filenames, in priority order, mapped to
 # the (install_command, run_command_builder) needed to use them. Node/Bun
@@ -41,16 +28,14 @@ PYTHON_MANIFEST_FILENAMES = ("requirements.txt", "pyproject.toml")
 def _collect_languages(work_items: list[WorkItem]) -> list[str]:
     seen: list[str] = []
     for item in work_items:
-        if item.language not in seen:
-            seen.append(item.language)
+        for owned_file in item.owned_files:
+            if owned_file.language not in seen:
+                seen.append(owned_file.language)
     return seen
 
 
 def _find_assembly_work_items(work_items: list[WorkItem]) -> list[WorkItem]:
-    return [
-        wi for wi in work_items
-        if any(marker in wi.title for marker in ASSEMBLY_TITLE_MARKERS)
-    ]
+    return [wi for wi in work_items if wi.category == "integration"]
 
 
 def _successful_files(agent_results: list[AgentResult]) -> list[str]:
@@ -221,6 +206,8 @@ def generate_instructions_md(
             "❌ Dispatch failed (dependency cycle) — some files below may "
             "have been written before the error."
         )
+    elif run_status == "task_plan_invalid":
+        lines.append("❌ Planning produced an invalid task/file ownership model; no code was generated.")
     else:
         lines.append(f"Status: {run_status}")
     lines.append("")
@@ -245,19 +232,20 @@ def generate_instructions_md(
                 "⚠️ No dependency manifest (package.json / requirements.txt "
                 "/ pyproject.toml) was found among the files this run "
                 "actually wrote, so there's no install/run command to "
-                "give — even though the plan included an assembly step:"
+                "give — even though the plan included an integration task:"
             )
             lines.append("")
             for wi in assembly_items:
-                lines.append(f"- {wi.title} → `{wi.output_path}`")
+                paths = ", ".join(f"`{owned_file.path}`" for owned_file in wi.owned_files)
+                lines.append(f"- {wi.title} → {paths}")
             lines.append("")
             lines.append(
-                "Check whether that WorkItem's specialist run failed or "
+                  "Check whether that task's specialist run failed or "
                 "wrote to an unexpected path (see files list below)."
             )
         else:
             lines.append(
-                "⚠️ This run's plan had no assembly/entry-point WorkItem "
+                "⚠️ This run's plan had no integration task "
                 "at all — the files below are individual modules, not a "
                 "runnable application. There is no single install/run "
                 "command."

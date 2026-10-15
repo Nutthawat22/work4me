@@ -9,15 +9,13 @@ import os
 from collections import deque
 from typing import Callable
 
-from pipeline.state import AgentResult, TestFailure, WorkItem
-from specialists.config import ConfigAgent
+from pipeline.state import AgentResult, TaskAttempt, TestFailure, WorkItem
+from pipeline.task_validation import normalize_relative_path, truncate_with_marker
 from specialists.feature import FeatureAgent
 from specialists.integrate import IntegrationAgent
-from specialists.logic import LogicAgent
-from specialists.scaffold import ScaffoldAgent
+from specialists.foundation import FoundationAgent
 from specialists.shared import SharedAgent
-from specialists.test_writer import TestAgent
-from specialists.ui import UIAgent
+from specialists.test_writer import ValidationAgent
 
 # Called as progress(item, index, total) immediately BEFORE that item is
 # dispatched to its specialist (index is 1-based). Dispatch is sequential
@@ -25,16 +23,13 @@ from specialists.ui import UIAgent
 # while, so this is the caller's only hook to show "still working, on
 # item N of M" rather than appearing to hang for the whole batch.
 DispatchProgressCallback = Callable[[WorkItem, int, int], None]
+TaskUpdateCallback = Callable[[WorkItem], None]
 
-# Cap how much dependency content gets injected into a dependent
-# WorkItem's prompt — avoids blowing up context on deeply-chained items.
-MAX_DEPENDENCY_FILES_SHOWN = 5
-MAX_DEPENDENCY_FILE_CHARS = 3000
-
-# Integration items must wire together EVERY feature module, so they need
-# the signatures/exports of ALL their dependencies (not truncated to the
-# first few) and more of each file's content than a normal dependent item.
-MAX_INTEGRATE_DEPENDENCY_FILE_CHARS = 12000
+# Limits how much dependency content is loaded before the worker prompt applies
+# its own smaller budget. Omitted paths are reported to the worker.
+MAX_DEPENDENCY_FILES_SHOWN = 40
+MAX_DEPENDENCY_FILE_CHARS = 12000
+MAX_DEPENDENCY_TOTAL_CHARS = 80000
 
 
 class CycleError(Exception):
@@ -104,12 +99,11 @@ def topological_sort(work_items: list[WorkItem], strict: bool = True) -> list[Wo
 
 
 def _read_dependency_content(
-    dep_id: str,
     result: AgentResult,
     run_dir: str,
     max_chars: int = MAX_DEPENDENCY_FILE_CHARS,
-) -> str | None:
-    """Read (and truncate) the file content a dependency WorkItem wrote.
+) -> dict[str, str] | None:
+    """Read (and truncate) every file a successful dependency task wrote.
 
     Returns None if the dependency's result was unsuccessful or its file
     can't be read for any reason — callers should note this rather than
@@ -117,15 +111,21 @@ def _read_dependency_content(
     """
     if not result.success or not result.files_written:
         return None
-    try:
-        full_path = os.path.join(run_dir, result.files_written[0])
-        with open(full_path, "r") as f:
-            content = f.read()
-    except OSError:
-        return None
-    if len(content) > max_chars:
-        content = content[:max_chars] + "\n... (truncated)"
-    return content
+    contents: dict[str, str] = {}
+    run_root = os.path.realpath(run_dir)
+    for relative_path in result.files_written:
+        try:
+            normalized = normalize_relative_path(relative_path)
+            full_path = os.path.realpath(os.path.join(run_root, normalized))
+            if os.path.commonpath((run_root, full_path)) != run_root:
+                continue
+            with open(full_path, "r") as source:
+                content = source.read()
+        except (OSError, ValueError):
+            continue
+        content = truncate_with_marker(content, max_chars, "\n... (truncated)")
+        contents[normalized] = content
+    return contents or None
 
 
 def build_dependency_context(
@@ -133,35 +133,40 @@ def build_dependency_context(
     results_by_id: dict[str, AgentResult],
     run_dir: str,
 ) -> dict[str, str]:
-    """Build the {output_path: file_content} map for a WorkItem's
+    """Build the {run-relative output path: file_content} map for dependencies.
     dependencies, resolving from already-dispatched AgentResults.
 
     Missing/failed/unreadable dependencies are noted inline rather than
-    omitted silently, and the total number of dependency files shown is
-    capped at MAX_DEPENDENCY_FILES_SHOWN.
-
-    Exception: "integrate" and "shared" items must wire together MULTIPLE
-    feature modules, so for them the file cap does NOT apply (all
-    depends_on are iterated) and each file is truncated at the larger
-    MAX_INTEGRATE_DEPENDENCY_FILE_CHARS limit.
+    omitted silently. File and total-character caps are explicit, with
+    omitted dependency paths reported in a sentinel context entry.
     """
-    is_wiring = item.type in ("integrate", "shared")
-    dep_ids = item.depends_on if is_wiring else item.depends_on[:MAX_DEPENDENCY_FILES_SHOWN]
-    max_chars = MAX_INTEGRATE_DEPENDENCY_FILE_CHARS if is_wiring else MAX_DEPENDENCY_FILE_CHARS
-
     context: dict[str, str] = {}
-    for dep_id in dep_ids:
+    omitted: list[str] = []
+    total_chars = 0
+    shown_files = 0
+    for dep_id in item.depends_on:
         result = results_by_id.get(dep_id)
         if result is None:
             context[dep_id] = f"(dependency {dep_id} unavailable — not yet dispatched)"
             continue
-        content = _read_dependency_content(dep_id, result, run_dir, max_chars=max_chars)
-        if content is None:
+        files = _read_dependency_content(result, run_dir)
+        if files is None:
             reason = "specialist failed" if not result.success else "file unreadable"
             context[dep_id] = f"(dependency {dep_id} unavailable — {reason})"
             continue
-        output_path = result.files_written[0]
-        context[output_path] = content
+        for output_path, content in files.items():
+            if shown_files >= MAX_DEPENDENCY_FILES_SHOWN or total_chars >= MAX_DEPENDENCY_TOTAL_CHARS:
+                omitted.append(output_path)
+                continue
+            remaining = MAX_DEPENDENCY_TOTAL_CHARS - total_chars
+            content = truncate_with_marker(
+                content, remaining, "\n... (truncated by dispatch context budget)"
+            )
+            context[output_path] = content
+            total_chars += len(content)
+            shown_files += 1
+    if omitted:
+        context["(dependency files omitted by dispatch budget)"] = ", ".join(omitted)
     return context
 
 
@@ -173,6 +178,7 @@ def dispatch_work_items(
     retry_context: dict[str, list[TestFailure]] | None = None,
     known_results: list[AgentResult] | None = None,
     progress: DispatchProgressCallback | None = None,
+    task_update: TaskUpdateCallback | None = None,
 ) -> list[AgentResult]:
     """
     Topologically sort work_items by depends_on, then dispatch each to
@@ -214,14 +220,11 @@ def dispatch_work_items(
     ordered = topological_sort(work_items, strict=strict)
 
     registry = {
-        "logic": LogicAgent(),
-        "ui": UIAgent(),
-        "config": ConfigAgent(),
-        "test": TestAgent(),
-        "scaffold": ScaffoldAgent(),
-        "integrate": IntegrationAgent(),
+        "foundation": FoundationAgent(),
         "feature": FeatureAgent(),
         "shared": SharedAgent(),
+        "integration": IntegrationAgent(),
+        "validation": ValidationAgent(),
     }
 
     results_by_id: dict[str, AgentResult] = {
@@ -231,9 +234,37 @@ def dispatch_work_items(
     total = len(ordered)
     results: list[AgentResult] = []
     for index, item in enumerate(ordered, start=1):
+        failed_dependencies = [
+            dep_id for dep_id in item.depends_on
+            if dep_id in results_by_id and not results_by_id[dep_id].success
+        ]
+        unavailable_dependencies = [dep_id for dep_id in item.depends_on if dep_id not in results_by_id]
+        if failed_dependencies or unavailable_dependencies:
+            item.status = "blocked"
+            result = AgentResult(
+                work_item_id=item.id,
+                agent_name=f"{item.category.title()}Agent",
+                success=False,
+                files_written=[],
+                notes=("Task blocked by dependencies: " + ", ".join(
+                    failed_dependencies + unavailable_dependencies
+                )),
+            )
+            results.append(result)
+            results_by_id[item.id] = result
+            if task_update is not None:
+                task_update(item)
+            continue
+
+        item.status = "ready"
+        if task_update is not None:
+            task_update(item)
+        item.status = "running"
+        if task_update is not None:
+            task_update(item)
         if progress is not None:
             progress(item, index, total)
-        agent = registry[item.type]
+        agent = registry[item.category]
         retry_failures = (retry_context or {}).get(item.id, [])
         dependency_context = build_dependency_context(item, results_by_id, run_dir)
         result = agent.execute(
@@ -245,5 +276,24 @@ def dispatch_work_items(
         )
         results.append(result)
         results_by_id[item.id] = result
+        item.status = "passed" if result.success else "failed"
+        item.attempts.append(
+            TaskAttempt(
+                number=len(item.attempts) + 1,
+                status="passed" if result.success else "failed",
+                files_written=list(result.files_written),
+                result_summary=f"Wrote {len(result.files_written)} file(s)" if result.success else "",
+                failure_details=(
+                    result.notes
+                    if not result.success
+                    else "\n".join(
+                        f"{failure.test_name}: {failure.error_output[:500]}"
+                        for failure in retry_failures[:5]
+                    )
+                ),
+            )
+        )
+        if task_update is not None:
+            task_update(item)
 
     return results

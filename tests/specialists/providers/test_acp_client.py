@@ -51,6 +51,7 @@ class FakeConnection:
         self._client = client
         self._prompt_behavior = prompt_behavior
         self._init_behavior = init_behavior
+        self.close_count = 0
 
     async def initialize(self, protocol_version, client_capabilities):
         if self._init_behavior is not None:
@@ -64,6 +65,7 @@ class FakeConnection:
         return await self._prompt_behavior(self, session_id)
 
     async def close(self):
+        self.close_count += 1
         return None
 
 
@@ -78,13 +80,18 @@ class FakeAcpBackend:
 
     def __init__(self, prompt_behavior=None, init_behavior=None, spawn_should_fail=False):
         self.spawn_count = 0
+        self.exit_count = 0
         self.processes: list[FakeProcess] = []
+        self.owned_paths: list[str] = []
         self.prompt_behavior = prompt_behavior or _default_success_behavior
         self.init_behavior = init_behavior
         self.spawn_should_fail = spawn_should_fail
 
     def spawn_agent_process(self, client, *args, cwd=None, env=None, **kwargs):
         backend = self
+        backend.owned_paths.extend(
+            [cwd, env["HOME"], os.path.dirname(env["OPENCODE_CONFIG"])]
+        )
 
         @asynccontextmanager
         async def _cm():
@@ -94,7 +101,11 @@ class FakeAcpBackend:
             process = FakeProcess()
             backend.processes.append(process)
             conn = FakeConnection(client, backend.prompt_behavior, backend.init_behavior)
-            yield conn, process
+            try:
+                yield conn, process
+            finally:
+                backend.exit_count += 1
+                process.returncode = 0
 
         return _cm()
 
@@ -176,6 +187,40 @@ def test_acp_call_success_returns_accumulated_text(monkeypatch, fresh_pool):
     result = acp_call(MESSAGES, "claude-sonnet-5", BASE_CONFIG, timeout=5)
 
     assert result == "mocked response text"
+
+
+def test_pool_teardown_closes_loop_sessions_and_temp_dirs_idempotently(monkeypatch, fresh_pool):
+    backend = FakeAcpBackend()
+    _patch_backend(monkeypatch, backend)
+
+    assert acp_call(MESSAGES, "claude-sonnet-5", BASE_CONFIG, timeout=5) == "mocked response text"
+    session = next(iter(fresh_pool._sessions.values()))
+    loop = fresh_pool._loop
+    thread = fresh_pool._thread
+    assert loop is not None and thread is not None
+    assert all(os.path.isdir(path) for path in backend.owned_paths)
+
+    fresh_pool.teardown_all()
+    assert loop.is_closed()
+    assert not thread.is_alive()
+    assert all(not os.path.exists(path) for path in backend.owned_paths)
+    assert session._closed is True
+    assert session.conn.close_count == 1
+    assert backend.exit_count == 1
+    assert backend.processes[0].returncode == 0
+    fresh_pool.teardown_all()
+
+
+def test_session_creation_failure_cleans_temp_dirs(monkeypatch, fresh_pool):
+    backend = FakeAcpBackend(init_behavior=_init_failure_behavior)
+    _patch_backend(monkeypatch, backend)
+
+    result = acp_call(MESSAGES, "claude-sonnet-5", BASE_CONFIG, timeout=5)
+
+    assert "handshake failed" in result
+    assert backend.owned_paths
+    assert all(not os.path.exists(path) for path in backend.owned_paths)
+    assert backend.exit_count == 1
 
 
 # ── acp_call: failure paths (must return error strings, never raise) ────────

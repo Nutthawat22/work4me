@@ -1,38 +1,26 @@
-"""
-specialists/test_writer.py
-
-TestAgent: writes pytest tests that validate a WorkItem's acceptance
-criteria.
-"""
+"""ValidationAgent: writes task-owned automated validation assets."""
 
 from pipeline.state import AgentResult, TestFailure, WorkItem
-from specialists.base import run_specialist
+from specialists.base import run_multifile_specialist
 
 SYSTEM_PROMPT = (
-    "You are an expert in writing {test_framework} test suites for "
-    "{language}. Write {test_framework} tests that validate every "
-    "acceptance criterion of the following work item. Output ONLY the "
-    "raw {language} test code — no markdown fences, no explanation."
+    "You implement the validation category for the configured test framework "
+    "and each owned file's language. Write tests for the stated acceptance "
+    "criteria and dependency contracts. Create exactly the owned test files. "
+    'Output ONLY {"files": {"relative/path": "complete test content"}}.'
 )
 
 
 def build_system_prompt(work_item: WorkItem, config: dict) -> str:
-    """Fully format SYSTEM_PROMPT with both {language} and {test_framework}
-    for this work item, using config["languages"][work_item.language] to
-    look up the human-readable test framework name.
-
-    Pre-formatting here (rather than relying on run_specialist's generic
-    {language}-only formatting) is needed because this is the only
-    specialist whose prompt needs a second variable. Passing the fully
-    formatted string to run_specialist is safe: run_specialist's
-    .format(language=...) call becomes a no-op once {language} is already
-    filled in.
-    """
-    test_framework = config["languages"][work_item.language]["test_framework_name"]
-    return SYSTEM_PROMPT.format(language=work_item.language, test_framework=test_framework)
+    frameworks = sorted({
+        config["languages"][owned_file.language]["test_framework_name"]
+        for owned_file in work_item.owned_files
+        if owned_file.language in config["languages"]
+    })
+    return SYSTEM_PROMPT.replace("configured test framework", ", ".join(frameworks) or "configured test framework")
 
 
-class TestAgent:
+class ValidationAgent:
     def execute(
         self,
         work_item: WorkItem,
@@ -42,8 +30,8 @@ class TestAgent:
         dependency_context: dict[str, str] | None = None,
     ) -> AgentResult:
         system_prompt = build_system_prompt(work_item, config)
-        return run_specialist(
-            work_item, config, run_dir, system_prompt, "TestAgent", "tests_dir",
+        return run_multifile_specialist(
+            work_item, config, run_dir, system_prompt, "ValidationAgent",
             retry_failures=retry_failures,
             dependency_context=dependency_context,
         )

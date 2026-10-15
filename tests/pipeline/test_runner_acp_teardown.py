@@ -38,7 +38,7 @@ def _config(tmp_path) -> dict:
             "output_dir": "product",
             "tests_dir": "tests",
         },
-        "languages": {},
+        "languages": {"python": {}},
     }
 
 
@@ -62,12 +62,14 @@ def test_teardown_called_on_design_parse_error(tmp_path, monkeypatch, teardown_s
 
 
 def test_teardown_called_on_dispatch_cycle_error(tmp_path, monkeypatch, teardown_spy):
-    from pipeline.state import WorkItem
+    from pipeline.state import OwnedFile, WorkItem
 
     work_items = [
         WorkItem(
-            id="WI-001", type="logic", language="python", title="t",
-            description="d", acceptance_criteria=[], output_path="a.py",
+            id="WI-001", category="feature", language="python", module="a",
+            scope="Implement a", title="t", description="d",
+            acceptance_criteria=["a works"], requirement_refs=[],
+            owned_files=[OwnedFile("a.py", "python")],
             depends_on=[],
         ),
     ]
@@ -83,18 +85,20 @@ def test_teardown_called_on_dispatch_cycle_error(tmp_path, monkeypatch, teardown
 
 
 def test_teardown_called_on_success(tmp_path, monkeypatch, teardown_spy):
-    from pipeline.state import WorkItem, AgentResult
+    from pipeline.state import OwnedFile, WorkItem, AgentResult
 
     work_items = [
         WorkItem(
-            id="WI-001", type="logic", language="python", title="t",
-            description="d", acceptance_criteria=[], output_path="a.py",
+            id="WI-001", category="feature", language="python", module="a",
+            scope="Implement a", title="t", description="d",
+            acceptance_criteria=["a works"], requirement_refs=[],
+            owned_files=[OwnedFile("a.py", "python")],
             depends_on=[],
         ),
     ]
     monkeypatch.setattr(
         "pipeline.runner.dispatch_work_items",
-        lambda *a, **k: [AgentResult(work_item_id="WI-001", agent_name="logic", success=True, files_written=["a.py"])],
+        lambda *a, **k: [AgentResult(work_item_id="WI-001", agent_name="feature", success=True, files_written=["product/a.py"])],
     )
     monkeypatch.setattr(
         "pipeline.runner.TestRunner.run",
@@ -117,17 +121,21 @@ def test_all_specialists_failed_reports_failure_despite_vacuous_test_pass(
     a vacuous TestResult(passed=True, total=0, ...). The run must be
     reported as FAILED, not "✅ All tests passed.".
     """
-    from pipeline.state import WorkItem, AgentResult
+    from pipeline.state import OwnedFile, WorkItem, AgentResult
 
     work_items = [
         WorkItem(
-            id="WI-001", type="logic", language="python", title="t1",
-            description="d", acceptance_criteria=[], output_path="a.py",
+            id="WI-001", category="feature", language="python", module="a",
+            scope="Implement a", title="t1", description="d",
+            acceptance_criteria=["a works"], requirement_refs=[],
+            owned_files=[OwnedFile("a.py", "python")],
             depends_on=[],
         ),
         WorkItem(
-            id="WI-002", type="logic", language="python", title="t2",
-            description="d", acceptance_criteria=[], output_path="b.py",
+            id="WI-002", category="feature", language="python", module="b",
+            scope="Implement b", title="t2", description="d",
+            acceptance_criteria=["b works"], requirement_refs=[],
+            owned_files=[OwnedFile("b.py", "python")],
             depends_on=[],
         ),
     ]
@@ -174,12 +182,14 @@ def test_legitimate_no_tests_needed_still_reports_passed(tmp_path, monkeypatch, 
     total=0, ...) is a correct trivial pass here and must NOT be flagged
     as a dispatch failure.
     """
-    from pipeline.state import WorkItem, AgentResult
+    from pipeline.state import OwnedFile, WorkItem, AgentResult
 
     work_items = [
         WorkItem(
-            id="WI-001", type="config", language="python", title="t1",
-            description="d", acceptance_criteria=[], output_path="config.json",
+            id="WI-001", category="foundation", language="python", module="config",
+            scope="Add configuration", title="t1", description="d",
+            acceptance_criteria=["configuration is valid"], requirement_refs=[],
+            owned_files=[OwnedFile("config.json", "python")],
             depends_on=[],
         ),
     ]
@@ -188,7 +198,7 @@ def test_legitimate_no_tests_needed_still_reports_passed(tmp_path, monkeypatch, 
         lambda *a, **k: [
             AgentResult(
                 work_item_id="WI-001", agent_name="config", success=True,
-                files_written=["config.json"],
+                  files_written=["product/config.json"],
             ),
         ],
     )
@@ -228,12 +238,14 @@ def test_dispatch_failure_only_in_later_retry_round_still_fails(
     longer resolvable) — this must still be reported as failed, not
     passed.
     """
-    from pipeline.state import WorkItem, AgentResult, TestFailure
+    from pipeline.state import OwnedFile, WorkItem, AgentResult, TestFailure
 
     work_items = [
         WorkItem(
-            id="WI-001", type="test", language="python", title="t1",
-            description="d", acceptance_criteria=[], output_path="test_a.py",
+            id="WI-001", category="validation", language="python", module="test-a",
+            scope="Validate feature a", title="t1", description="d",
+            acceptance_criteria=["a behaves correctly"], requirement_refs=[],
+            owned_files=[OwnedFile("test_a.py", "python", "tests")],
             depends_on=[],
         ),
     ]

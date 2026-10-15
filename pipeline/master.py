@@ -7,22 +7,10 @@ dev-plans/agents/features/2026-09-14-acp-native-master-architecture.md).
 Absorbs the three planning methods formerly on the separate
 `DesignAgent` class (pipeline/design.py, deleted in this phase):
 
-- decompose(user_prompt): free-text path — one LLM call turns a short
-  prompt into a flat WorkItem array.
-- plan_handoff(design_text, requirements_text=None): package-aware path
-  for approved technical-design handoffs. Renamed from decompose_handoff
-  to reflect what changed in this phase: the LLM is no longer given a
-  fixed WP-template to mechanically transcribe 1:1 — it genuinely
-  decides the right number of implementation WorkItems and what each
-  should own, based on the design document's actual scope/complexity.
-  Two structural invariants are still enforced regardless of task shape
-  (exactly one scaffold item first, exactly one integrate item last —
-  see PLAN_HANDOFF_SYSTEM_PROMPT_TEMPLATE rules 6a/6b), because those
-  are sound regardless of how many items the middle of the plan has.
-- decompose_features(design_text, requirements_text): design doc ->
-  Feature list (vertical slices of behavior, NOT files) — feeds
-  file_manifest.py. Unchanged behavior this phase (Phase 4 of the
-  design doc reframes file_manifest.py itself, not this method).
+- decompose(user_prompt) and plan_handoff(design_text, requirements_text):
+  both emit the same category-based, multi-file task model.
+- decompose_features()/plan_layout(): optional file-manifest strategy that
+  adapts architecture-grouped ownership into the same task model.
 
 Also retains Master's pre-existing (Phase 3, pre-rearchitecture)
 responsibilities: mapping test failures back to WorkItem ids
@@ -56,13 +44,16 @@ from pipeline.state import (
     FailReport,
     Feature,
     FileManifest,
+    OwnedFile,
     TestFailure,
     TestResult,
+    TaskAttempt,
     WorkItem,
 )
+from pipeline.task_validation import normalize_relative_path
 from specialists.providers.acp_client import acp_call_with_retry
 
-VALID_TYPES: set[str] = {"logic", "ui", "config", "test", "scaffold", "integrate"}
+VALID_CATEGORIES: set[str] = {"foundation", "feature", "shared", "integration", "validation"}
 
 # Longer timeout: plan_handoff feeds the full design doc (~100K+ chars),
 # well past acp_call_with_retry's 60s default.
@@ -95,15 +86,19 @@ FEATURE_REQUIRED_FIELDS = {
     "depends_on",
 }
 
-REQUIRED_FIELDS = {
+TASK_REQUIRED_FIELDS = {
     "id",
-    "type",
+    "category",
     "language",
+    "module",
+    "scope",
     "title",
     "description",
     "acceptance_criteria",
-    "output_path",
+    "requirement_refs",
+    "owned_files",
     "depends_on",
+    "expected_interfaces",
 }
 
 
@@ -111,8 +106,8 @@ def _build_work_items_response_schema(name: str, valid_languages: set[str]) -> d
     """
     Build a prompt-embedded structured-output schema (see
     specialists/providers/acp_client.py's _build_schema_instruction) that
-    describes a valid array of WorkItem objects, with "type" and
-    "language" enum-constrained to VALID_TYPES and the caller's
+    describes a valid array of task objects, with "category" and
+    "language" enum-constrained to VALID_CATEGORIES and the caller's
     valid_languages set respectively. ACP has no token-level schema
     enforcement mechanism (see the design doc's "Accepted Risk: No Hard
     Schema Enforcement, Anywhere") — this schema is only ever prepended
@@ -124,19 +119,33 @@ def _build_work_items_response_schema(name: str, valid_languages: set[str]) -> d
     continuity with _parse_json's unwrapping behavior, even though ACP
     itself does not require an object root.
     """
-    work_item_schema = {
+    file_schema = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "language": {"type": "string", "enum": sorted(valid_languages)},
+            "area": {"type": "string", "enum": ["product", "tests"]},
+        },
+        "required": ["path", "language", "area"],
+        "additionalProperties": False,
+    }
+    task_schema = {
         "type": "object",
         "properties": {
             "id": {"type": "string"},
-            "type": {"type": "string", "enum": sorted(VALID_TYPES)},
+            "category": {"type": "string", "enum": sorted(VALID_CATEGORIES)},
             "language": {"type": "string", "enum": sorted(valid_languages)},
+            "module": {"type": "string"},
+            "scope": {"type": "string"},
             "title": {"type": "string"},
             "description": {"type": "string"},
             "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
-            "output_path": {"type": "string"},
+            "requirement_refs": {"type": "array", "items": {"type": "string"}},
+            "owned_files": {"type": "array", "items": file_schema},
             "depends_on": {"type": "array", "items": {"type": "string"}},
+            "expected_interfaces": {"type": "array", "items": {"type": "string"}},
         },
-        "required": sorted(REQUIRED_FIELDS),
+        "required": sorted(TASK_REQUIRED_FIELDS),
         "additionalProperties": False,
     }
     return {
@@ -144,39 +153,12 @@ def _build_work_items_response_schema(name: str, valid_languages: set[str]) -> d
         "schema": {
             "type": "object",
             "properties": {
-                "items": {"type": "array", "items": work_item_schema},
+                  "items": {"type": "array", "items": task_schema},
             },
             "required": ["items"],
             "additionalProperties": False,
         },
     }
-
-
-SYSTEM_PROMPT_TEMPLATE = """You are the MasterAgent in an autonomous coding pipeline.
-
-Given a user's request, decompose it into a list of WorkItems for specialist \
-agents to implement. Output ONLY a JSON array (no prose, no markdown fences) \
-where each element matches this exact schema:
-
-{{
-  "id": "WI-001",
-  "type": "logic" | "ui" | "config" | "test" | "scaffold" | "integrate",
-  "language": "python",
-  "title": "one-line description",
-  "description": "full task spec",
-  "acceptance_criteria": ["criterion 1", "criterion 2"],
-  "output_path": "relative/path/to/file.py",
-  "depends_on": ["WI-000"]
-}}
-
-Rules:
-- "type" must be exactly one of: logic, ui, config, test, scaffold, integrate.
-- "language" must be exactly one of: {valid_languages}.
-- "depends_on" lists ids of other WorkItems in this same array that must be \
-completed first. Use [] if there are none.
-- Every field is required on every item.
-- Output must be a valid JSON array and nothing else.
-"""
 
 
 PLAN_HANDOFF_SYSTEM_PROMPT_TEMPLATE = """You are the MasterAgent in an autonomous coding pipeline, planning work \
@@ -302,7 +284,7 @@ components at all (e.g. a pure library/CLI design) — only apply (a)-(b) \
 when the Component Design section actually describes a web client and/or \
 HTTP server component. (Scaffold and integrate items should still be \
 emitted per rules 6a/6b.)
-8. COMMONLY-FORGOTTEN DELIVERABLES — check the design excerpt's Data \
+ 8. COMMONLY-FORGOTTEN DELIVERABLES — check the design excerpt's Data \
 Design, Observability/Operations, and Deployment/Configuration sections \
 (if present) and produce explicit WorkItems for what they describe, since \
 these are easy to omit by only reading the Work Packages list:
@@ -323,6 +305,39 @@ equivalent process/config file) reflecting that environment.
    d. Only produce these when the design excerpt actually describes the \
 corresponding concern — do not invent database/deployment requirements \
 for a design that doesn't call for them.
+  """
+
+
+TASK_PLANNING_PROMPT_TEMPLATE = """You are the MasterAgent for an autonomous coding pipeline.
+
+Decompose the request/design into cohesive implementation tasks. Tasks may own
+multiple related files and may span frontend/backend when that is one capability.
+Split only for complexity or meaningful architecture boundaries, never one task
+per file. All tasks use this schema:
+
+{{"items":[{{"id":"TASK-auth","category":"feature","language":"typescript",
+"module":"authentication","scope":"...","title":"...","description":"...",
+"acceptance_criteria":["..."],"requirement_refs":["REQ-001"],
+"owned_files":[{{"path":"src/auth.ts","language":"typescript","area":"product"}}],
+"depends_on":[],"expected_interfaces":["exports authenticate(credentials)"]}}]}}
+
+Categories and responsibility:
+- foundation: project setup and primitives required across modules.
+- feature: one cohesive user capability, including related frontend/backend files.
+- shared: cross-feature contracts/utilities/schema with one clear owner.
+- integration: application composition, entry points, and wiring.
+- validation: tests or validation assets, owned under area "tests".
+
+Rules:
+- Use only categories above and languages from: {valid_languages}.
+- Give every task a stable unique id, module, bounded scope, acceptance criteria,
+  requirement references (empty only when none exist), and at least one owned file.
+- Each file has a safe run-relative path, a configured language, and area
+  "product" or "tests". Every path has exactly one owner across the plan.
+- Dependencies reference task ids in this plan. State the concrete interfaces
+  each task promises and expects so dependent tasks can integrate without guessing.
+- Preserve all requested/design scope and trace requirement/test identifiers.
+- Emit JSON only. Do not use legacy logic/ui/config/test/scaffold/integrate types.
 """
 
 
@@ -433,11 +448,8 @@ def _check_no_extra_json_data(stripped: str, exc: json.JSONDecodeError) -> None:
 
 class MasterPlanError(Exception):
     """
-    Raised when MasterAgent's planning LLM response cannot be turned
-    into a valid plan — unparseable JSON, failed schema validation, or
-    (for plan_handoff specifically) a dependency-cycle/dangling-reference
-    graph. Renamed from pipeline/design.py's DesignParseError to match
-    the class move; behavior/semantics are unchanged.
+    Raised when planning returns malformed JSON, invalid task ownership,
+    or an invalid dependency graph.
     """
 
 
@@ -464,7 +476,7 @@ class MasterAgent:
 
         model_cfg = self.config["models"]["design"]
         model = model_cfg["model"]
-        system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        system_prompt = TASK_PLANNING_PROMPT_TEMPLATE.format(
             valid_languages=", ".join(sorted(valid_languages))
         )
         messages = [
@@ -474,7 +486,9 @@ class MasterAgent:
         response_schema = _build_work_items_response_schema("decompose_work_items", valid_languages)
 
         def _parse_and_validate(raw: str):
-            return self._validate_and_build(self._parse_json(raw), valid_languages)
+            work_items = self._validate_and_build(self._parse_json(raw), valid_languages)
+            self._validate_task_plan(work_items)
+            return work_items
 
         raw = acp_call_with_retry(
             messages, model, self.config,
@@ -488,21 +502,17 @@ class MasterAgent:
             raise MasterPlanError(raw)
 
         parsed = self._parse_json(raw)
-        return self._validate_and_build(parsed, valid_languages)
+        work_items = self._validate_and_build(parsed, valid_languages)
+        self._validate_task_plan(work_items)
+        return work_items
 
     def plan_handoff(
         self, design_text: str, requirements_text: str | None = None
     ) -> list[WorkItem]:
         """
-        Plan a dependency-ordered list of WorkItems for an approved
-        technical-design handoff. Renamed from decompose_handoff: this is
-        no longer a mechanical 1:1 translation of the design's authored
-        Work Packages. Instead, the LLM is prompted to genuinely judge
-        the right number of WorkItems and what each should own, based on
-        the design document's actual scope and complexity — while still
-        enforcing two structural invariants regardless of task shape
-        (exactly one scaffold item first, exactly one integrate item
-        last — see PLAN_HANDOFF_SYSTEM_PROMPT_TEMPLATE rules 6a/6b).
+        Plan dependency-ordered category tasks for an approved design handoff.
+        It uses the same task schema and validation as free-text decomposition
+        and does not mandate foundation or integration tasks.
 
         Args:
             design_text: The FULL text of the technical design document.
@@ -514,24 +524,18 @@ class MasterAgent:
                 restates.
 
         Returns:
-            A list[WorkItem] where every generated item's `depends_on`
-            correctly encodes dependency order (so dispatch.py's
-            topological sort can consume it directly), and traceability
-            IDs (WP-*, REQ-*, TEST-*, AC-*) are embedded in
-            `title`/`description` text.
+            A validated list of the common multi-file task model, with
+            requirement references and explicit per-file ownership.
 
         Raises:
-            MasterPlanError: if the response is not valid JSON, fails
-                schema validation, or — critically — if the generated
-                WorkItems have dangling `depends_on` references or a
-                dependency cycle (checked via
-                pipeline.dispatch.topological_sort(strict=True)).
+            MasterPlanError: if the response, ownership set, or dependency
+                graph is invalid.
         """
         valid_languages = set(self.config["languages"].keys())
 
         model_cfg = self.config["models"]["design"]
         model = model_cfg["model"]
-        system_prompt = PLAN_HANDOFF_SYSTEM_PROMPT_TEMPLATE.format(
+        system_prompt = TASK_PLANNING_PROMPT_TEMPLATE.format(
             valid_languages=", ".join(sorted(valid_languages))
         )
 
@@ -551,7 +555,7 @@ class MasterAgent:
 
         def _parse_and_validate(raw: str):
             work_items = self._validate_and_build(self._parse_json(raw), valid_languages)
-            self._check_dependency_graph(work_items)
+            self._validate_task_plan(work_items)
             return work_items
 
         raw = acp_call_with_retry(
@@ -567,7 +571,7 @@ class MasterAgent:
 
         parsed = self._parse_json(raw)
         work_items = self._validate_and_build(parsed, valid_languages)
-        self._check_dependency_graph(work_items)
+        self._validate_task_plan(work_items)
         return work_items
 
     def decompose_features(
@@ -742,21 +746,9 @@ class MasterAgent:
             )
 
         groups = group_into_work_items(manifest)
-        return file_groups_to_work_items(groups, manifest)
-
-    @staticmethod
-    def _check_dependency_graph(work_items: list[WorkItem]) -> None:
-        """
-        Guard for plan_handoff: a missed or malformed depends_on edge
-        passes schema validation but breaks dispatch.py's topological sort
-        at runtime. Fail fast here with a clear message instead.
-        """
-        try:
-            topological_sort(work_items, strict=True)
-        except CycleError as e:
-            raise MasterPlanError(
-                f"plan_handoff produced an invalid dependency graph: {e}"
-            ) from e
+        work_items = file_groups_to_work_items(groups, manifest, features)
+        self._validate_task_plan(work_items)
+        return work_items
 
     @staticmethod
     def _parse_json(raw: str) -> list[dict]:
@@ -791,52 +783,168 @@ class MasterAgent:
 
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
-                raise MasterPlanError(f"WorkItem at index {idx} is not a JSON object: {item!r}")
+                raise MasterPlanError(f"Task at index {idx} is not a JSON object: {item!r}")
 
-            missing = REQUIRED_FIELDS - item.keys()
+            missing = TASK_REQUIRED_FIELDS - item.keys()
             if missing:
                 raise MasterPlanError(
-                    f"WorkItem at index {idx} (id={item.get('id', '?')}) missing required fields: {sorted(missing)}"
+                    f"Task at index {idx} (id={item.get('id', '?')}) missing required fields: {sorted(missing)}"
                 )
 
-            item_type = item["type"]
-            if item_type not in VALID_TYPES:
+            category = item["category"]
+            if not isinstance(category, str) or category not in VALID_CATEGORIES:
                 raise MasterPlanError(
-                    f"WorkItem {item.get('id', '?')} has invalid type '{item_type}', "
-                    f"must be one of {sorted(VALID_TYPES)}"
+                    f"Task {item.get('id', '?')} has invalid category {category!r}, "
+                    f"must be one of {sorted(VALID_CATEGORIES)}"
                 )
 
             item_language = item["language"]
-            if item_language not in valid_languages:
+            if not isinstance(item_language, str) or item_language not in valid_languages:
                 raise MasterPlanError(
-                    f"WorkItem {item.get('id', '?')} has invalid language '{item_language}', "
+                    f"Task {item.get('id', '?')} has invalid language '{item_language}', "
                     f"must be one of {sorted(valid_languages)}"
                 )
 
-            if not isinstance(item["acceptance_criteria"], list):
-                raise MasterPlanError(
-                    f"WorkItem {item.get('id', '?')} 'acceptance_criteria' must be a list"
-                )
+            for string_field in ("id", "module", "scope", "title", "description"):
+                if not isinstance(item[string_field], str) or not item[string_field].strip():
+                    raise MasterPlanError(
+                        f"Task {item.get('id', '?')} '{string_field}' must be a non-empty string"
+                    )
+            for list_field in (
+                "acceptance_criteria", "requirement_refs", "depends_on", "expected_interfaces"
+            ):
+                value = item[list_field]
+                if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                    raise MasterPlanError(f"Task {item['id']} '{list_field}' must be a list of strings")
+            if not item["acceptance_criteria"]:
+                raise MasterPlanError(f"Task {item['id']} must have acceptance criteria")
+            if not isinstance(item["owned_files"], list) or not item["owned_files"]:
+                raise MasterPlanError(f"Task {item['id']} must own at least one file")
 
-            if not isinstance(item["depends_on"], list):
-                raise MasterPlanError(
-                    f"WorkItem {item.get('id', '?')} 'depends_on' must be a list"
-                )
+            owned_files: list[OwnedFile] = []
+            for file_idx, file_data in enumerate(item["owned_files"]):
+                if not isinstance(file_data, dict):
+                    raise MasterPlanError(f"Task {item['id']} owned_files[{file_idx}] must be an object")
+                if not {"path", "language", "area"} <= set(file_data):
+                    raise MasterPlanError(
+                        f"Task {item['id']} owned_files[{file_idx}] requires path, language, and area"
+                    )
+                path = file_data["path"]
+                file_language = file_data["language"]
+                area = file_data["area"]
+                if not isinstance(path, str):
+                    raise MasterPlanError(f"Task {item['id']} owned file path must be a string")
+                if not isinstance(file_language, str) or file_language not in valid_languages:
+                    raise MasterPlanError(
+                        f"Task {item['id']} owned file {path!r} has invalid language {file_language!r}"
+                    )
+                if area not in ("product", "tests"):
+                    raise MasterPlanError(f"Task {item['id']} owned file {path!r} has invalid area {area!r}")
+                try:
+                    normalize_relative_path(path)
+                except ValueError as exc:
+                    raise MasterPlanError(f"Task {item['id']} owns unsafe path {path!r}: {exc}") from exc
+                if (category == "validation") != (area == "tests"):
+                    raise MasterPlanError(
+                        f"Task {item['id']} category {category!r} must own files only in the "
+                        f"{'tests' if category == 'validation' else 'product'} area"
+                    )
+                owned_files.append(OwnedFile(path=path, language=file_language, area=area))
 
             work_items.append(
                 WorkItem(
                     id=item["id"],
-                    type=item_type,  # type: ignore[arg-type]
+                    category=category,  # type: ignore[arg-type]
                     language=item_language,
+                    module=item["module"],
+                    scope=item["scope"],
                     title=item["title"],
                     description=item["description"],
                     acceptance_criteria=item["acceptance_criteria"],
-                    output_path=item["output_path"],
+                    requirement_refs=item["requirement_refs"],
+                    owned_files=owned_files,
                     depends_on=item["depends_on"],
+                    expected_interfaces=item["expected_interfaces"],
                 )
             )
 
         return work_items
+
+    def _validate_task_plan(self, work_items: list[WorkItem]) -> None:
+        if not work_items:
+            raise MasterPlanError("Task plan must contain at least one task")
+        ids = [item.id for item in work_items]
+        if len(ids) != len(set(ids)):
+            raise MasterPlanError("Task ids must be unique")
+
+        owners: dict[tuple[str, str], str] = {}
+        for item in work_items:
+            if not isinstance(item.id, str) or not item.id.strip():
+                raise MasterPlanError("Every task must have a non-empty id")
+            if item.category not in VALID_CATEGORIES:
+                raise MasterPlanError(f"Task {item.id} has invalid category {item.category!r}")
+            if not isinstance(item.language, str) or item.language not in self.config["languages"]:
+                raise MasterPlanError(f"Task {item.id} has invalid language {item.language!r}")
+            for field_name in ("module", "scope", "title", "description"):
+                value = getattr(item, field_name)
+                if not isinstance(value, str) or not value.strip():
+                    raise MasterPlanError(f"Task {item.id} must have a non-empty {field_name}")
+            for field_name in (
+                "acceptance_criteria", "requirement_refs", "depends_on", "expected_interfaces"
+            ):
+                values = getattr(item, field_name)
+                if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+                    raise MasterPlanError(f"Task {item.id} {field_name} must be a list of strings")
+            if not item.acceptance_criteria:
+                raise MasterPlanError(f"Task {item.id} must have acceptance criteria")
+            if not item.owned_files:
+                raise MasterPlanError(f"Task {item.id} must own at least one file")
+            for owned_file in item.owned_files:
+                if not isinstance(owned_file, OwnedFile):
+                    raise MasterPlanError(f"Task {item.id} owned files must use the OwnedFile model")
+                if owned_file.area not in ("product", "tests"):
+                    raise MasterPlanError(f"Task {item.id} has invalid file area {owned_file.area!r}")
+                if (item.category == "validation") != (owned_file.area == "tests"):
+                    raise MasterPlanError(f"Task {item.id} category and file area do not match")
+                if owned_file.language not in self.config["languages"]:
+                    raise MasterPlanError(
+                        f"Task {item.id} file {owned_file.path!r} has invalid language {owned_file.language!r}"
+                    )
+                try:
+                    normalized = normalize_relative_path(owned_file.path)
+                except ValueError as exc:
+                    raise MasterPlanError(
+                        f"Task {item.id} owns unsafe path {owned_file.path!r}: {exc}"
+                    ) from exc
+                area_key = "tests_dir" if owned_file.area == "tests" else "output_dir"
+                default_dir = "tests" if area_key == "tests_dir" else "product"
+                configured_dir = normalize_relative_path(
+                    self.config.get("pipeline", {}).get(area_key, default_dir)
+                )
+                prefix = configured_dir + "/"
+                if normalized.startswith(prefix):
+                    try:
+                        normalized = normalize_relative_path(normalized[len(prefix):])
+                    except ValueError as exc:
+                        raise MasterPlanError(
+                            f"Task {item.id} owns unsafe path {owned_file.path!r}: {exc}"
+                        ) from exc
+                key = (configured_dir.casefold(), normalized.casefold())
+                previous = owners.get(key)
+                if previous is not None:
+                    raise MasterPlanError(
+                        f"File {configured_dir}/{normalized!s} has multiple task owners: "
+                        f"{previous} and {item.id}"
+                    )
+                owners[key] = item.id
+
+        try:
+            topological_sort(work_items, strict=True)
+        except CycleError as exc:
+            raise MasterPlanError(f"invalid dependency graph: {exc}") from exc
+
+        for item in work_items:
+            item.status = "blocked" if item.depends_on else "ready"
 
     @staticmethod
     def _parse_features_json(raw: str) -> list[dict]:
@@ -928,36 +1036,36 @@ class MasterAgent:
         work_items: list[WorkItem],
     ) -> dict[str, list[TestFailure]]:
         """
-        Given a failed TestResult, resolve which WorkItem ids should be
-        retried: the WorkItem that produced the failing test file, plus
-        everything in that WorkItem's depends_on (either could be at
-        fault).
+        Resolve failing output files to their owning tasks. Validation-task
+        failures also retry their declared implementation dependencies; any
+        changed task then pulls in downstream dependents whose outputs may be
+        stale. Unrelated successful tasks stay out of the retry subset.
 
         Convention (must match pipeline/test_runner.py): TestFailure.test_name
         is f"{file_path}::{classname}::{name}" — the file path is the first
         "::"-delimited segment.
 
-        Returns:
-            dict mapping work_item_id -> list of TestFailure that directly
-            implicated it. WorkItem ids added to the retry set only via
-            depends_on propagation (i.e. they didn't directly produce a
-            failing file) map to an empty list — the caller can tell
-            "retried because a dependent failed" from an empty list.
+        Returns a map from retry task id to its directly associated test
+        failures. Tasks added for repair have empty lists.
         """
         by_id = {item.id: item for item in work_items}
 
-        # file_path (normalized) -> work_item_id, from every AgentResult's
-        # files_written (paths are relative to project_root).
+        # Run-relative output path -> task id from every AgentResult.
         reverse_map: dict[str, str] = {}
         for result in agent_results:
             for path in result.files_written:
-                reverse_map[os.path.normpath(path)] = result.work_item_id
+                reverse_map[os.path.normcase(os.path.normpath(path))] = result.work_item_id
 
         retry_failures: dict[str, list[TestFailure]] = {}
 
+        for result in agent_results:
+            item = by_id.get(result.work_item_id)
+            if item is not None and item.status == "failed":
+                retry_failures.setdefault(item.id, [])
+
         for failure in test_result.failures:
             file_path = failure.test_name.split("::", 1)[0]
-            normalized = os.path.normpath(file_path)
+            normalized = os.path.normcase(os.path.normpath(file_path))
 
             work_item_id = reverse_map.get(normalized)
 
@@ -965,12 +1073,13 @@ class MasterAgent:
                 # Fallback: endswith matching, handles relative vs
                 # project-root-relative path discrepancies between how
                 # pytest reports the file and how it's stored in the map.
-                for mapped_path, mapped_id in reverse_map.items():
-                    if normalized.endswith(mapped_path) or mapped_path.endswith(
-                        normalized
-                    ):
-                        work_item_id = mapped_id
-                        break
+                matches = {
+                    mapped_id
+                    for mapped_path, mapped_id in reverse_map.items()
+                    if normalized.endswith(mapped_path) or mapped_path.endswith(normalized)
+                }
+                if len(matches) == 1:
+                    work_item_id = matches.pop()
 
             if work_item_id is None:
                 # Couldn't resolve — skip retry-targeting for this failure,
@@ -980,9 +1089,17 @@ class MasterAgent:
 
             retry_failures.setdefault(work_item_id, []).append(failure)
             item = by_id.get(work_item_id)
-            if item is not None:
+            if item is not None and item.category == "validation":
                 for dep_id in item.depends_on:
                     retry_failures.setdefault(dep_id, [])
+
+        changed = set(retry_failures)
+        while changed:
+            current = changed.pop()
+            for item in work_items:
+                if current in item.depends_on and item.id not in retry_failures:
+                    retry_failures[item.id] = []
+                    changed.add(item.id)
 
         return retry_failures
 

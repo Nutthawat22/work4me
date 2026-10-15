@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from typing import Callable
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -21,7 +22,7 @@ from pipeline.config_validation import validate_config
 from pipeline.dispatch import dispatch_work_items, CycleError
 from pipeline.instructions import write_instructions_md
 from pipeline.run_paths import append_index, create_run_dir, write_manifest
-from pipeline.state import AgentResult, FailReport, TestResult, WorkItem
+from pipeline.state import AgentResult, FailReport, TaskAttempt, TestResult, WorkItem
 from pipeline.test_runner import TestRunner
 from specialists.providers import acp_client
 
@@ -37,12 +38,12 @@ def load_config() -> tuple[dict, str]:
 
 
 def print_work_item(item: WorkItem) -> None:
-    print(f"  [{item.id}] ({item.type}) {item.title}")
+    print(f"  [{item.id}] ({item.category}) {item.title}")
     print(f"    description: {item.description}")
     print(f"    acceptance_criteria:")
     for criterion in item.acceptance_criteria:
         print(f"      - {criterion}")
-    print(f"    output_path: {item.output_path}")
+    print(f"    owned_files: {[f'{file.area}/{file.path}' for file in item.owned_files]}")
     print(f"    depends_on: {item.depends_on}")
 
 
@@ -55,7 +56,7 @@ def print_agent_result(result: AgentResult) -> None:
 
 
 def _print_dispatch_progress(item: WorkItem, index: int, total: int) -> None:
-    print(f"  ⏳ [{index}/{total}] {item.id} ({item.type}) {item.title} — working...")
+    print(f"  ⏳ [{index}/{total}] {item.id} ({item.category}) {item.title} — working...")
 
 
 def print_specialist_failures(results: list[AgentResult]) -> None:
@@ -87,12 +88,38 @@ def _final_agent_results_by_work_item(
     return list(by_id.values())
 
 
+def _sync_task_results(
+    work_items: list[WorkItem],
+    results: list[AgentResult],
+    attempts_before: dict[str, int],
+) -> None:
+    """Keep task artifacts correct when dispatch is replaced by a test double."""
+    by_id = {item.id: item for item in work_items}
+    for result in results:
+        item = by_id.get(result.work_item_id)
+        if item is None or len(item.attempts) != attempts_before.get(item.id, 0):
+            continue
+        if not result.success and result.notes.startswith("Task blocked by dependencies:"):
+            item.status = "blocked"
+            continue
+        item.status = "passed" if result.success else "failed"
+        item.attempts.append(
+            TaskAttempt(
+                number=len(item.attempts) + 1,
+                status="passed" if result.success else "failed",
+                files_written=list(result.files_written),
+                result_summary=f"Wrote {len(result.files_written)} file(s)" if result.success else "",
+                failure_details=result.notes if not result.success else "",
+            )
+        )
+
+
 def print_fail_report(report: FailReport) -> None:
     print("═" * 50)
     print(f"PIPELINE FAILED after {report.run_number} attempts")
     print("═" * 50)
     print()
-    print(f"Unresolved work items: {', '.join(report.unresolved_items) or '(none resolved)'}")
+    print(f"Unresolved tasks: {', '.join(report.unresolved_items) or '(none resolved)'}")
     print()
     print("Failures:")
     for failure in report.failures:
@@ -112,6 +139,7 @@ def run_pipeline(
     user_input: str | None = None,
     work_items: list[WorkItem] | None = None,
     label: str | None = None,
+    progress: Callable[[dict[str, object]], None] | None = None,
 ) -> bool:
     """
     Run one full pipeline pass end-to-end (run-dir creation -> decompose
@@ -135,6 +163,8 @@ def run_pipeline(
             field. Defaults to user_input when user_input is given.
             Required when work_items is given, since there's no raw
             prompt string to derive it from.
+        progress: Optional structured progress callback. Completed task
+            counts represent specialist attempts; retries add to the count.
 
     Returns:
         True if the run's tests ultimately passed, False otherwise
@@ -153,7 +183,7 @@ def run_pipeline(
         label = user_input
 
     try:
-        return _run_pipeline_body(config, user_input, work_items, label)
+        return _run_pipeline_body(config, user_input, work_items, label, progress)
     finally:
         acp_client.teardown()
 
@@ -163,6 +193,7 @@ def _run_pipeline_body(
     user_input: str | None,
     work_items: list[WorkItem] | None,
     label: str,
+    progress: Callable[[dict[str, object]], None] | None = None,
 ) -> bool:
     """
     The actual run_pipeline() body, extracted so run_pipeline() can wrap
@@ -178,16 +209,23 @@ def _run_pipeline_body(
 
     runs_dir_abs = os.path.join(PROJECT_ROOT, config["pipeline"]["runs_dir"])
     run_dir = create_run_dir(runs_dir_abs, label)
+    run_id = os.path.basename(run_dir)
     print(f"\n📁 Run dir: {run_dir}\n")
 
-    # tests_blocking defaults to True (absent key == today's behavior):
-    # explicit False makes test-*content* failures advisory-only for the
-    # run's final pass/fail decision and the retry loop's test-driven
-    # trigger — it does NOT touch the vacuous-pass guard further down
-    # (specialist dispatch failures always block, regardless of this
-    # flag). See _run_pipeline_body's retry loop and final decision
-    # block below for where this is actually consumed.
+      # tests_blocking defaults to True (absent key == today's behavior):
+      # explicit False makes test-*content* failures advisory-only for the
+      # run's final pass/fail decision and the retry loop's test-driven
+      # trigger — it does NOT touch the vacuous-pass guard further down
+      # (specialist dispatch failures always block, regardless of this
+      # flag). See _run_pipeline_body's retry loop and final decision
+      # block below for where this is actually consumed.
     tests_blocking = config["pipeline"].get("tests_blocking", True)
+
+    def report(**updates: object) -> None:
+        if progress is not None:
+            progress({"run_id": run_id, "tests_blocking": tests_blocking, **updates})
+
+    report(phase="planning")
 
     manifest = {
         "run_id": os.path.basename(run_dir),
@@ -213,20 +251,72 @@ def _run_pipeline_body(
             write_instructions_md(
                 run_dir, config, [], [], None, "design_parse_error"
             )
+            report(phase="teardown", outcome="failed")
             return False
+
+    try:
+        master._validate_task_plan(work_items)
+    except MasterPlanError as e:
+        print(f"\n⚠️  Invalid task plan: {e}\n")
+        manifest["status"] = "failed"
+        manifest["failure_reason"] = "task_plan_invalid"
+        manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_manifest(run_dir, manifest)
+        append_index(runs_dir_abs, manifest)
+        write_instructions_md(run_dir, config, [], [], None, "task_plan_invalid")
+        report(phase="teardown", outcome="failed")
+        return False
 
     manifest["work_item_count"] = len(work_items)
     write_manifest(run_dir, manifest)
 
-    with open(os.path.join(run_dir, "design", "plan.json"), "w") as f:
-        json.dump([dataclasses.asdict(wi) for wi in work_items], f, indent=2)
+    plan_path = os.path.join(run_dir, "design", "plan.json")
+    reported_task_statuses: dict[str, str] = {}
 
-    print(f"✅ Plan ready: {len(work_items)} WorkItem(s) (see design/plan.json for full detail)\n")
+    def persist_plan(_item: WorkItem | None = None) -> None:
+        with open(plan_path, "w") as plan_file:
+            json.dump(
+                {"format_version": 2, "tasks": [dataclasses.asdict(wi) for wi in work_items]},
+                plan_file,
+                indent=2,
+            )
+        if _item is not None:
+            reported_task_statuses[_item.id] = _item.status
+            report(
+                phase="dispatch",
+                tasks_total=len(work_items),
+                tasks_started=sum(len(item.attempts) for item in work_items)
+                + sum(item.status == "running" for item in work_items),
+                tasks_completed=sum(len(item.attempts) for item in work_items),
+                tasks_blocked=sum(status == "blocked" for status in reported_task_statuses.values()),
+                task={
+                    "id": _item.id,
+                    "category": _item.category,
+                    "status": _item.status,
+                    "attempt": len(_item.attempts) + (1 if _item.status == "running" else 0),
+                },
+            )
 
-    print(f"🚀 Dispatching {len(work_items)} WorkItem(s)...\n")
+    persist_plan()
+
+    print(f"✅ Plan ready: {len(work_items)} task(s) (see design/plan.json for full detail)\n")
+
+    print(f"🚀 Dispatching {len(work_items)} task(s)...\n")
+    report(
+        phase="dispatch",
+        tasks_total=len(work_items),
+        tasks_started=0,
+        tasks_completed=0,
+        tasks_blocked=0,
+        task=None,
+        attempt_round=1,
+        max_attempts=config["pipeline"]["max_retries"],
+    )
+    attempts_before = {item.id: len(item.attempts) for item in work_items}
     try:
         agent_results = dispatch_work_items(
-            work_items, config, run_dir, progress=_print_dispatch_progress
+            work_items, config, run_dir, progress=_print_dispatch_progress,
+            task_update=persist_plan,
         )
     except CycleError as e:
         print(f"\n⚠️  Dispatch failed — dependency cycle: {e}\n")
@@ -238,7 +328,11 @@ def _run_pipeline_body(
         write_instructions_md(
             run_dir, config, work_items, [], None, "dispatch_cycle_error"
         )
+        report(phase="teardown", outcome="failed")
         return False
+
+    _sync_task_results(work_items, agent_results, attempts_before)
+    persist_plan()
 
     print(f"Dispatch results ({len(agent_results)} agent(s) ran):\n")
     for result in agent_results:
@@ -251,6 +345,7 @@ def _run_pipeline_body(
 
     current_work_items = work_items
     all_agent_results: list[AgentResult] = list(agent_results)
+    report(phase="testing", task=None, attempt_round=1)
     test_result: TestResult = test_runner.run(config, work_items, run_dir)
 
     attempt = 1
@@ -266,31 +361,18 @@ def _run_pipeline_body(
     print()
 
     while attempt < max_retries:
-        # tests_blocking=True (default): unchanged — any test failure
-        # (content or vacuous-pass-adjacent) drives a retry attempt, same
-        # as before this flag existed.
-        #
-        # tests_blocking=False: a *pure* test-content failure (every
-        # specialist's final dispatch succeeded) is advisory-only and
-        # must not burn a retry — the known jest/dynamic-path-matching
-        # issue (see module docstring context) can produce false test
-        # failures unrelated to actual code quality. But if some
-        # WorkItem's specialist dispatch is still unresolved (failed),
-        # that's a real problem worth retrying regardless of
-        # tests_blocking — retries are fundamentally about fixing failed
-        # WorkItems, not about satisfying the test suite.
-        if not test_result.passed:
-            if tests_blocking:
-                should_retry = True
-            else:
-                unresolved_specialist_ids = {
-                    r.work_item_id
-                    for r in _final_agent_results_by_work_item(all_agent_results)
-                    if not r.success
-                }
-                should_retry = bool(unresolved_specialist_ids)
-        else:
-            should_retry = False
+        # Test-content failures trigger retries only when blocking is enabled;
+        # failed task executions always retry regardless of that setting.
+        unresolved_specialist_ids = {
+            r.work_item_id
+            for r in _final_agent_results_by_work_item(all_agent_results)
+            if not r.success
+        }
+        should_retry = (
+            (not test_result.passed or bool(unresolved_specialist_ids))
+            if tests_blocking
+            else bool(unresolved_specialist_ids)
+        )
 
         if not should_retry:
             break
@@ -304,20 +386,26 @@ def _run_pipeline_body(
 
         current_work_items = [wi for wi in work_items if wi.id in retry_context]
         attempt += 1
+        report(phase="retrying", task=None, attempt_round=attempt)
 
-        print(f"Retrying attempt {attempt} for WorkItems: "
+        print(f"Retrying attempt {attempt} for tasks: "
               f"{[wi.id for wi in current_work_items]}\n")
 
+        attempts_before = {item.id: len(item.attempts) for item in current_work_items}
         try:
             retry_results = dispatch_work_items(
                 current_work_items, config, run_dir,
                 retry_context=retry_context, strict=False,
                 known_results=all_agent_results,
                 progress=_print_dispatch_progress,
+                task_update=persist_plan,
             )
         except CycleError as e:
             print(f"\n⚠️  Retry dispatch failed — dependency cycle: {e}\n")
             break
+
+        _sync_task_results(current_work_items, retry_results, attempts_before)
+        persist_plan()
 
         print(f"Dispatch results ({len(retry_results)} agent(s) ran):\n")
         for result in retry_results:
@@ -327,6 +415,7 @@ def _run_pipeline_body(
 
         all_agent_results.extend(retry_results)
 
+        report(phase="testing", task=None, attempt_round=attempt)
         test_result = test_runner.run(config, work_items, run_dir)
         with open(
             os.path.join(run_dir, "tests", "results", f"attempt-{attempt}.json"), "w"
@@ -364,6 +453,7 @@ def _run_pipeline_body(
         write_instructions_md(
             run_dir, config, work_items, all_agent_results, test_result, "passed"
         )
+        report(phase="teardown", outcome="passed", attempt_round=attempt)
         return True
 
     if test_result.passed and failed_work_item_ids:
@@ -376,7 +466,7 @@ def _run_pipeline_body(
         # a test-content signal, and always blocks.
         print(
             f"⚠️  {len(failed_work_item_ids)} of {len(final_agent_results)} "
-            "WorkItem(s) failed dispatch and produced no output — the "
+            "task(s) failed dispatch and produced no output — the "
             "0/0 vacuous test pass does not mean this run succeeded.\n"
         )
         fail_report = FailReport(
@@ -385,7 +475,7 @@ def _run_pipeline_body(
             unresolved_items=failed_work_item_ids,
             summary=(
                 f"{len(failed_work_item_ids)} of {len(final_agent_results)} "
-                f"WorkItem(s) failed dispatch (specialist errors) after "
+                f"task(s) failed dispatch (specialist errors) after "
                 f"{attempt} attempt(s); no test files were produced for "
                 "them, so the 0/0 vacuous test pass cannot be treated as "
                 "a real pass."
@@ -407,6 +497,7 @@ def _run_pipeline_body(
         write_instructions_md(
             run_dir, config, work_items, all_agent_results, test_result, "failed"
         )
+        report(phase="teardown", outcome="failed", attempt_round=attempt)
         return False
 
     if not tests_blocking and not failed_work_item_ids:
@@ -421,7 +512,7 @@ def _run_pipeline_body(
         print(
             "⚠️  Tests failed but tests_blocking=false — treating as "
             "advisory-only. Specialist dispatch succeeded for all "
-            "WorkItems; automated test results should be treated as "
+            "tasks; automated test results should be treated as "
             "unverified.\n"
         )
         manifest["status"] = "passed_with_test_failures"
@@ -432,6 +523,11 @@ def _run_pipeline_body(
         write_instructions_md(
             run_dir, config, work_items, all_agent_results, test_result,
             "passed_with_test_failures",
+        )
+        report(
+            phase="teardown",
+            outcome="passed_with_test_failures",
+            attempt_round=attempt,
         )
         return True
 
@@ -462,6 +558,7 @@ def _run_pipeline_body(
     write_instructions_md(
         run_dir, config, work_items, all_agent_results, test_result, "failed"
     )
+    report(phase="teardown", outcome="failed", attempt_round=attempt)
     return False
 
 

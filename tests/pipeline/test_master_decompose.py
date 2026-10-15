@@ -31,13 +31,17 @@ def _work_items_json() -> str:
         "items": [
             {
                 "id": "WI-001",
-                "type": "logic",
+                "category": "feature",
                 "language": "python",
+                "module": "calculator",
+                "scope": "Implement addition",
                 "title": "Add two numbers",
                 "description": "Implement add(a, b)",
                 "acceptance_criteria": ["add(2, 3) == 5"],
-                "output_path": "add.py",
+                "requirement_refs": ["REQ-001"],
+                "owned_files": [{"path": "add.py", "language": "python", "area": "product"}],
                 "depends_on": [],
+                "expected_interfaces": ["exports add(a, b)"],
             },
         ]
     })
@@ -51,19 +55,23 @@ class TestDecomposeHappyPath:
         work_items = MasterAgent(_config()).decompose("build an adder")
         assert len(work_items) == 1
         assert work_items[0].id == "WI-001"
-        assert work_items[0].type == "logic"
+        assert work_items[0].category == "feature"
 
     def test_decompose_accepts_bare_array(self, monkeypatch):
         bare_array = json.dumps([
             {
                 "id": "WI-001",
-                "type": "logic",
+                "category": "feature",
                 "language": "python",
+                "module": "example",
+                "scope": "Implement example behavior",
                 "title": "t",
                 "description": "d",
-                "acceptance_criteria": [],
-                "output_path": "a.py",
+                "acceptance_criteria": ["example works"],
+                "requirement_refs": [],
+                "owned_files": [{"path": "a.py", "language": "python", "area": "product"}],
                 "depends_on": [],
+                "expected_interfaces": [],
             },
         ])
         monkeypatch.setattr(
@@ -118,13 +126,17 @@ class TestDecomposeErrors:
             "items": [
                 {
                     "id": "WI-001",
-                    "type": "logic",
-                    "language": "rust",  # not in config["languages"]
-                    "title": "t",
-                    "description": "d",
-                    "acceptance_criteria": [],
-                    "output_path": "a.rs",
-                    "depends_on": [],
+                      "category": "feature",
+                      "language": "rust",  # not in config["languages"]
+                      "module": "example",
+                      "scope": "Implement example behavior",
+                      "title": "t",
+                      "description": "d",
+                      "acceptance_criteria": ["example works"],
+                      "requirement_refs": [],
+                      "owned_files": [{"path": "a.rs", "language": "rust", "area": "product"}],
+                      "depends_on": [],
+                      "expected_interfaces": [],
                 },
             ]
         })

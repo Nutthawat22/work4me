@@ -4,8 +4,7 @@ pipeline/state.py
 Data structures shared across the agentic pipeline: WorkItem, AgentResult,
 TestResult, TestFailure, ReviewResult, FailReport, PipelineState.
 
-See ~/dev-plans/agents/features/2026-08-10-agentic-pipeline.md for the
-full design spec these are derived from.
+See docs/task-workflow.md for the active task model and run artifact contract.
 """
 
 from __future__ import annotations
@@ -15,19 +14,42 @@ from typing import Literal
 
 # ── Work Item ────────────────────────────────────────────────────────────────
 
-WorkItemType = Literal["logic", "ui", "config", "test", "scaffold", "integrate", "feature", "shared"]
+TaskCategory = Literal["foundation", "feature", "shared", "integration", "validation"]
+TaskStatus = Literal["blocked", "ready", "running", "passed", "failed"]
+
+
+@dataclass
+class OwnedFile:
+    path: str
+    language: str
+    area: Literal["product", "tests"] = "product"
+
+
+@dataclass
+class TaskAttempt:
+    number: int
+    status: Literal["passed", "failed"]
+    files_written: list[str] = field(default_factory=list)
+    result_summary: str = ""
+    failure_details: str = ""
 
 
 @dataclass
 class WorkItem:
-    id: str                          # e.g. "WI-001"
-    type: WorkItemType               # routes to the correct specialist
-    language: str                    # e.g. "python" — must match a key in config's "languages"
-    title: str                       # one-line description
-    description: str                 # full task spec
-    acceptance_criteria: list[str]   # bullet list — used by TestAgent & TestRunner
-    output_path: str                 # relative path where agent writes its file(s)
-    depends_on: list[str] = field(default_factory=list)  # other WorkItem ids
+    id: str
+    category: TaskCategory
+    language: str
+    module: str
+    scope: str
+    title: str
+    description: str
+    acceptance_criteria: list[str]
+    requirement_refs: list[str]
+    owned_files: list[OwnedFile]
+    depends_on: list[str] = field(default_factory=list)
+    expected_interfaces: list[str] = field(default_factory=list)
+    status: TaskStatus = "blocked"
+    attempts: list[TaskAttempt] = field(default_factory=list)
 
 
 # ── Agent Result ─────────────────────────────────────────────────────────────
@@ -63,7 +85,7 @@ class TestResult:
 @dataclass
 class ReviewResult:
     """Accept/reject verdict shape used by specialists/base.py's internal
-    self-check loop (see run_specialist/run_multifile_specialist): after
+    self-check loop (see run_multifile_specialist): after
     writing its own output, a specialist verifies it against the
     WorkItem's acceptance_criteria/dependency_context via a separate
     self-check LLM call, and this is that call's parsed response. Not a
@@ -88,10 +110,8 @@ class FailReport:
 
 @dataclass
 class Feature:
-    """A feature-level unit of work (the WHAT), emitted by a future
-    feature-oriented decomposition stage. Unlike WorkItem, a Feature does
-    NOT name files — it describes intent only. The file layout is decided
-    later by plan_file_manifest()."""
+    """Feature intent used as input to the optional file-manifest strategy.
+    Unlike a dispatchable WorkItem, a Feature does not name output files."""
     id: str                          # e.g. "FEAT-auth"
     title: str
     description: str
@@ -103,7 +123,7 @@ class Feature:
 
 # ── File Spec ────────────────────────────────────────────────────────────────
 
-FileRole = Literal["scaffold", "feature", "shared", "entrypoint"]
+FileRole = Literal["scaffold", "feature", "shared", "entrypoint", "validation"]
 
 
 @dataclass
@@ -118,6 +138,7 @@ class FileSpec:
     contributing_features: list[str]       # Feature ids that need something in this file
     requirements: list[str] = field(default_factory=list)     # merged, file-scoped requirement bullets
     depends_on_files: list[str] = field(default_factory=list)  # other FileSpec.path values this imports
+    interfaces: list[str] = field(default_factory=list)        # contracts this file exposes or consumes
 
 
 # ── File Manifest ────────────────────────────────────────────────────────────
@@ -135,17 +156,17 @@ class FileManifest:
 @dataclass
 class FileGroup:
     """A cohesion cluster of FileSpecs that should be authored together by
-    one multi-file specialist call. Produced by group_into_work_items().
-    This is a planning artifact only — it is intentionally NOT the live
-    WorkItem type (that stays untouched); a future wiring step will adapt
-    FileGroups into dispatchable work."""
-    id: str                          # e.g. "GRP-feature-auth"
+    one multi-file specialist task. Produced by group_into_work_items() and
+    adapted into the shared WorkItem model by file_groups_to_work_items()."""
+    id: str                          # stable architecture/task id
     role: FileRole
     language: str
+    module: str
     title: str
     files: list[str]                 # FileSpec.path values in this group
     contributing_features: list[str]
     requirements: list[str] = field(default_factory=list)
+    interfaces: list[str] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)   # other FileGroup ids
 
 

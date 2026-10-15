@@ -1,10 +1,9 @@
 """
 tests/pipeline/test_file_manifest.py
 
-Tests for the additive, not-yet-wired file-indexed planning scaffold
-(pipeline/file_manifest.py). No LLM calls and no network: exercises
-group_into_work_items() and validate_file_manifest() with hand-made
-FileManifests, and confirms plan_file_manifest() is still a stub.
+Tests for the file-indexed planning strategy (pipeline/file_manifest.py).
+No live LLM calls or network: exercises grouping and validation with
+hand-made FileManifests and mocks the planner call.
 """
 
 import json
@@ -110,15 +109,15 @@ def _by_id(groups: list[FileGroup]) -> dict[str, FileGroup]:
 
 def test_group_scaffold_single_group():
     groups = _by_id(group_into_work_items(_manifest()))
-    assert "GRP-scaffold" in groups
-    assert groups["GRP-scaffold"].role == "scaffold"
-    assert groups["GRP-scaffold"].files == ["package.json"]
+    assert "TASK-foundation" in groups
+    assert groups["TASK-foundation"].role == "scaffold"
+    assert groups["TASK-foundation"].files == ["package.json"]
 
 
 def test_group_feature_auth_has_both_files():
     groups = _by_id(group_into_work_items(_manifest()))
-    assert "GRP-feature-FEAT-auth" in groups
-    g = groups["GRP-feature-FEAT-auth"]
+    assert "TASK-feature-FEAT-auth" in groups
+    g = groups["TASK-feature-FEAT-auth"]
     assert g.role == "feature"
     assert g.files == ["src/server/auth/service.ts", "src/server/routes/auth.ts"]
     assert g.contributing_features == ["FEAT-auth"]
@@ -126,13 +125,13 @@ def test_group_feature_auth_has_both_files():
 
 def test_group_feature_requests():
     groups = _by_id(group_into_work_items(_manifest()))
-    assert "GRP-feature-FEAT-requests" in groups
-    assert groups["GRP-feature-FEAT-requests"].files == ["src/server/routes/requests.ts"]
+    assert "TASK-feature-FEAT-requests" in groups
+    assert groups["TASK-feature-FEAT-requests"].files == ["src/server/routes/requests.ts"]
 
 
 def test_group_shared_en_json_own_group():
     groups = _by_id(group_into_work_items(_manifest()))
-    gid = "GRP-shared-src-i18n-en-json"
+    gid = "TASK-shared-feat-auth-feat-requests"
     assert gid in groups
     g = groups[gid]
     assert g.role == "shared"
@@ -142,14 +141,14 @@ def test_group_shared_en_json_own_group():
 
 def test_group_entrypoint_own_group_and_depends_on_feature_groups():
     groups = _by_id(group_into_work_items(_manifest()))
-    gid = "GRP-entrypoint-src-index-ts"
+    gid = "TASK-integration"
     assert gid in groups
     g = groups[gid]
     assert g.role == "entrypoint"
     assert g.files == ["src/index.ts"]
     # index.ts depends_on_files the auth + requests route files, which live in
     # their respective feature groups.
-    assert set(g.depends_on) == {"GRP-feature-FEAT-auth", "GRP-feature-FEAT-requests"}
+    assert set(g.depends_on) == {"TASK-feature-FEAT-auth", "TASK-feature-FEAT-requests"}
 
 
 def test_group_ordering_scaffold_first_entrypoint_last():
@@ -169,7 +168,7 @@ def test_group_convergent_feature_file_treated_as_shared():
         ),
     ])
     groups = _by_id(group_into_work_items(manifest))
-    gid = "GRP-shared-src-shared-util-ts"
+    gid = "TASK-shared-feat-auth-feat-requests"
     assert gid in groups
     assert groups[gid].role == "shared"
 

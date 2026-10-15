@@ -24,9 +24,8 @@ sys.path.insert(0, REPO_ROOT)
 from specialists.base import (
     SELF_CHECK_MAX_ATTEMPTS,
     run_multifile_specialist,
-    run_specialist,
 )
-from pipeline.state import WorkItem
+from pipeline.state import OwnedFile, WorkItem
 
 
 def _config() -> dict:
@@ -39,13 +38,17 @@ def _config() -> dict:
 def _work_item() -> WorkItem:
     return WorkItem(
         id="WI-001",
-        type="logic",
+        category="feature",
         language="python",
+        module="calculator",
+        scope="Implement addition",
         title="Add two numbers",
         description="Implement add(a, b)",
         acceptance_criteria=["add(2, 3) == 5"],
-        output_path="add.py",
+        requirement_refs=["REQ-001"],
+        owned_files=[OwnedFile("add.py", "python")],
         depends_on=[],
+        expected_interfaces=["exports add(a, b)"],
     )
 
 
@@ -55,6 +58,10 @@ def _accept_json(reasoning="looks good") -> str:
 
 def _reject_json(issue="missing something") -> str:
     return json.dumps({"accepted": False, "issues": [issue], "reasoning": issue})
+
+
+def _file_response(content: str) -> str:
+    return json.dumps({"files": {"add.py": content}})
 
 
 def _queue_call_llm(monkeypatch, responses: list[str]):
@@ -77,13 +84,13 @@ def _queue_call_llm(monkeypatch, responses: list[str]):
 class TestSelfCheckAcceptsFirstTry:
     def test_accepted_on_first_attempt_does_not_regenerate(self, monkeypatch, tmp_path):
         calls = _queue_call_llm(monkeypatch, [
-            "def add(a, b):\n    return a + b\n",
+            _file_response("def add(a, b):\n    return a + b\n"),
             _accept_json(),
         ])
 
-        result = run_specialist(
+        result = run_multifile_specialist(
             _work_item(), _config(), str(tmp_path),
-            "You are an expert {language} engineer.", "LogicAgent", "output_dir",
+            "You are an expert {language} engineer.", "FeatureAgent",
         )
 
         assert len(calls) == 2  # one generation, one self-check — no regeneration
@@ -102,7 +109,7 @@ class TestSelfCheckAcceptsFirstTry:
 
         result = run_multifile_specialist(
             _work_item(), _config(), str(tmp_path),
-            "You are an expert {language} engineer.", "FeatureAgent", "output_dir",
+            "You are an expert {language} engineer.", "FeatureAgent",
         )
 
         assert len(calls) == 2
@@ -113,15 +120,15 @@ class TestSelfCheckAcceptsFirstTry:
 class TestSelfCheckRejectsThenAccepts:
     def test_rejected_then_accepted_regenerates_once(self, monkeypatch, tmp_path):
         calls = _queue_call_llm(monkeypatch, [
-            "def add(a, b):\n    return a - b\n",   # v1: wrong implementation
+            _file_response("def add(a, b):\n    return a - b\n"),   # v1: wrong implementation
             _reject_json("subtracts instead of adding"),
-            "def add(a, b):\n    return a + b\n",   # v2: fixed
+            _file_response("def add(a, b):\n    return a + b\n"),   # v2: fixed
             _accept_json(),
         ])
 
-        result = run_specialist(
+        result = run_multifile_specialist(
             _work_item(), _config(), str(tmp_path),
-            "You are an expert {language} engineer.", "LogicAgent", "output_dir",
+            "You are an expert {language} engineer.", "FeatureAgent",
         )
 
         assert len(calls) == 4
@@ -143,14 +150,14 @@ class TestSelfCheckExhaustsAttempts:
         total_attempts = SELF_CHECK_MAX_ATTEMPTS + 1
         responses = []
         for i in range(total_attempts):
-            responses.append(f"def add(a, b):\n    return {i}\n")
+            responses.append(_file_response(f"def add(a, b):\n    return {i}\n"))
             responses.append(_reject_json(f"issue {i}"))
 
         calls = _queue_call_llm(monkeypatch, responses)
 
-        result = run_specialist(
+        result = run_multifile_specialist(
             _work_item(), _config(), str(tmp_path),
-            "You are an expert {language} engineer.", "LogicAgent", "output_dir",
+            "You are an expert {language} engineer.", "FeatureAgent",
         )
 
         assert len(calls) == total_attempts * 2
@@ -163,13 +170,13 @@ class TestSelfCheckExhaustsAttempts:
 class TestSelfCheckFailsOpenOnBrokenCheckCall:
     def test_self_check_llm_error_does_not_block_success(self, monkeypatch, tmp_path):
         calls = _queue_call_llm(monkeypatch, [
-            "def add(a, b):\n    return a + b\n",
+            _file_response("def add(a, b):\n    return a + b\n"),
             "[m] Error: ACP prompt timed out after 60s.",
         ])
 
-        result = run_specialist(
+        result = run_multifile_specialist(
             _work_item(), _config(), str(tmp_path),
-            "You are an expert {language} engineer.", "LogicAgent", "output_dir",
+            "You are an expert {language} engineer.", "FeatureAgent",
         )
 
         assert len(calls) == 2

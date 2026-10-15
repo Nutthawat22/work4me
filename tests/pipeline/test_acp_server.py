@@ -84,6 +84,9 @@ def test_initialize_returns_well_formed_response(agent):
     assert resp.protocol_version == 1
     assert resp.agent_capabilities is not None
     assert resp.agent_info.name == "agents-pipeline"
+    assert resp.agent_capabilities.field_meta["agents-pipeline"]["runStatus"]["method"] == (
+        "_agents-pipeline/run/status"
+    )
 
 
 # ── new_session() ────────────────────────────────────────────────────────────
@@ -118,7 +121,7 @@ def test_prompt_extracts_text_and_calls_run_pipeline(agent, monkeypatch):
 
     captured_calls = []
 
-    def fake_run_pipeline(config, *, user_input=None, work_items=None, label=None):
+    def fake_run_pipeline(config, *, user_input=None, work_items=None, label=None, progress=None):
         captured_calls.append({"user_input": user_input, "label": label})
         return True
 
@@ -346,25 +349,34 @@ def test_ext_notification_is_a_noop(agent):
 
 def test_concurrent_prompts_do_not_cross_contaminate_captured_stdout(agent, monkeypatch):
     """
-    Two concurrent prompt() calls, each backed by a fake run_pipeline
-    that prints distinguishable dummy output from a background thread
-    (mirroring how the REAL run_pipeline()/dispatch.py print() from
-    inside a blocking call offloaded via asyncio.to_thread), must not
-    leak any of session A's lines into session B's captured
-    session_update stream, or vice versa.
+    Simultaneous prompts are queued, execute one at a time, and keep each
+    run's stdout in its owning session update stream.
     """
     agent._conn = _RecordingConn()
     session_a = asyncio.run(agent.new_session(cwd="/tmp/a"))
     session_b = asyncio.run(agent.new_session(cwd="/tmp/b"))
 
-    def fake_run_pipeline(config, *, user_input=None, work_items=None, label=None):
-        # Distinguish which session this call belongs to via the label
-        # (derived from user_input by _slugify_label in prompt()) since
-        # run_pipeline itself has no session concept.
+    active = 0
+    max_active = 0
+    execution_order = []
+    sink_bound = []
+    proxy_bound = []
+    active_lock = threading.Lock()
+
+    def fake_run_pipeline(config, *, user_input=None, work_items=None, label=None, progress=None):
+        nonlocal active, max_active
+        sink_bound.append(acp_server._SESSION_SINK.get() is not None)
+        proxy_bound.append(isinstance(sys.stdout, acp_server._SessionStdoutProxy))
         tag = "A" if "session-a" in (user_input or "") else "B"
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+            execution_order.append(tag)
         for i in range(15):
             print(f"[{tag}] line {i}")
             time.sleep(0.002)
+        with active_lock:
+            active -= 1
         return True
 
     monkeypatch.setattr(acp_server, "run_pipeline", fake_run_pipeline)
@@ -389,8 +401,180 @@ def test_concurrent_prompts_do_not_cross_contaminate_captured_stdout(agent, monk
     assert contaminated_a == [], f"session A captured contaminated lines: {contaminated_a}"
     assert contaminated_b == [], f"session B captured contaminated lines: {contaminated_b}"
 
-    assert any("[A] line" in l for l in lines_a)
+    assert proxy_bound == [True, True]
+    assert sink_bound == [True, True]
+    assert any("[A] line" in l for l in lines_a), agent._conn.updates
     assert any("[B] line" in l for l in lines_b)
+    assert max_active == 1
+    assert execution_order == ["A", "B"]
+
+
+def test_status_extension_reports_queued_and_active_task_progress(agent, monkeypatch):
+    agent._conn = _RecordingConn()
+    session_a = asyncio.run(agent.new_session(cwd="/tmp/a"))
+    session_b = asyncio.run(agent.new_session(cwd="/tmp/b"))
+    started = threading.Event()
+    finish = threading.Event()
+
+    def fake_run_pipeline(config, *, user_input=None, work_items=None, label=None, progress=None):
+        assert progress is not None
+        progress({
+            "run_id": "run-a",
+            "phase": "dispatch",
+            "tasks_total": 2,
+            "tasks_started": 1,
+            "tasks_completed": 0,
+            "tasks_blocked": 0,
+            "task": {"id": "TASK-1", "category": "feature", "status": "running", "attempt": 1},
+        })
+        started.set()
+        assert finish.wait(timeout=3)
+        progress({"phase": "teardown", "outcome": "passed"})
+        return True
+
+    monkeypatch.setattr(acp_server, "run_pipeline", fake_run_pipeline)
+
+    async def _drive_and_inspect():
+        first = asyncio.create_task(
+            agent.prompt(session_id=session_a.session_id, prompt=[_text_block("first")])
+        )
+        assert await asyncio.to_thread(started.wait, 2)
+        second = asyncio.create_task(
+            agent.prompt(session_id=session_b.session_id, prompt=[_text_block("second")])
+        )
+        await asyncio.sleep(0.03)
+        active_status = await agent.ext_method(
+            "agents-pipeline/run/status", {"sessionId": session_a.session_id}
+        )
+        queued_status = await agent.ext_method(
+            "agents-pipeline/run/status", {"sessionId": session_b.session_id}
+        )
+        assert active_status["status"] == "running"
+        assert active_status["run_id"] == "run-a"
+        assert active_status["tasks_total"] == 2
+        assert active_status["tasks_completed"] == 0
+        assert active_status["current_task"] == {
+            "id": "TASK-1", "category": "feature", "status": "running", "attempt": 1
+        }
+        assert queued_status["status"] == "queued"
+        assert queued_status["queue_position"] == 1
+        finish.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(_drive_and_inspect())
+
+
+def test_failed_run_releases_queue_and_final_update_precedes_response(agent, monkeypatch):
+    agent._conn = _RecordingConn()
+    sessions = [
+        asyncio.run(agent.new_session(cwd=f"/tmp/{label}"))
+        for label in ("failure", "next")
+    ]
+    calls = []
+
+    def fake_run_pipeline(config, *, user_input=None, work_items=None, label=None, progress=None):
+        calls.append(user_input)
+        if user_input == "failure":
+            raise RuntimeError("first run failed")
+        progress({"run_id": "run-next", "phase": "teardown", "outcome": "passed"})
+        return True
+
+    monkeypatch.setattr(acp_server, "run_pipeline", fake_run_pipeline)
+
+    async def _drive_both():
+        return await asyncio.gather(*(
+            agent.prompt(session_id=session.session_id, prompt=[_text_block(text)])
+            for session, text in zip(sessions, ("failure", "next"))
+        ))
+
+    results = asyncio.run(_drive_both())
+    assert [result.stop_reason for result in results] == ["refusal", "end_turn"]
+    assert calls == ["failure", "next"]
+    final_message_index = max(
+        index for index, (sid, text) in enumerate(agent._conn.updates)
+        if sid == sessions[1].session_id and "✅ Pipeline passed" in text
+    )
+    assert final_message_index == len(agent._conn.updates) - 1
+    status = asyncio.run(agent.ext_method(
+        "agents-pipeline/run/status", {"sessionId": sessions[1].session_id}
+    ))
+    assert status["status"] == "completed"
+    assert status["outcome"] == "passed"
+
+
+def test_advisory_test_failure_has_distinct_structured_outcome(agent, monkeypatch):
+    agent._conn = _RecordingConn()
+    session = asyncio.run(agent.new_session(cwd="/tmp/advisory"))
+
+    def fake_run_pipeline(config, *, user_input=None, work_items=None, label=None, progress=None):
+        progress({"run_id": "run-advisory", "tests_blocking": False,
+                  "phase": "teardown", "outcome": "passed_with_test_failures"})
+        return True
+
+    monkeypatch.setattr(acp_server, "run_pipeline", fake_run_pipeline)
+    result = asyncio.run(agent.prompt(
+        session_id=session.session_id, prompt=[_text_block("advisory")]
+    ))
+
+    status = asyncio.run(agent.ext_method(
+        "agents-pipeline/run/status", {"sessionId": session.session_id}
+    ))
+    assert result.stop_reason == "end_turn"
+    assert status["status"] == "completed"
+    assert status["outcome"] == "passed_with_test_failures"
+    assert status["tests_blocking"] is False
+    assert any("advisory test failures" in text for _, text in agent._conn.updates)
+
+
+def test_cancelled_queued_prompt_does_not_wedge_following_runs(agent, monkeypatch):
+    agent._conn = _RecordingConn()
+    sessions = [
+        asyncio.run(agent.new_session(cwd=f"/tmp/{name}"))
+        for name in ("active", "cancel-queued", "next")
+    ]
+    active_started = threading.Event()
+    release_active = threading.Event()
+    calls = []
+
+    def fake_run_pipeline(config, *, user_input=None, work_items=None, label=None, progress=None):
+        calls.append(user_input)
+        if user_input == "active":
+            active_started.set()
+            assert release_active.wait(timeout=3)
+        return True
+
+    monkeypatch.setattr(acp_server, "run_pipeline", fake_run_pipeline)
+
+    async def _drive():
+        active = asyncio.create_task(
+            agent.prompt(session_id=sessions[0].session_id, prompt=[_text_block("active")])
+        )
+        assert await asyncio.to_thread(active_started.wait, 2)
+        queued = asyncio.create_task(
+            agent.prompt(
+                session_id=sessions[1].session_id,
+                prompt=[_text_block("cancel-queued")],
+            )
+        )
+        await asyncio.sleep(0.03)
+        queued.cancel()
+        queued_response = await queued
+        queued_status = await agent.ext_method(
+            "agents-pipeline/run/status", {"sessionId": sessions[1].session_id}
+        )
+        assert queued_response.stop_reason == "cancelled"
+        assert queued_status["status"] == "cancelled"
+        assert calls == ["active"]
+        release_active.set()
+        await active
+        next_response = await agent.prompt(
+            session_id=sessions[2].session_id, prompt=[_text_block("next")]
+        )
+        return next_response
+
+    result = asyncio.run(_drive())
+    assert result.stop_reason == "end_turn"
+    assert calls == ["active", "next"]
 
 
 def test_debug_stdout_type(agent):

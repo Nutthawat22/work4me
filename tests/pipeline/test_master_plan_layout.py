@@ -93,11 +93,11 @@ class TestLlmDecidedStrategy:
         )
         work_items = MasterAgent(_config()).plan_layout(_features(), strategy="llm_decided")
 
-        assert len(work_items) == 3  # scaffold + 2 feature groups
+        assert len(work_items) == 3  # foundation + 2 feature groups
         by_id = {wi.id: wi for wi in work_items}
-        assert by_id["GRP-scaffold"].type == "scaffold"
-        assert by_id["GRP-feature-FEAT-auth"].type == "feature"
-        assert by_id["GRP-feature-FEAT-requests"].type == "feature"
+        assert by_id["TASK-foundation"].category == "foundation"
+        assert by_id["TASK-feature-FEAT-auth"].category == "feature"
+        assert by_id["TASK-feature-FEAT-requests"].category == "feature"
 
     def test_default_strategy_is_llm_decided(self, monkeypatch):
         monkeypatch.setattr(
@@ -129,9 +129,9 @@ class TestExternalStrategy:
 
         assert len(work_items) == 3
         by_id = {wi.id: wi for wi in work_items}
-        assert by_id["GRP-scaffold"].type == "scaffold"
-        assert by_id["GRP-feature-FEAT-auth"].type == "feature"
-        assert by_id["GRP-feature-FEAT-requests"].type == "feature"
+        assert by_id["TASK-foundation"].category == "foundation"
+        assert by_id["TASK-feature-FEAT-auth"].category == "feature"
+        assert by_id["TASK-feature-FEAT-requests"].category == "feature"
 
     def test_none_external_layout_raises(self):
         with pytest.raises(MasterPlanError):

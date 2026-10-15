@@ -20,7 +20,13 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, REPO_ROOT)
 
 from pipeline import runner
-from pipeline.state import AgentResult, TestFailure, TestResult as PipelineTestResult, WorkItem
+from pipeline.state import (
+    AgentResult,
+    OwnedFile,
+    TestFailure as PipelineTestFailure,
+    TestResult as PipelineTestResult,
+    WorkItem,
+)
 
 
 def _config(tmp_path, *, tests_blocking: bool | None, max_retries: int = 3) -> dict:
@@ -41,14 +47,16 @@ def _config(tmp_path, *, tests_blocking: bool | None, max_retries: int = 3) -> d
             "specialist": {"model": "kimi-k2.7-code", "provider": "acp"},
         },
         "pipeline": pipeline_cfg,
-        "languages": {},
+        "languages": {"python": {}},
     }
 
 
 def _work_item(item_id: str = "WI-001") -> WorkItem:
     return WorkItem(
-        id=item_id, type="logic", language="python", title="t",
-        description="d", acceptance_criteria=[], output_path=f"{item_id}.py",
+        id=item_id, category="feature", language="python", module=item_id,
+        scope="Implement one test capability", title="t",
+        description="d", acceptance_criteria=["works"], requirement_refs=[],
+        owned_files=[OwnedFile(path=f"{item_id}.py", language="python")],
         depends_on=[],
     )
 
@@ -60,6 +68,12 @@ def _read_manifest(tmp_path) -> dict:
     return json.loads((run_dirs[0] / "manifest.json").read_text())
 
 
+def _read_plan(tmp_path) -> dict:
+    run_dirs = [d for d in (tmp_path / "runs").iterdir() if d.is_dir()]
+    assert len(run_dirs) == 1
+    return json.loads((run_dirs[0] / "design" / "plan.json").read_text())
+
+
 @pytest.fixture(autouse=True)
 def _no_real_teardown(monkeypatch):
     monkeypatch.setattr(runner.acp_client, "teardown", lambda: None)
@@ -69,7 +83,7 @@ def _failing_test_result() -> PipelineTestResult:
     return PipelineTestResult(
         passed=False, total=1, failed=1,
         failures=[
-            TestFailure(
+            PipelineTestFailure(
                 test_name="WI-001.py::Foo::test_bar",
                 work_item_id="",
                 error_output="assertion failed",
@@ -106,6 +120,10 @@ def test_non_blocking_failed_tests_all_specialists_ok_passes_run(tmp_path, monke
     manifest = _read_manifest(tmp_path)
     assert manifest["status"] == "passed_with_test_failures"
     assert manifest["tests_blocking"] is False
+    plan = _read_plan(tmp_path)
+    assert plan["format_version"] == 2
+    assert plan["tasks"][0]["status"] == "passed"
+    assert plan["tasks"][0]["attempts"][0]["files_written"] == ["WI-001.py"]
 
 
 # ── tests_blocking=false, specialist failed, tests failed → still failed ──
@@ -240,6 +258,7 @@ def test_non_blocking_pure_test_failure_does_not_trigger_retry(tmp_path, monkeyp
 # ── → retries should still happen (unresolved specialist work) ───────────
 
 def test_non_blocking_unresolved_specialist_failure_still_retries(tmp_path, monkeypatch):
+    """A failed task retries even when the test runner reports a vacuous pass."""
     work_items = [_work_item()]
 
     dispatch_call_count = {"n": 0}
@@ -276,18 +295,15 @@ def test_non_blocking_unresolved_specialist_failure_still_retries(tmp_path, monk
     config = _config(tmp_path, tests_blocking=False, max_retries=2)
     result = runner.run_pipeline(config, work_items=work_items, label="test run")
 
-    # Retry loop's should_retry check only fires on `not test_result.passed`
-    # — a vacuous passed=True/total=0 result technically satisfies
-    # test_result.passed, so this scenario is actually caught by the
-    # vacuous-pass guard rather than the retry loop's own trigger. Confirm
-    # dispatch was called only once here (the vacuous-pass guard fires
-    # immediately without retrying) and the run is reported failed.
-    assert dispatch_call_count["n"] == 1
-    assert result is False
+    assert dispatch_call_count["n"] == 2
+    assert result is True
 
     manifest = _read_manifest(tmp_path)
-    assert manifest["status"] == "failed"
-    assert manifest["failure_reason"] == "specialist_dispatch_failure"
+    assert manifest["status"] == "passed"
+    task = _read_plan(tmp_path)["tasks"][0]
+    assert task["status"] == "passed"
+    assert [attempt["status"] for attempt in task["attempts"]] == ["failed", "passed"]
+    assert task["attempts"][0]["failure_details"] == "Error: ACP prompt timed out."
 
 
 def test_non_blocking_real_test_failure_with_unresolved_specialist_retries(tmp_path, monkeypatch):

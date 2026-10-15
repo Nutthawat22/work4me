@@ -39,6 +39,7 @@ from pipeline.state import (
     FileGroup,
     FileManifest,
     FileSpec,
+    OwnedFile,
     WorkItem,
 )
 from specialists.providers.acp_client import acp_call_with_retry
@@ -56,7 +57,7 @@ from pipeline.master import PLANNING_MAX_ATTEMPTS
 # can be large, well past acp_call_with_retry's 60s default.
 PLAN_FILE_MANIFEST_TIMEOUT_SECONDS = 240
 
-VALID_FILE_ROLES: list[str] = ["scaffold", "feature", "shared", "entrypoint"]
+VALID_FILE_ROLES: list[str] = ["scaffold", "feature", "shared", "entrypoint", "validation"]
 
 FILE_SPEC_REQUIRED_FIELDS = {
     "path",
@@ -93,6 +94,7 @@ def _build_file_manifest_response_schema(valid_languages: set[str]) -> dict:
             "contributing_features": {"type": "array", "items": {"type": "string"}},
             "requirements": {"type": "array", "items": {"type": "string"}},
             "depends_on_files": {"type": "array", "items": {"type": "string"}},
+            "interfaces": {"type": "array", "items": {"type": "string"}},
         },
         "required": sorted(FILE_SPEC_REQUIRED_FIELDS),
         "additionalProperties": False,
@@ -126,7 +128,8 @@ Output ONLY a JSON object (no prose, no markdown fences) of this exact shape:
       "language": "typescript",
       "contributing_features": ["FEAT-auth"],
       "requirements": ["file-scoped requirement bullet"],
-      "depends_on_files": ["other/path/in/this/array.ts"]
+        "depends_on_files": ["other/path/in/this/array.ts"],
+        "interfaces": ["exports createRequest()" ]
     }}
   ]
 }}
@@ -146,7 +149,8 @@ contributing_features.
 - "shared" = a file MULTIPLE features contribute to — put every contributor \
 in contributing_features.
 - "entrypoint" = the composition/wiring files that assemble everything \
-(server entry, app shell).
+  (server entry, app shell).
+- "validation" = test files. Their paths are relative to pipeline.tests_dir.
 
 Rules:
 - Every non-scaffold file must list at least one contributing feature, and \
@@ -316,6 +320,10 @@ def _build_file_spec(idx: int, item: dict) -> FileSpec:
                 f"FileSpec {item.get('path', '?')} '{list_field}' must be a list"
             )
 
+    interfaces = item.get("interfaces", [])
+    if not isinstance(interfaces, list) or not all(isinstance(value, str) for value in interfaces):
+        raise FileManifestParseError(f"FileSpec {item['path']} 'interfaces' must be a list of strings")
+
     return FileSpec(
         path=item["path"],
         role=role,  # type: ignore[arg-type]
@@ -323,6 +331,7 @@ def _build_file_spec(idx: int, item: dict) -> FileSpec:
         contributing_features=item["contributing_features"],
         requirements=item["requirements"],
         depends_on_files=item["depends_on_files"],
+        interfaces=interfaces,
     )
 
 
@@ -345,63 +354,40 @@ def _dedup_preserve_order(items: list[str]) -> list[str]:
 
 
 def group_into_work_items(manifest: FileManifest) -> list[FileGroup]:
-    """
-    Cluster the FileSpecs of a FileManifest into FileGroups — cohesion units
-    each authored by a single multi-file specialist call. Pure Python; no LLM.
-
-    Clustering rules:
-      - scaffold-role files            -> ONE group "GRP-scaffold".
-      - feature-role, single feature   -> one group per feature id
-                                          "GRP-feature-{featureid}" (local cohesion).
-      - feature-role, MULTIPLE features -> convergent, so treated like shared:
-                                          its own group, role "shared".
-      - shared-role files              -> EACH its own group (single author,
-                                          many contributors).
-      - entrypoint-role files          -> EACH its own group.
-
-    depends_on between groups is derived from FileSpec.depends_on_files:
-    group A depends_on group B (A != B) if any file in A imports any file in B.
-
-    Groups are returned ordered scaffold -> feature -> shared -> entrypoint,
-    stable-by-id within each bucket.
-    """
-    # Bucket each spec into a group key.
-    #   grouped_specs: group_id -> list[FileSpec]
-    #   group_meta:    group_id -> (role, title)
+    """Cluster files by cohesive feature/module boundaries, never per file."""
     grouped_specs: dict[str, list[FileSpec]] = {}
-    group_meta: dict[str, tuple[str, str]] = {}
+    group_meta: dict[str, tuple[str, str, str]] = {}
 
-    def _bucket(group_id: str, role: str, title: str, spec: FileSpec) -> None:
+    def _bucket(group_id: str, role: str, title: str, module: str, spec: FileSpec) -> None:
         grouped_specs.setdefault(group_id, []).append(spec)
-        # First writer sets the title/role for the group.
-        group_meta.setdefault(group_id, (role, title))
+        group_meta.setdefault(group_id, (role, title, module))
 
     for spec in manifest.files:
         if spec.role == "scaffold":
-            _bucket("GRP-scaffold", "scaffold", "Project scaffold", spec)
+            _bucket("TASK-foundation", "scaffold", "Project foundation", "foundation", spec)
         elif spec.role == "feature" and len(spec.contributing_features) == 1:
             feat = spec.contributing_features[0]
             _bucket(
-                f"GRP-feature-{feat}",
+                f"TASK-feature-{feat}",
                 "feature",
                 f"Feature: {feat}",
+                feat,
                 spec,
             )
         elif spec.role == "shared" or (
             spec.role == "feature" and len(spec.contributing_features) > 1
         ):
-            # shared files, and convergent feature files, get a solo group so
-            # exactly one author owns the physical path.
-            gid = f"GRP-shared-{_sanitize_path(spec.path)}"
-            _bucket(gid, "shared", f"Shared: {spec.path}", spec)
+            contributors = "-".join(sorted(spec.contributing_features)) or "crosscutting"
+            gid = f"TASK-shared-{_sanitize_path(contributors)}"
+            _bucket(gid, "shared", f"Shared module: {contributors}", contributors, spec)
         elif spec.role == "entrypoint":
-            gid = f"GRP-entrypoint-{_sanitize_path(spec.path)}"
-            _bucket(gid, "entrypoint", f"Entrypoint: {spec.path}", spec)
+            _bucket("TASK-integration", "entrypoint", "Application integration", "application", spec)
+        elif spec.role == "validation":
+            contributors = "-".join(sorted(spec.contributing_features)) or "application"
+            gid = f"TASK-validation-{_sanitize_path(contributors)}"
+            _bucket(gid, "validation", f"Validation: {contributors}", contributors, spec)
         else:
-            # feature-role file with ZERO contributing features — degenerate,
-            # but keep it addressable rather than silently dropping it.
-            gid = f"GRP-shared-{_sanitize_path(spec.path)}"
-            _bucket(gid, "shared", f"Shared: {spec.path}", spec)
+            raise ValueError(f"Cannot group file role/contributors: {spec.role!r}, {spec.contributing_features!r}")
 
     # Map each path -> its owning group id (for dependency resolution).
     path_to_group: dict[str, str] = {}
@@ -412,23 +398,17 @@ def group_into_work_items(manifest: FileManifest) -> list[FileGroup]:
     # Build the FileGroup objects.
     groups: dict[str, FileGroup] = {}
     for group_id, specs in grouped_specs.items():
-        role, title = group_meta[group_id]
-        # language: use the language of the files; if mixed, first is fine.
+        role, title, module = group_meta[group_id]
         language = specs[0].language
-
         files = sorted(spec.path for spec in specs)
+        contributing = sorted({feature for spec in specs for feature in spec.contributing_features})
+        requirements = _dedup_preserve_order(
+            [requirement for spec in specs for requirement in spec.requirements]
+        )
+        interfaces = _dedup_preserve_order(
+            [interface for spec in specs for interface in spec.interfaces]
+        )
 
-        contributing: list[str] = []
-        for spec in specs:
-            contributing.extend(spec.contributing_features)
-        contributing = sorted(set(contributing))
-
-        requirements: list[str] = []
-        for spec in specs:
-            requirements.extend(spec.requirements)
-        requirements = _dedup_preserve_order(requirements)
-
-        # Cross-group dependencies from file-level imports.
         depends: set[str] = set()
         for spec in specs:
             for dep_path in spec.depends_on_files:
@@ -440,15 +420,16 @@ def group_into_work_items(manifest: FileManifest) -> list[FileGroup]:
             id=group_id,
             role=role,
             language=language,
+            module=module,
             title=title,
             files=files,
             contributing_features=contributing,
             requirements=requirements,
+            interfaces=interfaces,
             depends_on=sorted(depends),
         )
 
-    # Order: scaffold -> feature -> shared -> entrypoint, stable-by-id within.
-    role_order = {"scaffold": 0, "feature": 1, "shared": 2, "entrypoint": 3}
+    role_order = {"scaffold": 0, "feature": 1, "shared": 2, "validation": 3, "entrypoint": 4}
     return sorted(
         groups.values(),
         key=lambda g: (role_order.get(g.role, 99), g.id),
@@ -457,19 +438,20 @@ def group_into_work_items(manifest: FileManifest) -> list[FileGroup]:
 
 # ── file_groups_to_work_items (adapter) ──────────────────────────────────────
 
-# FileGroup.role -> WorkItemType. entrypoint groups wire everything together,
-# so they become "integrate" work items.
+# FileGroup.role -> TaskCategory.
 _ROLE_TO_WORK_ITEM_TYPE = {
-    "scaffold": "scaffold",
+    "scaffold": "foundation",
     "feature": "feature",
     "shared": "shared",
-    "entrypoint": "integrate",
+    "entrypoint": "integration",
+    "validation": "validation",
 }
 
 
 def file_groups_to_work_items(
     groups: list[FileGroup],
     manifest: FileManifest,
+    features: list[Feature],
     language_default: str = "typescript",
 ) -> list[WorkItem]:
     """
@@ -488,30 +470,57 @@ def file_groups_to_work_items(
     topological_sort will re-order by depends_on anyway.
     """
     spec_by_path: dict[str, FileSpec] = {spec.path: spec for spec in manifest.files}
+    feature_by_id = {feature.id: feature for feature in features}
+    feature_group = {
+        feature_id: group.id
+        for group in groups if group.role == "feature"
+        for feature_id in group.contributing_features
+    }
 
     work_items: list[WorkItem] = []
     for group in groups:
         feats = ", ".join(group.contributing_features) if group.contributing_features else "(none)"
-        lines = [
-            f"Create exactly these files for group {group.id} "
-            f"(contributing features: {feats}):"
-        ]
+        lines = [f"Module: {group.title}", f"Contributing features: {feats}", "Owned files:"]
+        source_ids: list[str] = []
+        owned_files: list[OwnedFile] = []
+        requirements = list(group.requirements)
         for path in group.files:
             spec = spec_by_path.get(path)
             reqs = "; ".join(spec.requirements) if (spec and spec.requirements) else "no specific requirements"
             lines.append(f"- {path}: {reqs}")
+            if spec is not None:
+                area = "tests" if spec.role == "validation" else "product"
+                owned_files.append(OwnedFile(path=path, language=spec.language, area=area))
+        for feature_id in group.contributing_features:
+            feature = feature_by_id.get(feature_id)
+            if feature is not None:
+                source_ids.extend(feature.source_ids)
+                requirements.extend(feature.acceptance_criteria if group.role == "feature" else [])
         description = "\n".join(lines)
+        dependencies = set(group.depends_on)
+        for feature_id in group.contributing_features:
+            feature = feature_by_id.get(feature_id)
+            if feature is not None:
+                dependencies.update(
+                    feature_group[dep_id]
+                    for dep_id in feature.depends_on
+                    if dep_id in feature_group and feature_group[dep_id] != group.id
+                )
 
         work_items.append(
             WorkItem(
                 id=group.id,
-                type=_ROLE_TO_WORK_ITEM_TYPE.get(group.role, "feature"),  # type: ignore[arg-type]
+                category=_ROLE_TO_WORK_ITEM_TYPE[group.role],  # type: ignore[arg-type]
                 language=group.language or language_default,
+                module=group.module,
+                scope=description,
                 title=group.title,
                 description=description,
-                acceptance_criteria=list(group.requirements),
-                output_path=group.files[0] if group.files else "",
-                depends_on=list(group.depends_on),
+                acceptance_criteria=_dedup_preserve_order(requirements) or [group.title],
+                requirement_refs=_dedup_preserve_order(source_ids + group.contributing_features),
+                owned_files=owned_files,
+                depends_on=sorted(dependencies),
+                expected_interfaces=list(group.interfaces),
             )
         )
 

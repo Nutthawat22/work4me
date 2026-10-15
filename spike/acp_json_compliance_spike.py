@@ -93,7 +93,7 @@ from pipeline.master import (  # noqa: E402
     MasterAgent,
     MasterPlanError,
     FEATURES_SYSTEM_PROMPT_TEMPLATE,
-    SYSTEM_PROMPT_TEMPLATE,
+    TASK_PLANNING_PROMPT_TEMPLATE,
     _build_features_response_schema,
     _build_work_items_response_schema,
 )
@@ -332,7 +332,7 @@ def main() -> None:
     print()
 
     work_items_schema = _build_work_items_response_schema("decompose_work_items_spike", valid_languages)
-    work_items_system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+    work_items_system_prompt = TASK_PLANNING_PROMPT_TEMPLATE.format(
         valid_languages=", ".join(sorted(valid_languages))
     )
 

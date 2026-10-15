@@ -83,45 +83,51 @@ def _config() -> dict:
     }
 
 
+def _features() -> list[Feature]:
+    return [
+        Feature("FEAT-auth", "Auth", "Authentication", ["users can log in"], "typescript", ["REQ-001"]),
+        Feature("FEAT-requests", "Requests", "Requesting", ["users can submit"], "typescript", ["REQ-002"]),
+    ]
+
+
 # ── file_groups_to_work_items ────────────────────────────────────────────────
 
 def test_file_groups_to_work_items_roles_and_mapping():
     manifest = _manifest()
     groups = group_into_work_items(manifest)
-    work_items = file_groups_to_work_items(groups, manifest)
+    work_items = file_groups_to_work_items(groups, manifest, _features())
 
     by_id = {wi.id: wi for wi in work_items}
 
     # scaffold
-    assert by_id["GRP-scaffold"].type == "scaffold"
+    assert by_id["TASK-foundation"].category == "foundation"
 
     # feature groups
-    assert by_id["GRP-feature-FEAT-auth"].type == "feature"
-    assert by_id["GRP-feature-FEAT-requests"].type == "feature"
+    assert by_id["TASK-feature-FEAT-auth"].category == "feature"
+    assert by_id["TASK-feature-FEAT-requests"].category == "feature"
 
     # shared group (en.json contributed by both)
-    shared = by_id["GRP-shared-src-i18n-en-json"]
-    assert shared.type == "shared"
+    shared = by_id["TASK-shared-feat-auth-feat-requests"]
+    assert shared.category == "shared"
 
     # entrypoint -> integrate
-    entry = by_id["GRP-entrypoint-src-index-ts"]
-    assert entry.type == "integrate"
+    entry = by_id["TASK-integration"]
+    assert entry.category == "integration"
 
     # depends_on preserved (group ids)
-    assert set(entry.depends_on) == {"GRP-feature-FEAT-auth", "GRP-feature-FEAT-requests"}
+    assert set(entry.depends_on) == {"TASK-feature-FEAT-auth", "TASK-feature-FEAT-requests"}
 
 
-def test_file_groups_to_work_items_output_path_and_description():
+def test_file_groups_to_work_items_owned_files_and_description():
     manifest = _manifest()
     groups = group_into_work_items(manifest)
-    work_items = file_groups_to_work_items(groups, manifest)
+    work_items = file_groups_to_work_items(groups, manifest, _features())
     by_id = {wi.id: wi for wi in work_items}
 
-    auth = by_id["GRP-feature-FEAT-auth"]
-    group = next(g for g in groups if g.id == "GRP-feature-FEAT-auth")
+    auth = by_id["TASK-feature-FEAT-auth"]
+    group = next(g for g in groups if g.id == "TASK-feature-FEAT-auth")
 
-    # output_path is one of the group's files.
-    assert auth.output_path in group.files
+    assert {owned.path for owned in auth.owned_files} == set(group.files)
 
     # description embeds each file path.
     for path in group.files:
@@ -135,7 +141,7 @@ def test_file_groups_to_work_items_output_path_and_description():
 def test_file_groups_to_work_items_order_preserved():
     manifest = _manifest()
     groups = group_into_work_items(manifest)
-    work_items = file_groups_to_work_items(groups, manifest)
+    work_items = file_groups_to_work_items(groups, manifest, _features())
     assert [g.id for g in groups] == [wi.id for wi in work_items]
 
 

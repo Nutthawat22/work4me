@@ -21,12 +21,11 @@ flagging first):
     i.e. this mirrors runner.py's REPL/decompose() path, NOT the
     handoff-package (ingest.py) path. Handoff-package support is
     deferred to a later version.
-  - Progress streaming is STDOUT-REDIRECT based, not a threaded
-    progress-callback system. run_pipeline()/dispatch.py are untouched
-    -- they still just print(). This module captures that output via a
-    contextvars-based sys.stdout proxy (see _SessionStdoutProxy below)
-    and forwards each captured line as a session_update
-    agent_message_chunk notification.
+    - Human-readable progress remains STDOUT-REDIRECT based:
+      run_pipeline()/dispatch.py console output is captured via a
+      contextvars-based sys.stdout proxy and streamed as ACP message
+      chunks. A runner callback separately updates queryable structured
+      progress through the advertised status extension.
   - Cancellation is WEAK/BEST-EFFORT. cancel(session_id) sets a flag on
     the session's state dict; run_pipeline()/dispatch.py do NOT check
     this flag mid-run (that would require threading a cancellation flag
@@ -38,52 +37,13 @@ flagging first):
   - Session model is 1 ACP session = 1 pipeline run. No multi-turn
     steering, no session reuse across multiple prompts. A second
     prompt() call against an already-used session_id is rejected.
-  - Concurrency: prompt() calls are NOT serialized behind a global lock
-    -- multiple sessions can run concurrently, each on its own executor
-    thread, each with correctly-isolated captured stdout (see the
-    concurrency-safety note below). See also the KNOWN CONCURRENCY
-    HAZARD note below regarding specialists.providers.acp_client's
-    shared session-pool teardown, which this module does NOT attempt to
-    fix.
+    - Concurrency: prompt() calls are queued FIFO. One full run at a time
+      is allowed per server process, including planning, dispatch,
+      testing/retries, progress delivery, and runner teardown.
 
-Concurrency-safety of stdout capture:
-
-  sys.stdout is process-global, so naively swapping it per-request would
-  let concurrent runs interleave/corrupt each other's captured output.
-  This module solves that with a `contextvars.ContextVar` holding a
-  per-session "sink" callback, plus a single stdout proxy object
-  (`_SessionStdoutProxy`, installed once at import time) whose
-  `write()` checks the contextvar and routes to that session's sink if
-  set, or falls through to the real stdout otherwise. `prompt()` drives
-  the blocking `run_pipeline()` call via `asyncio.to_thread`, which
-  (per Python's documented behavior, and verified empirically for this
-  change) automatically copies the calling task's `contextvars.Context`
-  into the worker thread -- so the contextvar set inside `prompt()`
-  correctly follows execution into run_pipeline()'s worker thread, and
-  two concurrent prompt() calls each see only their own session's sink,
-  with zero cross-session line leakage. This was chosen over adding a
-  new `output_sink` parameter to run_pipeline() because it requires
-  ZERO changes to pipeline/runner.py or pipeline/dispatch.py -- both
-  files are untouched by this change, so no regression risk was
-  introduced to either module or their existing tests.
-
-KNOWN CONCURRENCY HAZARD (flagged, not fixed here): every
-run_pipeline() call unconditionally calls
-specialists.providers.acp_client.teardown() in its own `finally` block,
-which stops AcpSessionPool's single shared background asyncio event
-loop/thread entirely -- not just that run's own pooled ACP sessions.
-Two concurrent prompt() calls (each internally calling run_pipeline())
-will race: whichever run finishes first tears down the shared loop out
-from under the other run, which is very likely to break or hang that
-still-in-flight run's own specialist calls. This is a pre-existing
-property of specialists/providers/acp_client.py's teardown() design,
-not something introduced by this module -- fixing it would require
-changing acp_client.py's pool lifecycle (e.g. reference-counting active
-runs before stopping the shared loop), which is out of scope for this
-phase. Concurrent prompt() calls are therefore NOT safe in practice
-today, even though this module itself does not add any additional
-serialization -- this is an explicit, flagged limitation, not a
-silently-accepted one.
+Stdout capture uses a `contextvars.ContextVar` sink and one
+`_SessionStdoutProxy`. Pipeline output is routed to the owning session;
+scheduled output deliveries are drained before the next queued run begins.
 
 Manual invocation for testing:
 
@@ -98,11 +58,14 @@ a real external ACP client.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextvars
 import os
 import re
 import sys
+import threading
 import uuid
+from collections import deque
 from typing import Any, Callable, Optional
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -129,11 +92,89 @@ AGENT_VERSION = "0.1.0"
 # Holds the current "session sink" callback (str -> None) for whichever
 # prompt() call's context is active on the current thread/task. None
 # means "no session in progress on this context" -- falls through to
-# the real stdout. See module docstring's "Concurrency-safety of stdout
-# capture" section for why this is safe across asyncio.to_thread calls.
+# the real stdout. asyncio.to_thread propagates this context into the
+# pipeline worker thread.
 _SESSION_SINK: contextvars.ContextVar[Optional[Callable[[str], None]]] = contextvars.ContextVar(
     "acp_server_session_sink", default=None
 )
+
+
+class _RunTicket:
+    __slots__ = ("session_id", "acquired", "cancelled")
+
+    def __init__(self, session_id: str) -> None:
+        self.session_id = session_id
+        self.acquired = False
+        self.cancelled = False
+
+
+class _RunQueue:
+    """FIFO process-local queue; blocking waits happen off the event loop."""
+
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._waiting: deque[_RunTicket] = deque()
+        self._active: Optional[_RunTicket] = None
+
+    def enqueue(self, session_id: str) -> _RunTicket:
+        ticket = _RunTicket(session_id)
+        with self._condition:
+            self._waiting.append(ticket)
+            self._condition.notify_all()
+        return ticket
+
+    def position(self, ticket: _RunTicket) -> Optional[int]:
+        with self._condition:
+            try:
+                return list(self._waiting).index(ticket) + 1
+            except ValueError:
+                return None
+
+    async def acquire(self, ticket: _RunTicket) -> None:
+        waiter = asyncio.create_task(asyncio.to_thread(self._wait_and_claim, ticket))
+        try:
+            claimed = await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            self._cancel_waiter(ticket)
+            try:
+                claimed = await asyncio.shield(waiter)
+            except asyncio.CancelledError:
+                claimed = False
+            if claimed:
+                self.release(ticket)
+            raise
+        if not claimed:
+            raise asyncio.CancelledError
+
+    def _wait_and_claim(self, ticket: _RunTicket) -> bool:
+        with self._condition:
+            while not ticket.cancelled:
+                if self._active is None and self._waiting and self._waiting[0] is ticket:
+                    self._waiting.popleft()
+                    self._active = ticket
+                    ticket.acquired = True
+                    return True
+                self._condition.wait()
+            return False
+
+    def _cancel_waiter(self, ticket: _RunTicket) -> None:
+        with self._condition:
+            ticket.cancelled = True
+            try:
+                self._waiting.remove(ticket)
+            except ValueError:
+                pass
+            self._condition.notify_all()
+
+    def release(self, ticket: _RunTicket) -> None:
+        with self._condition:
+            if self._active is ticket:
+                self._active = None
+                ticket.acquired = False
+                self._condition.notify_all()
+
+
+_RUN_QUEUE = _RunQueue()
 
 
 class _SessionStdoutProxy:
@@ -173,7 +214,7 @@ class _SessionStdoutProxy:
         return getattr(self._real, name)
 
 
-def _install_stdout_proxy() -> None:
+def _install_stdout_proxy() -> _SessionStdoutProxy:
     """
     Install (or refresh) the module-global stdout proxy. Unwraps any
     previously-installed proxy first, so this is safe to call more than
@@ -187,7 +228,9 @@ def _install_stdout_proxy() -> None:
     current = sys.stdout
     if isinstance(current, _SessionStdoutProxy):
         current = current._real
-    sys.stdout = _SessionStdoutProxy(current)
+    proxy = _SessionStdoutProxy(current)
+    sys.stdout = proxy
+    return proxy
 
 
 _install_stdout_proxy()
@@ -235,13 +278,35 @@ class _SessionState:
     module docstring's "Session model"). `cancelled` is best-effort only
     -- see module docstring's "Cancellation" section."""
 
-    __slots__ = ("session_id", "cwd", "cancelled", "used")
+    __slots__ = (
+        "session_id", "cwd", "cancelled", "used", "progress", "progress_lock", "queue_ticket"
+    )
 
     def __init__(self, session_id: str, cwd: str) -> None:
         self.session_id = session_id
         self.cwd = cwd
         self.cancelled = False
         self.used = False
+        self.progress: dict[str, Any] = {
+            "schema_version": 1,
+            "session_id": session_id,
+            "run_id": None,
+            "status": "created",
+            "phase": "created",
+            "outcome": None,
+            "cancel_requested": False,
+            "queue_position": None,
+            "tasks_total": 0,
+            "tasks_started": 0,
+            "tasks_completed": 0,
+            "tasks_blocked": 0,
+            "current_task": None,
+            "attempt_round": 0,
+            "max_attempts": None,
+            "tests_blocking": None,
+        }
+        self.progress_lock = threading.Lock()
+        self.queue_ticket: Optional[_RunTicket] = None
 
 
 class PipelineAgent:
@@ -283,7 +348,16 @@ class PipelineAgent:
     ) -> InitializeResponse:
         return InitializeResponse(
             protocol_version=protocol_version,
-            agent_capabilities=AgentCapabilities(),
+            agent_capabilities=AgentCapabilities(
+                field_meta={
+                    "agents-pipeline": {
+                        "runStatus": {
+                            "method": "_agents-pipeline/run/status",
+                            "params": {"sessionId": "string"},
+                        }
+                    }
+                }
+            ),
             agent_info=Implementation(name=AGENT_NAME, version=AGENT_VERSION),
         )
 
@@ -319,44 +393,157 @@ class PipelineAgent:
 
         text = _extract_prompt_text(prompt)
         if not text:
+            self._set_progress(state, status="failed", phase="completed", outcome="invalid_prompt")
             await self._send_message(session_id, "⚠️  No text content found in prompt (v1 only reads TextContentBlock).")
             return PromptResponse(stop_reason="refusal")
 
         label = _slugify_label(text)
-
         loop = asyncio.get_running_loop()
+        ticket = _RUN_QUEUE.enqueue(session_id)
+        state.queue_ticket = ticket
+        self._set_progress(state, status="queued", phase="queued", outcome=None)
+        deliveries: list[concurrent.futures.Future[None]] = []
+        deliveries_lock = threading.Lock()
 
         def _sink(data: str) -> None:
-            # Called from the executor thread that's running
-            # run_pipeline(). Schedule the actual (async) send back onto
-            # the event loop rather than awaiting here directly -- this
-            # function itself must stay synchronous, since it's invoked
-            # from sys.stdout.write().
             if not data:
                 return
-            asyncio.run_coroutine_threadsafe(self._send_message(session_id, data, chunk=True), loop)
+            future = asyncio.run_coroutine_threadsafe(
+                self._send_message(session_id, data, chunk=True), loop
+            )
+            with deliveries_lock:
+                deliveries.append(future)
 
-        token = _SESSION_SINK.set(_sink)
+        async def _drain_deliveries() -> None:
+            with deliveries_lock:
+                pending = list(deliveries)
+                deliveries.clear()
+            if pending:
+                drain_task = asyncio.gather(
+                    *(asyncio.wrap_future(future) for future in pending),
+                    return_exceptions=True,
+                )
+                while not drain_task.done():
+                    try:
+                        await asyncio.shield(drain_task)
+                    except asyncio.CancelledError:
+                        state.cancelled = True
+
+        async def _wait_for_pipeline(task: asyncio.Task[Optional[bool]]) -> tuple[Optional[bool], bool]:
+            interrupted = False
+            while True:
+                try:
+                    return await asyncio.shield(task), interrupted
+                except asyncio.CancelledError:
+                    interrupted = True
+                    state.cancelled = True
+
+        acquired = False
+        token: Optional[contextvars.Token[Optional[Callable[[str], None]]]] = None
+        installed_proxy: Optional[_SessionStdoutProxy] = None
+        pipeline_task: Optional[asyncio.Task[Optional[bool]]] = None
+        success: Optional[bool] = None
+        interrupted = False
+        response: PromptResponse
         try:
-            success = await asyncio.to_thread(self._run_pipeline_safely, text, label)
+            await self._send_message(session_id, "⏳ Pipeline queued.")
+            await _RUN_QUEUE.acquire(ticket)
+            acquired = True
+            self._set_progress(state, status="running", phase="starting")
+            installed_proxy = _install_stdout_proxy()
+            token = _SESSION_SINK.set(_sink)
+            pipeline_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._run_pipeline_safely,
+                    text,
+                    label,
+                    lambda update: self._apply_pipeline_progress(state, update),
+                )
+            )
+            success, interrupted = await _wait_for_pipeline(pipeline_task)
+            await _drain_deliveries()
+            outcome = self._progress_outcome(state)
+            if success is None:
+                self._set_progress(state, status="failed", phase="completed", outcome="error")
+                response = PromptResponse(stop_reason="refusal")
+            elif state.cancelled or interrupted:
+                self._set_progress(state, status="cancelled", phase="completed", outcome=outcome or "cancelled")
+                await self._send_message(
+                    session_id,
+                    "\n🛑 Session was cancelled (best-effort; run may have completed anyway).\n",
+                )
+                response = PromptResponse(stop_reason="cancelled")
+            else:
+                outcome = outcome or ("passed" if success else "failed")
+                self._set_progress(state, status="completed", phase="completed", outcome=outcome)
+                summary = "✅ Pipeline passed" if success else "❌ Pipeline failed"
+                if outcome == "passed_with_test_failures":
+                    summary = "⚠️ Pipeline completed with advisory test failures"
+                await self._send_message(session_id, f"\n{summary}\n")
+                response = PromptResponse(stop_reason="end_turn")
+        except asyncio.CancelledError:
+            interrupted = True
+            state.cancelled = True
+            self._set_progress(state, status="cancelled", phase="completed", outcome="cancelled")
+            response = PromptResponse(stop_reason="cancelled")
+        except Exception as error:
+            self._set_progress(state, status="failed", phase="completed", outcome="error")
+            await self._send_message(session_id, f"⚠️  Pipeline request failed: {error}\n")
+            response = PromptResponse(stop_reason="refusal")
         finally:
-            _SESSION_SINK.reset(token)
+            try:
+                if pipeline_task is not None and not pipeline_task.done():
+                    success, worker_interrupted = await _wait_for_pipeline(pipeline_task)
+                    interrupted = interrupted or worker_interrupted
+                if token is not None:
+                    _SESSION_SINK.reset(token)
+                if installed_proxy is not None and sys.stdout is installed_proxy:
+                    sys.stdout = installed_proxy._real
+                await _drain_deliveries()
+            finally:
+                if acquired:
+                    _RUN_QUEUE.release(ticket)
+                state.queue_ticket = None
+        return response
 
-        if state.cancelled:
-            await self._send_message(session_id, "\n🛑 Session was cancelled (best-effort; run may have completed anyway).\n")
-            return PromptResponse(stop_reason="cancelled")
+    @staticmethod
+    def _set_progress(state: _SessionState, **updates: Any) -> None:
+        with state.progress_lock:
+            state.progress.update(updates)
 
-        if success is None:
-            # Unexpected exception path -- _run_pipeline_safely already
-            # sent an error session_update before returning None here.
-            return PromptResponse(stop_reason="refusal")
+    @staticmethod
+    def _progress_outcome(state: _SessionState) -> Optional[str]:
+        with state.progress_lock:
+            outcome = state.progress.get("outcome")
+            return outcome if isinstance(outcome, str) else None
 
-        summary = "✅ Pipeline passed" if success else "❌ Pipeline failed"
-        await self._send_message(session_id, f"\n{summary}\n")
+    @staticmethod
+    def _apply_pipeline_progress(state: _SessionState, update: dict[str, object]) -> None:
+        with state.progress_lock:
+            state.progress.update(update)
+            if "task" in update:
+                task = update["task"]
+                if isinstance(task, dict) and task.get("status") == "running":
+                    state.progress["current_task"] = dict(task)
+                else:
+                    state.progress["current_task"] = None
 
-        return PromptResponse(stop_reason="end_turn")
+    def _status_snapshot(self, state: _SessionState) -> dict[str, Any]:
+        with state.progress_lock:
+            snapshot = dict(state.progress)
+            task = snapshot.get("current_task")
+            if isinstance(task, dict):
+                snapshot["current_task"] = dict(task)
+        ticket = state.queue_ticket
+        snapshot["queue_position"] = _RUN_QUEUE.position(ticket) if ticket is not None else None
+        return snapshot
 
-    def _run_pipeline_safely(self, user_input: str, label: str) -> Optional[bool]:
+    def _run_pipeline_safely(
+        self,
+        user_input: str,
+        label: str,
+        progress: Callable[[dict[str, object]], None],
+    ) -> Optional[bool]:
         """
         Runs on an executor thread (via asyncio.to_thread). Wraps
         run_pipeline() so unexpected exceptions (anything NOT already
@@ -369,7 +556,7 @@ class PipelineAgent:
         session_update was already sent).
         """
         try:
-            return run_pipeline(self.config, user_input=user_input, label=label)
+            return run_pipeline(self.config, user_input=user_input, label=label, progress=progress)
         except MasterPlanError as e:
             # run_pipeline() already catches this internally and returns
             # False -- this branch is defensive/documentation only (see
@@ -416,6 +603,7 @@ class PipelineAgent:
         state = self._sessions.get(session_id)
         if state is not None:
             state.cancelled = True
+            self._set_progress(state, cancel_requested=True)
 
     # ── optional Agent protocol methods: minimal/default handling ───────
 
@@ -484,7 +672,15 @@ class PipelineAgent:
         return None
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        raise acp.RequestError.method_not_found(f"ext_method {method} not supported in v1")
+        if method != "agents-pipeline/run/status":
+            raise acp.RequestError.method_not_found(f"ext_method {method} not supported")
+        session_id = params.get("sessionId", params.get("session_id"))
+        if not isinstance(session_id, str):
+            raise acp.RequestError.invalid_params({"sessionId": "required string"})
+        state = self._sessions.get(session_id)
+        if state is None:
+            raise acp.RequestError.invalid_params({"sessionId": session_id, "reason": "unknown session"})
+        return self._status_snapshot(state)
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         return None
