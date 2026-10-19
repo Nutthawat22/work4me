@@ -1,5 +1,5 @@
 """
-specialists/base.py
+src/specialists/base.py
 
 Shared multi-file task execution helper. Category workers delegate to
 run_multifile_specialist() so output ownership and validation stay uniform.

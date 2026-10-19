@@ -1,5 +1,5 @@
 """
-specialists/foundation.py
+src/specialists/foundation.py
 
 FoundationAgent: implements project setup and primitives shared across modules.
 """

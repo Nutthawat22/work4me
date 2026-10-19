@@ -1,5 +1,5 @@
 """
-specialists/providers/__init__.py
+src/specialists/providers/__init__.py
 
 Registry of LLM provider adapters, keyed by the string used in
 config["models"][role]["provider"]. All adapters share the call_llm

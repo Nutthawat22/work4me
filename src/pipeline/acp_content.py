@@ -1,14 +1,14 @@
 """
-pipeline/acp_content.py
+src/pipeline/acp_content.py
 
 Standalone, NOT-YET-WIRED-IN utility for extracting file-like content
 from an ACP `prompt` request's list of content blocks (see
-pipeline/acp_server.py's module docstring for the surrounding ACP
+src/pipeline/acp_server.py's module docstring for the surrounding ACP
 Agent/server context, and its `_extract_prompt_text()` for the
 existing free-text-only extraction this module deliberately does not
 touch).
 
-Why this exists / why it's separate: pipeline/acp_server.py's
+Why this exists / why it's separate: src/pipeline/acp_server.py's
 `prompt()` currently reads ONLY `TextContentBlock` entries
 (_extract_prompt_text) — v1 scope, per that module's docstring. This
 module is prep work for a later version that also reads embedded
@@ -26,7 +26,7 @@ doc / flagging first):
 
   - TextContentBlock (type="text") -> contributes to the returned
     `text` field, using the exact same matching/joining logic as
-    pipeline/acp_server.py's `_extract_prompt_text()` (duck-typed on
+    src/pipeline/acp_server.py's `_extract_prompt_text()` (duck-typed on
     `.type == "text"` and a non-None `.text`, joined with a single
     space). This module does not import from acp_server.py to avoid a
     reverse dependency; the logic is duplicated deliberately, matching
@@ -60,7 +60,7 @@ Explicitly NOT done here (by design, for this task):
     DEFAULT_MAX_PROMPT_CONTENT_CHARS)` and passing it in. This keeps
     this module a pure function with no config-fixture dependency,
     trivially unit-testable in isolation.
-  - No wiring into pipeline/acp_server.py's `prompt()` routing. This
+  - No wiring into src/pipeline/acp_server.py's `prompt()` routing. This
     module is a standalone utility until the external team confirms
     what content-block shapes they'll actually send.
 """

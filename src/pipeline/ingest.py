@@ -1,5 +1,5 @@
 """
-pipeline/ingest.py
+src/pipeline/ingest.py
 
 Non-interactive entry point that feeds a structured requirements-handoff
 package (e.g. requirements/cra-approval-system-handoff/) into the
@@ -14,12 +14,12 @@ expects.
 Usage:
     # Interactive: scans requirements/ and prompts you to pick a package.
     # For automated/scripted use, always pass --handoff explicitly instead.
-    python pipeline/ingest.py --dry-run
-    python pipeline/ingest.py
+    python src/pipeline/ingest.py --dry-run
+    python src/pipeline/ingest.py
 
     # Explicit/scriptable (bypasses the interactive picker entirely):
-    python pipeline/ingest.py --handoff requirements/cra-approval-system-handoff --dry-run
-    python pipeline/ingest.py --handoff requirements/cra-approval-system-handoff
+    python src/pipeline/ingest.py --handoff requirements/cra-approval-system-handoff --dry-run
+    python src/pipeline/ingest.py --handoff requirements/cra-approval-system-handoff
 """
 
 import argparse
@@ -27,10 +27,13 @@ import hashlib
 import os
 import re
 import sys
+from pathlib import Path
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_ROOT = str(_REPO_ROOT / "src")
+sys.path.insert(0, _SRC_ROOT)
 
+from pipeline.project_paths import PROJECT_ROOT
 from pipeline.config_validation import validate_config
 from pipeline.master import MasterAgent, MasterPlanError
 from pipeline.runner import load_config, run_pipeline

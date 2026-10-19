@@ -1,5 +1,5 @@
 """
-specialists/llm_client.py
+src/specialists/llm_client.py
 
 Thin dispatcher used by all agents (Master, Design, and specialists) to
 call an LLM. Resolves config["models"][role]["provider"] against the

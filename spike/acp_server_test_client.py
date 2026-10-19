@@ -1,9 +1,9 @@
 """
-Throwaway ACP CLIENT script for manually exercising pipeline/acp_server.py
+Throwaway ACP CLIENT script for manually exercising src/pipeline/acp_server.py
 (the ACP AGENT/server built for Phase 5 of the ACP-native rearchitecture).
 
 Mirrors spike/acp_spike.py's SpikeClient pattern, but instead of spawning
-`opencode acp`, it spawns THIS PROJECT'S OWN pipeline/acp_server.py as the
+`opencode acp`, it spawns THIS PROJECT'S OWN src/pipeline/acp_server.py as the
 agent subprocess, using the project's own venv python
 (venv/bin/python -- this repo's actual convention, see spike/acp_spike.py's
 own venv/bin/activate usage note).
@@ -17,7 +17,7 @@ Or, to try a different prompt:
     venv/bin/python spike/acp_server_test_client.py "build a cli that reverses a string"
 
 This will:
-  1. Spawn `venv/bin/python pipeline/acp_server.py` as a subprocess.
+  1. Spawn `venv/bin/python src/pipeline/acp_server.py` as a subprocess.
   2. initialize() -> new_session() -> prompt() with the given free-text task.
   3. Print every session_update notification as it arrives (this is the
      pipeline's own print() output, streamed back live).
@@ -41,7 +41,7 @@ import acp
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_ROOT_PYTHON = os.path.join(PROJECT_ROOT, "venv", "bin", "python")
-SERVER_MODULE_PATH = os.path.join(PROJECT_ROOT, "pipeline", "acp_server.py")
+SERVER_MODULE_PATH = os.path.join(PROJECT_ROOT, "src", "pipeline", "acp_server.py")
 
 DEFAULT_PROMPT = "create a simple hello world html page"
 
@@ -107,7 +107,7 @@ class TestClient:
 async def main() -> None:
     prompt_text = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PROMPT
 
-    print(f"=== Spawning pipeline/acp_server.py, prompting: {prompt_text!r} ===\n")
+    print(f"=== Spawning src/pipeline/acp_server.py, prompting: {prompt_text!r} ===\n")
 
     with tempfile.TemporaryDirectory(prefix="acp-server-test-client-") as cwd:
         client = TestClient()

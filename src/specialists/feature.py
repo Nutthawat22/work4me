@@ -1,5 +1,5 @@
 """
-specialists/feature.py
+src/specialists/feature.py
 
 FeatureAgent: implements one cohesive capability over its explicitly owned
 set of related files.

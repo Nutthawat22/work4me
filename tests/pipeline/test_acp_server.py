@@ -1,7 +1,7 @@
 """
 tests/pipeline/test_acp_server.py
 
-Unit tests for pipeline/acp_server.py (the ACP Agent/server entrypoint —
+Unit tests for src/pipeline/acp_server.py (the ACP Agent/server entrypoint —
 Phase 5 of the ACP-native rearchitecture). No real LLM calls, no real
 ACP subprocess spawned: pipeline.acp_server.run_pipeline is monkeypatched
 directly (same convention as tests/pipeline/test_runner_acp_teardown.py).

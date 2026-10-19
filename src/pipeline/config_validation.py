@@ -1,5 +1,5 @@
 """
-pipeline/config_validation.py
+src/pipeline/config_validation.py
 
 Validates a loaded config dict against the shape required by the
 pipeline (see config.example.json). Keeps load_config() in runner.py
@@ -35,7 +35,7 @@ REQUIRED_PIPELINE_KEYS: dict[str, type] = {
 # Keys that MAY be present under pipeline.* but are not required -- if
 # present, their type is still validated (same style as
 # REQUIRED_PIPELINE_KEYS); if absent, no error is raised. See
-# pipeline/acp_content.py's DEFAULT_MAX_PROMPT_CONTENT_CHARS for the
+# src/pipeline/acp_content.py's DEFAULT_MAX_PROMPT_CONTENT_CHARS for the
 # default a caller should use when this key is omitted.
 OPTIONAL_PIPELINE_KEYS: dict[str, type] = {
     "max_prompt_content_chars": int,
@@ -60,12 +60,12 @@ def _type_name(t: type) -> str:
 
 def validate_config(config: dict) -> list[str]:
     """
-    Validate config against the required shape read by pipeline/*.py and
-    specialists/*.py.
+    Validate config against the required shape read by src/pipeline/*.py and
+    src/specialists/*.py.
 
     Returns a list of human-readable error strings; empty list means the
     config is valid. Does not raise — callers decide how to surface
-    errors (see main() in pipeline/runner.py).
+    errors (see main() in src/pipeline/runner.py).
     """
     errors: list[str] = []
 

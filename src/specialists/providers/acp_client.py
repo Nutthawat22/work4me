@@ -1,5 +1,5 @@
 """
-specialists/providers/acp_client.py
+src/specialists/providers/acp_client.py
 
 Agent Client Protocol (ACP) adapter -- the sole LLM provider (see
 specialists/providers/__init__.py's PROVIDERS registry; the former
@@ -555,7 +555,7 @@ _POOL = AcpSessionPool()
 
 def teardown() -> None:
     """
-    Public accessor for pipeline/runner.py (and any other caller outside
+    Public accessor for src/pipeline/runner.py (and any other caller outside
     this module) to tear down the module-level session pool without
     reaching into the "private" _POOL directly. Delegates to
     AcpSessionPool.teardown_all() — see its docstring for behavior.

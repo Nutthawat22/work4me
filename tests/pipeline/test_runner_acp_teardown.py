@@ -1,7 +1,7 @@
 """
 tests/pipeline/test_runner_acp_teardown.py
 
-Confirms pipeline/runner.py::run_pipeline() calls
+Confirms src/pipeline/runner.py::run_pipeline() calls
 specialists.providers.acp_client.teardown() exactly once at the end of
 every run, regardless of which exit path is taken (MasterPlanError,
 CycleError, test-failure, or success). No real LLM/subprocess/test-suite

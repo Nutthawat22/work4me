@@ -1,7 +1,7 @@
 """
 tests/specialists/providers/test_acp_client.py
 
-Unit tests for specialists/providers/acp_client.py. Uses a STUBBED/mocked
+Unit tests for src/specialists/providers/acp_client.py. Uses a STUBBED/mocked
 ACP transport (a fake acp.spawn_agent_process + fake connection) -- no
 real `opencode acp` subprocess is spawned here. See spike/acp_spike*.py
 for real-subprocess verification.

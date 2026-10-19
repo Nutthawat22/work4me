@@ -1,5 +1,5 @@
 """
-pipeline/instructions.py
+src/pipeline/instructions.py
 
 Generates a deterministic, templated instructions.md file at the end of
 every pipeline run (pass or fail) explaining how to actually run the
@@ -162,7 +162,7 @@ def generate_instructions_md(
             "design_parse_error", "dispatch_cycle_error" — mirrors
             manifest["status"]/manifest["failure_reason"].
             "passed_with_test_failures" is the tests_blocking=false
-            non-blocking-test-failure case (see pipeline/runner.py).
+            non-blocking-test-failure case (see src/pipeline/runner.py).
         run_id: The run directory's basename, for the header.
         run_dir: Absolute path to the run directory, needed to actually
             read a written package.json's "scripts" off disk. If None

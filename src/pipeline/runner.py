@@ -1,10 +1,10 @@
 """
-pipeline/runner.py
+src/pipeline/runner.py
 
 REPL entrypoint for the agentic pipeline (Phase 1: Master + Design only).
 Replaces the old main.py keyword-routing orchestrator.
 
-Usage: python pipeline/runner.py
+Usage: python src/pipeline/runner.py
 """
 
 import copy
@@ -13,11 +13,14 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_ROOT = str(_REPO_ROOT / "src")
+sys.path.insert(0, _SRC_ROOT)
 
+from pipeline.project_paths import PROJECT_ROOT, resolve_project_path
 from pipeline.master import MasterAgent, MasterPlanError
 from pipeline.config_validation import validate_config
 from pipeline.dispatch import dispatch_work_items, CycleError
@@ -210,9 +213,7 @@ def run_pipeline(
             run_config = copy.deepcopy(config)
             pipeline_config = run_config["pipeline"]
             runs_root = pipeline_config["runs_dir"]
-            runs_root = os.path.realpath(
-                runs_root if os.path.isabs(runs_root) else os.path.join(PROJECT_ROOT, runs_root)
-            )
+            runs_root = os.path.realpath(resolve_project_path(runs_root))
             project_root = validate_project_path(existing_project_path, runs_root)
             context, baseline = build_project_context(project_root, (runs_root,))
             pipeline_config["_existing_project_path"] = project_root
@@ -309,7 +310,7 @@ def _run_pipeline_body(
     master = MasterAgent(config)
     master.set_intent(label)
 
-    runs_dir_abs = os.path.join(PROJECT_ROOT, config["pipeline"]["runs_dir"])
+    runs_dir_abs = resolve_project_path(config["pipeline"]["runs_dir"])
     run_dir = create_run_dir(runs_dir_abs, label)
     if config["pipeline"].get("_existing_project_path"):
         config["pipeline"]["_active_run_dir"] = run_dir

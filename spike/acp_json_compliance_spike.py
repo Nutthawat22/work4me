@@ -7,7 +7,7 @@ Standalone, throwaway. Does NOT modify acp_client.py, master.py, or any
 other spike file.
 
 Measures the REAL JSON schema-compliance rate of ACP's prompt-only
-schema mechanism (specialists/providers/acp_client.py's acp_call() +
+schema mechanism (src/specialists/providers/acp_client.py's acp_call() +
 _build_schema_instruction() -- there is no token-constrained
 structured-output enforcement over ACP, unlike chat_completions/
 responses providers' response_format=json_schema,strict=true).
@@ -16,7 +16,7 @@ Target model: claude-sonnet-5. NOTE -- the design doc's own text
 mentions "kimi-k2.7-code, gpt-5.6-luna" as example role models, but
 those are placeholder names that only exist in config.example.json.
 The REAL config that actually loads at runtime
-(~/.config/Agents/config.json, which pipeline/runner.py's
+(~/.config/Agents/config.json, which src/pipeline/runner.py's
 load_config() checks before falling back to the repo's config.json)
 has every role (code/default/master/design/specialist) pointed at
 claude-sonnet-5. That's the model actually in production use, so
@@ -24,16 +24,16 @@ that's what this spike targets.
 
 Reuses, unmodified:
   - acp_call() / AcpSessionPool (_POOL) / teardown() from
-    specialists/providers/acp_client.py.
+    src/specialists/providers/acp_client.py.
   - pipeline.master's REAL WorkItem/Feature response schemas
     (_build_work_items_response_schema, _build_features_response_schema),
     system prompt templates (SYSTEM_PROMPT_TEMPLATE,
     FEATURES_SYSTEM_PROMPT_TEMPLATE), and parse/validate static methods
     (MasterAgent._parse_json/_validate_and_build,
     MasterAgent._parse_features_json/_validate_and_build_features) --
-    imported directly since pipeline/master.py imports cleanly without
+    imported directly since src/pipeline/master.py imports cleanly without
     needing a live config at import time. (Its import chain does trigger
-    specialists/providers/acp_client.py's `import acp`, so this script
+    src/specialists/providers/acp_client.py's `import acp`, so this script
     must be run with spike/venv's interpreter, which has
     agent-client-protocol installed -- see Run instructions below.)
 
@@ -81,13 +81,13 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-# pipeline/master.py and specialists/providers/acp_client.py live at the
-# repo root (one level up from spike/); add it to sys.path so this
+# pipeline/master.py and specialists/providers/acp_client.py live under
+# src/; add that source root to sys.path so this
 # script can `import pipeline.master` / `import specialists.providers...`
 # regardless of the cwd it's invoked from.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_SRC_ROOT = os.path.join(_REPO_ROOT, "src")
+sys.path.insert(0, _SRC_ROOT)
 
 from pipeline.master import (  # noqa: E402
     MasterAgent,

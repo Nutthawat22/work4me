@@ -1,8 +1,8 @@
 """
 tests/specialists/providers/test_providers_registry.py
 
-Tests for specialists/providers/__init__.py's PROVIDERS registry and its
-dispatch from specialists/llm_client.py::call_llm. No real subprocess is
+Tests for src/specialists/providers/__init__.py's PROVIDERS registry and its
+dispatch from src/specialists/llm_client.py::call_llm. No real subprocess is
 spawned — the "acp" entry is verified via a stubbed acp_call (patched
 onto the PROVIDERS dict itself), not a live opencode acp process.
 """

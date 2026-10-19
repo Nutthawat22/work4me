@@ -1,5 +1,5 @@
 """
-pipeline/dispatch.py
+src/pipeline/dispatch.py
 
 Dependency ordering (topological sort over WorkItem.depends_on) and
 sequential dispatch to the matching specialist agent.
@@ -188,7 +188,7 @@ def dispatch_work_items(
         work_items: The (possibly partial) batch of WorkItems to dispatch.
         config: Loaded config dict.
         run_dir: Path to this pipeline run's output directory (see
-            pipeline/run_paths.py), passed through to each specialist.
+            src/pipeline/run_paths.py), passed through to each specialist.
         strict: Passed through to topological_sort — True (default) for a
             full/self-contained batch, False for a retry subset where
             depends_on may reference ids outside this batch.
@@ -198,7 +198,7 @@ def dispatch_work_items(
             failure history. Passed through to each specialist's
             execute() so it can inform the LLM prompt on retries.
         known_results: Optional list of AgentResults from prior dispatch
-            rounds (e.g. pipeline/runner.py's all_agent_results
+            rounds (e.g. src/pipeline/runner.py's all_agent_results
             accumulator). Needed during retry-subset dispatch (strict=
             False) so dependency file lookups can resolve WorkItems that
             already succeeded in an earlier round and therefore aren't

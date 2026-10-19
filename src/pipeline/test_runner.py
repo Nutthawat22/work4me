@@ -1,5 +1,5 @@
 """
-pipeline/test_runner.py
+src/pipeline/test_runner.py
 
 TestRunner: dispatches per-language test suites (via subprocess) based on
 the languages actually present in a run's WorkItems, parses each
@@ -61,8 +61,7 @@ import xml.etree.ElementTree as ET
 
 from pipeline.state import TestFailure, TestResult, WorkItem
 from pipeline.project_context import IGNORED_DIRECTORIES
-
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from pipeline.project_paths import PROJECT_ROOT
 
 MAX_ERROR_OUTPUT_LEN = 2000
 

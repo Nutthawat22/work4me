@@ -1,5 +1,5 @@
 """
-pipeline/file_manifest.py
+src/pipeline/file_manifest.py
 
 Feature-oriented / file-indexed planning stage — one of Master's
 selectable layout strategies (Phase 4 of the ACP-native rearchitecture,

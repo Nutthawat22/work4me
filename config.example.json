@@ -2,7 +2,7 @@
   "litellm_url": "https://opencode.ai/zen/go/v1",
   "litellm_key": "YOUR_OPENCODE_GO_API_KEY_HERE",
   "models": {
-    "_comment": "provider is always \"acp\" (routes through a pooled `opencode acp` subprocess — see specialists/providers/acp_client.py). ACP has no token-level schema enforcement; JSON reliability is handled via a prompt-embedded schema instruction plus same-session retry-with-error-feedback (acp_call_with_retry), not a hard guarantee.",
+    "_comment": "provider is always \"acp\" (routes through a pooled `opencode acp` subprocess — see src/specialists/providers/acp_client.py). ACP has no token-level schema enforcement; JSON reliability is handled via a prompt-embedded schema instruction plus same-session retry-with-error-feedback (acp_call_with_retry), not a hard guarantee.",
     "code": {"model": "kimi-k2.7-code", "provider": "acp"},
     "default": {"model": "kimi-k2.7-code", "provider": "acp"},
     "master": {"model": "kimi-k2.7-code", "provider": "acp"},

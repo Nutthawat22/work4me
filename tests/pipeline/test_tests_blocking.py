@@ -2,7 +2,7 @@
 tests/pipeline/test_tests_blocking.py
 
 Tests for config["pipeline"]["tests_blocking"] (default True) — see
-pipeline/runner.py's _run_pipeline_body. When explicitly set to False,
+src/pipeline/runner.py's _run_pipeline_body. When explicitly set to False,
 a failing test_result should not by itself fail the run (advisory-only),
 but the vacuous-pass guard (specialist dispatch failures) must still
 block regardless. No real LLM/subprocess/test-suite work happens here —

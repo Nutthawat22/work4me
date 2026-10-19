@@ -3,6 +3,10 @@ runs/
 requirements/
 app/
 __pycache__/
-.cachebro
-spike/venv/
+spike/
 venv/
+spike/venv/
+node_modules/
+output/
+.pytest_cache/
+.cachebro/

@@ -30,7 +30,10 @@ Also install `opencode` with `acp` support and put its executable on the server 
 
 The server loads its config from **`~/.config/Agents/config.json`** first; if that file doesn't exist, it falls back to the repo's own `config.json` at the project root. Configure one of these locations on the machine/environment where you run the server; the home config takes precedence.
 
-Base your config on `config.example.json` in this repo. Shape and fields:
+Base your config on `config.example.json` in this repo. Run the documented
+scripts by absolute path when launching from another working directory; each
+entry point resolves repository config and artifact paths independently of the
+client's cwd. Shape and fields:
 
 ```json
 {
@@ -69,7 +72,7 @@ Field-by-field, what you need to fill in:
 - **`pipeline.output_dir`** — subdirectory name (inside each run dir) where generated product code is written.
 - **`pipeline.tests_dir`** — subdirectory name (inside each run dir) where generated tests are written.
 - **`pipeline.tests_blocking`** — whether test failures block a run from being reported as passed (`true`) or are advisory-only once all specialists have dispatched successfully (`false`).
-- **`pipeline.max_prompt_content_chars`** *(optional, default `200000`)* — per-file truncation limit (in chars) for embedded text-resource attachments extracted from an ACP prompt (see `pipeline/acp_content.py`). Not yet wired into `acp_server.py`'s routing — prep work only.
+- **`pipeline.max_prompt_content_chars`** *(optional, default `200000`)* — per-file truncation limit (in chars) for embedded text-resource attachments extracted from an ACP prompt (see `src/pipeline/acp_content.py`). Not yet wired into `acp_server.py`'s routing — prep work only.
 - **`languages.*`** — per-language test-runner configuration (test command, file patterns, result format). Copy these as-is from `config.example.json` unless you need to change how tests are invoked for a given language.
 
 ### 2.3 Client-side requirements
@@ -84,7 +87,7 @@ Field-by-field, what you need to fill in:
 Spawn the server as a subprocess, communicating over stdio (stdin/stdout for JSON-RPC framing; the server's own diagnostic/error output does not go to stdout — see [section 3.5](#35-progress-streaming)):
 
 ```
-<your-venv-path>/venv/bin/python <path-to-repo>/pipeline/acp_server.py
+<your-venv-path>/venv/bin/python <path-to-repo>/src/pipeline/acp_server.py
 ```
 
 Use the interpreter from the venv you created in step 2.1 (it needs `agent-client-protocol` and this repo's other dependencies installed).
@@ -216,7 +219,7 @@ import acp
 
 async def main() -> None:
     python_path = "/path/to/agents-pipeline/venv/bin/python"
-    server_path = "/path/to/agents-pipeline/pipeline/acp_server.py"
+    server_path = "/path/to/agents-pipeline/src/pipeline/acp_server.py"
     task_prompt = "build a cli that reverses a string"
 
     class Client:

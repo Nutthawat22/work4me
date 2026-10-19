@@ -1,5 +1,5 @@
 """
-pipeline/run_paths.py
+src/pipeline/run_paths.py
 
 Helpers for creating a per-run output directory under config's
 "runs_dir": runs/{NNNN-slug}/{design,product,tests/results}. One run dir

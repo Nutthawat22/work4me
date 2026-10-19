@@ -1,8 +1,8 @@
 """
 tests/pipeline/test_config_validation.py
 
-Tests for pipeline/config_validation.py's validate_config(), focused on
-provider validation (see specialists/providers/__init__.py's PROVIDERS
+Tests for src/pipeline/config_validation.py's validate_config(), focused on
+provider validation (see src/specialists/providers/__init__.py's PROVIDERS
 registry and VALID_PROVIDERS here).
 """
 

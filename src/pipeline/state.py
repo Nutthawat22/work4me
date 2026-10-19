@@ -1,5 +1,5 @@
 """
-pipeline/state.py
+src/pipeline/state.py
 
 Data structures shared across the agentic pipeline: WorkItem, AgentResult,
 TestResult, TestFailure, ReviewResult, FailReport, PipelineState.

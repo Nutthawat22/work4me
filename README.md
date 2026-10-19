@@ -9,5 +9,7 @@ pip install -r requirements.txt
 
 ## Run
 
-- REPL: `python pipeline/runner.py`
-- Handoff ingestion: `python pipeline/ingest.py --handoff <dir>`
+From the repository root:
+
+- REPL: `python src/pipeline/runner.py`
+- Handoff ingestion: `python src/pipeline/ingest.py --handoff <dir>`

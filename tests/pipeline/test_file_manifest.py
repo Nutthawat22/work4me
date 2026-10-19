@@ -1,7 +1,7 @@
 """
 tests/pipeline/test_file_manifest.py
 
-Tests for the file-indexed planning strategy (pipeline/file_manifest.py).
+Tests for the file-indexed planning strategy (src/pipeline/file_manifest.py).
 No live LLM calls or network: exercises grouping and validation with
 hand-made FileManifests and mocks the planner call.
 """

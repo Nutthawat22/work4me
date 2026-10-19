@@ -1,5 +1,5 @@
 """
-pipeline/acp_server.py
+src/pipeline/acp_server.py
 
 ACP Agent/server entrypoint for the pipeline (Phase 5 of the ACP-native
 rearchitecture — see
@@ -47,7 +47,7 @@ scheduled output deliveries are drained before the next queued run begins.
 
 Manual invocation for testing:
 
-    venv/bin/python pipeline/acp_server.py
+    venv/bin/python src/pipeline/acp_server.py
 
 This starts the agent listening on stdio (see acp.run_agent), exactly
 as `opencode acp` does for the client side. Use
@@ -66,10 +66,12 @@ import sys
 import threading
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable, Optional
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_ROOT = str(_REPO_ROOT / "src")
+sys.path.insert(0, _SRC_ROOT)
 
 import acp
 from acp.schema import (
@@ -82,6 +84,7 @@ from acp.schema import (
 )
 
 from pipeline.master import MasterPlanError
+from pipeline.project_paths import PROJECT_ROOT, resolve_project_path
 from pipeline.project_context import validate_project_path
 from pipeline.runner import load_config, run_pipeline
 
@@ -725,9 +728,8 @@ class PipelineAgent:
             mode = params.get("mode")
             if mode != "existing_project":
                 raise acp.RequestError.invalid_params({"mode": "must be 'existing_project'"})
-            runs_root = self.config["pipeline"]["runs_dir"]
             runs_root = os.path.realpath(
-                runs_root if os.path.isabs(runs_root) else os.path.join(PROJECT_ROOT, runs_root)
+                resolve_project_path(self.config["pipeline"]["runs_dir"])
             )
             try:
                 project_path = validate_project_path(

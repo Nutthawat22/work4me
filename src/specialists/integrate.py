@@ -1,5 +1,5 @@
 """
-specialists/integrate.py
+src/specialists/integrate.py
 
 IntegrationAgent: implements composition and wiring assets for a runnable
 application, using declared dependencies and owned files.

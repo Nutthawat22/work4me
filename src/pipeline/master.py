@@ -1,5 +1,5 @@
 """
-pipeline/master.py
+src/pipeline/master.py
 
 MasterAgent: owns the user's intent AND all planning for a pipeline run
 (Phase 2 of the ACP-native rearchitecture — see
@@ -105,7 +105,7 @@ TASK_REQUIRED_FIELDS = {
 def _build_work_items_response_schema(name: str, valid_languages: set[str]) -> dict:
     """
     Build a prompt-embedded structured-output schema (see
-    specialists/providers/acp_client.py's _build_schema_instruction) that
+    src/specialists/providers/acp_client.py's _build_schema_instruction) that
     describes a valid array of task objects, with "category" and
     "language" enum-constrained to VALID_CATEGORIES and the caller's
     valid_languages set respectively. ACP has no token-level schema
@@ -668,7 +668,7 @@ class MasterAgent:
         - "llm_decided" (default): calls file_manifest.plan_file_manifest()
           (one LLM call, itself retry-with-error-feedback wrapped — see
           plan_file_manifest's own docstring) to derive the file plan from
-          features, exactly as pipeline/ingest.py's --mode manifest branch
+          features, exactly as src/pipeline/ingest.py's --mode manifest branch
           used to do by hand before this method existed.
         - "external": accepts a pre-built layout via `external_layout`
           (see the Implementation notes below for the exact shape

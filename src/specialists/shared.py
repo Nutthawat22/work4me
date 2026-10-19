@@ -1,5 +1,5 @@
 """
-specialists/shared.py
+src/specialists/shared.py
 
 SharedAgent: implements shared modules and contracts with one task owner.
 """

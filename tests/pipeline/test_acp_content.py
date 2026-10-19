@@ -1,8 +1,8 @@
 """
 tests/pipeline/test_acp_content.py
 
-Unit tests for pipeline/acp_content.py's extract_prompt_content(). This
-module is standalone (not wired into pipeline/acp_server.py's routing
+Unit tests for src/pipeline/acp_content.py's extract_prompt_content(). This
+module is standalone (not wired into src/pipeline/acp_server.py's routing
 yet), so these tests use plain duck-typed fakes (SimpleNamespace) for
 ACP content blocks rather than importing the real acp.schema classes --
 matching the fake-block convention already used in
