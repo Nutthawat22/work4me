@@ -2,6 +2,7 @@ config.json
 runs/
 requirements/
 app/
+tests/
 __pycache__/
 spike/
 venv/
