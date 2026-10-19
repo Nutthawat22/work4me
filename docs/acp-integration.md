@@ -260,7 +260,7 @@ if __name__ == "__main__":
 
 This example is Python-specific, but the underlying protocol — JSON-RPC over stdio — is language-agnostic; an equivalent client can be implemented in any language with JSON-RPC and subprocess support.
 
-For live status polling while `prompt` is in flight, see [AGENTS.md](../AGENTS.md#handshake-and-live-status-python-sdk-0121). Query final status before closing the session or server: session state is in memory and is discarded by `close_session` or a server restart; historical artifacts remain on disk.
+For live status polling while `prompt` is in flight, query the extension described in [section 3.6](#36-structured-run-status) from a concurrent task. Query final status before closing the session or server: session state is in memory and is discarded by `close_session` or a server restart; historical artifacts remain on disk.
 
 ## 5. Known limitations (v1)
 

@@ -73,6 +73,9 @@ def test_master_planning_receives_existing_project_context(monkeypatch):
     assert "update the app" in captured[1]["content"]
     assert "print('current')" in captured[1]["content"]
     assert "existing-project change" in captured[0]["content"]
+    assert "relative to the project root" in captured[0]["content"]
+    assert "A project-root file is difficulty.js" in captured[0]["content"]
+    assert "project/difficulty.js only when the actual owned file" in captured[0]["content"]
 
 
 def test_project_context_and_change_summary_include_additions_modifications_deletions(

@@ -487,7 +487,11 @@ class MasterAgent:
                 "\n\nThis is an existing-project change. Inspect the supplied project context, "
                 "reuse its established structure and conventions, and plan only necessary "
                 "project-relative additions, modifications, and intentional deletions. "
-                "Do not plan replacement scaffolding for files that already serve the request."
+                "Do not plan replacement scaffolding for files that already serve the request. "
+                "Path contract: every owned_files[].path is a slash-separated path relative "
+                "to the project root, with no leading project/ label. A project-root file is "
+                "difficulty.js; a nested file is src/difficulty.js. Use project/difficulty.js "
+                "only when the actual owned file is inside a directory literally named project."
             )
             planning_input = (
                 f"Requested change:\n{user_prompt}\n\n"
