@@ -462,7 +462,9 @@ class MasterAgent:
         """Update the held intent for a new pipeline run."""
         self.intent = user_prompt
 
-    def decompose(self, user_prompt: str) -> list[WorkItem]:
+    def decompose(
+        self, user_prompt: str, project_context: str | None = None
+    ) -> list[WorkItem]:
         """
         Ask the LLM to decompose user_prompt into WorkItems, parse and
         validate the JSON response, and return constructed WorkItem objects.
@@ -479,9 +481,21 @@ class MasterAgent:
         system_prompt = TASK_PLANNING_PROMPT_TEMPLATE.format(
             valid_languages=", ".join(sorted(valid_languages))
         )
+        planning_input = user_prompt
+        if project_context:
+            system_prompt += (
+                "\n\nThis is an existing-project change. Inspect the supplied project context, "
+                "reuse its established structure and conventions, and plan only necessary "
+                "project-relative additions, modifications, and intentional deletions. "
+                "Do not plan replacement scaffolding for files that already serve the request."
+            )
+            planning_input = (
+                f"Requested change:\n{user_prompt}\n\n"
+                f"{project_context}"
+            )
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": planning_input},
         ]
         response_schema = _build_work_items_response_schema("decompose_work_items", valid_languages)
 

@@ -82,6 +82,7 @@ from acp.schema import (
 )
 
 from pipeline.master import MasterPlanError
+from pipeline.project_context import validate_project_path
 from pipeline.runner import load_config, run_pipeline
 
 AGENT_NAME = "agents-pipeline"
@@ -279,7 +280,8 @@ class _SessionState:
     -- see module docstring's "Cancellation" section."""
 
     __slots__ = (
-        "session_id", "cwd", "cancelled", "used", "progress", "progress_lock", "queue_ticket"
+        "session_id", "cwd", "cancelled", "used", "mode", "project_path",
+        "progress", "progress_lock", "queue_ticket"
     )
 
     def __init__(self, session_id: str, cwd: str) -> None:
@@ -287,6 +289,8 @@ class _SessionState:
         self.cwd = cwd
         self.cancelled = False
         self.used = False
+        self.mode = "new_project"
+        self.project_path: Optional[str] = None
         self.progress: dict[str, Any] = {
             "schema_version": 1,
             "session_id": session_id,
@@ -304,6 +308,8 @@ class _SessionState:
             "attempt_round": 0,
             "max_attempts": None,
             "tests_blocking": None,
+            "mode": "new_project",
+            "project_path": None,
         }
         self.progress_lock = threading.Lock()
         self.queue_ticket: Optional[_RunTicket] = None
@@ -354,7 +360,15 @@ class PipelineAgent:
                         "runStatus": {
                             "method": "_agents-pipeline/run/status",
                             "params": {"sessionId": "string"},
-                        }
+                        },
+                        "sessionConfig": {
+                            "method": "_agents-pipeline/session/configure",
+                            "params": {
+                                "sessionId": "string",
+                                "mode": "existing_project",
+                                "projectPath": "absolute server-side path",
+                            },
+                        },
                     }
                 }
             ),
@@ -458,13 +472,25 @@ class PipelineAgent:
                     text,
                     label,
                     lambda update: self._apply_pipeline_progress(state, update),
+                    state.project_path,
                 )
             )
             success, interrupted = await _wait_for_pipeline(pipeline_task)
             await _drain_deliveries()
+            if state.project_path is not None and success is not True:
+                await self._send_message(
+                    session_id,
+                    "⚠️ Existing-project edits are in place; partial changes may remain. "
+                    "No rollback was performed. See the run's changes.json for the change summary.\n",
+                )
             outcome = self._progress_outcome(state)
             if success is None:
-                self._set_progress(state, status="failed", phase="completed", outcome="error")
+                self._set_progress(
+                    state,
+                    status="failed",
+                    phase="completed",
+                    outcome="failed" if state.project_path is not None else "error",
+                )
                 response = PromptResponse(stop_reason="refusal")
             elif state.cancelled or interrupted:
                 self._set_progress(state, status="cancelled", phase="completed", outcome=outcome or "cancelled")
@@ -543,6 +569,7 @@ class PipelineAgent:
         user_input: str,
         label: str,
         progress: Callable[[dict[str, object]], None],
+        existing_project_path: Optional[str] = None,
     ) -> Optional[bool]:
         """
         Runs on an executor thread (via asyncio.to_thread). Wraps
@@ -556,7 +583,15 @@ class PipelineAgent:
         session_update was already sent).
         """
         try:
-            return run_pipeline(self.config, user_input=user_input, label=label, progress=progress)
+            if existing_project_path is None:
+                return run_pipeline(self.config, user_input=user_input, label=label, progress=progress)
+            return run_pipeline(
+                self.config,
+                user_input=user_input,
+                label=label,
+                progress=progress,
+                existing_project_path=existing_project_path,
+            )
         except MasterPlanError as e:
             # run_pipeline() already catches this internally and returns
             # False -- this branch is defensive/documentation only (see
@@ -672,6 +707,40 @@ class PipelineAgent:
         return None
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method == "agents-pipeline/session/configure":
+            session_id = params.get("sessionId", params.get("session_id"))
+            if not isinstance(session_id, str):
+                raise acp.RequestError.invalid_params({"sessionId": "required string"})
+            state = self._sessions.get(session_id)
+            if state is None:
+                raise acp.RequestError.invalid_params({"sessionId": session_id, "reason": "unknown session"})
+            if state.used or state.progress["status"] != "created":
+                raise acp.RequestError.invalid_params(
+                    {"sessionId": session_id, "reason": "session configuration is only allowed before prompt"}
+                )
+            if state.project_path is not None:
+                raise acp.RequestError.invalid_params(
+                    {"sessionId": session_id, "reason": "session is already configured"}
+                )
+            mode = params.get("mode")
+            if mode != "existing_project":
+                raise acp.RequestError.invalid_params({"mode": "must be 'existing_project'"})
+            runs_root = self.config["pipeline"]["runs_dir"]
+            runs_root = os.path.realpath(
+                runs_root if os.path.isabs(runs_root) else os.path.join(PROJECT_ROOT, runs_root)
+            )
+            try:
+                project_path = validate_project_path(
+                    params.get("projectPath", params.get("project_path")),
+                    runs_root,
+                )
+            except ValueError as error:
+                raise acp.RequestError.invalid_params({"projectPath": str(error)}) from error
+            state.mode = mode
+            state.project_path = project_path
+            self._set_progress(state, mode=mode, project_path=project_path)
+            return {"sessionId": session_id, "mode": mode, "projectPath": project_path}
+
         if method != "agents-pipeline/run/status":
             raise acp.RequestError.method_not_found(f"ext_method {method} not supported")
         session_id = params.get("sessionId", params.get("session_id"))

@@ -87,6 +87,9 @@ def test_initialize_returns_well_formed_response(agent):
     assert resp.agent_capabilities.field_meta["agents-pipeline"]["runStatus"]["method"] == (
         "_agents-pipeline/run/status"
     )
+    assert resp.agent_capabilities.field_meta["agents-pipeline"]["sessionConfig"]["method"] == (
+        "_agents-pipeline/session/configure"
+    )
 
 
 # ── new_session() ────────────────────────────────────────────────────────────
@@ -104,6 +107,94 @@ def test_new_session_ids_are_unique(agent):
     r2 = asyncio.run(agent.new_session(cwd="/tmp/a"))
 
     assert r1.session_id != r2.session_id
+
+
+def test_existing_project_configuration_is_validated_and_passed_to_pipeline(
+    agent, monkeypatch, tmp_path
+):
+    agent._conn = _RecordingConn()
+    project = tmp_path / "existing"
+    project.mkdir()
+    session = asyncio.run(agent.new_session(cwd="/tmp/client-cwd"))
+    configured = asyncio.run(agent.ext_method(
+        "agents-pipeline/session/configure",
+        {
+            "sessionId": session.session_id,
+            "mode": "existing_project",
+            "projectPath": str(project),
+        },
+    ))
+    captured = []
+
+    def fake_run_pipeline(config, **kwargs):
+        captured.append(kwargs)
+        kwargs["progress"]({"phase": "teardown", "outcome": "failed"})
+        return False
+
+    monkeypatch.setattr(acp_server, "run_pipeline", fake_run_pipeline)
+    result = asyncio.run(agent.prompt(
+        session_id=session.session_id,
+        prompt=[_text_block("update the project")],
+    ))
+
+    status = asyncio.run(agent.ext_method(
+        "agents-pipeline/run/status", {"sessionId": session.session_id}
+    ))
+    assert configured["projectPath"] == str(project.resolve())
+    assert captured[0]["existing_project_path"] == str(project.resolve())
+    assert result.stop_reason == "end_turn"
+    assert status["mode"] == "existing_project"
+    assert status["project_path"] == str(project.resolve())
+    assert status["outcome"] == "failed"
+    assert any("partial changes may remain" in text for _, text in agent._conn.updates)
+
+
+@pytest.mark.parametrize(
+    "project_path",
+    ["relative/project", "/path/that/does/not/exist", "/"],
+)
+def test_existing_project_configuration_rejects_invalid_paths(agent, tmp_path, project_path):
+    session = asyncio.run(agent.new_session(cwd="/tmp"))
+    with pytest.raises(acp.RequestError):
+        asyncio.run(agent.ext_method(
+            "agents-pipeline/session/configure",
+            {
+                "sessionId": session.session_id,
+                "mode": "existing_project",
+                "projectPath": project_path,
+            },
+        ))
+
+
+def test_existing_project_configuration_must_precede_prompt(agent, monkeypatch, tmp_path):
+    project = tmp_path / "existing"
+    project.mkdir()
+    session = asyncio.run(agent.new_session(cwd="/tmp"))
+    monkeypatch.setattr(acp_server, "run_pipeline", lambda config, **kwargs: True)
+    asyncio.run(agent.prompt(session_id=session.session_id, prompt=[_text_block("run")]))
+
+    with pytest.raises(acp.RequestError):
+        asyncio.run(agent.ext_method(
+            "agents-pipeline/session/configure",
+            {
+                "sessionId": session.session_id,
+                "mode": "existing_project",
+                "projectPath": str(project),
+            },
+        ))
+
+
+def test_existing_project_configuration_rejects_pipeline_run_tree(agent):
+    session = asyncio.run(agent.new_session(cwd="/tmp"))
+    with pytest.raises(acp.RequestError):
+        asyncio.run(agent.ext_method(
+            "agents-pipeline/session/configure",
+            {
+                "sessionId": session.session_id,
+                "mode": "existing_project",
+                "projectPath": acp_server.PROJECT_ROOT,
+            },
+        ))
 
 
 # ── prompt(): unknown session ────────────────────────────────────────────────

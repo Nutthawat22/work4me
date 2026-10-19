@@ -7,6 +7,7 @@ Replaces the old main.py keyword-routing orchestrator.
 Usage: python pipeline/runner.py
 """
 
+import copy
 import dataclasses
 import json
 import os
@@ -22,6 +23,12 @@ from pipeline.config_validation import validate_config
 from pipeline.dispatch import dispatch_work_items, CycleError
 from pipeline.instructions import write_instructions_md
 from pipeline.run_paths import append_index, create_run_dir, write_manifest
+from pipeline.project_context import (
+    build_project_context,
+    snapshot_project_files,
+    summarize_project_changes,
+    validate_project_path,
+)
 from pipeline.state import AgentResult, FailReport, TaskAttempt, TestResult, WorkItem
 from pipeline.test_runner import TestRunner
 from specialists.providers import acp_client
@@ -51,6 +58,8 @@ def print_agent_result(result: AgentResult) -> None:
     status = "✅" if result.success else "❌"
     print(f"  [{result.work_item_id}] {result.agent_name} {status}")
     print(f"    files_written: {result.files_written}")
+    if result.files_deleted:
+        print(f"    files_deleted: {result.files_deleted}")
     if result.notes:
         print(f"    notes: {result.notes}")
 
@@ -108,8 +117,13 @@ def _sync_task_results(
                 number=len(item.attempts) + 1,
                 status="passed" if result.success else "failed",
                 files_written=list(result.files_written),
-                result_summary=f"Wrote {len(result.files_written)} file(s)" if result.success else "",
+                result_summary=(
+                    f"Wrote {len(result.files_written)} file(s); deleted {len(result.files_deleted)} file(s)"
+                    if result.success
+                    else ""
+                ),
                 failure_details=result.notes if not result.success else "",
+                files_deleted=list(result.files_deleted),
             )
         )
 
@@ -140,6 +154,7 @@ def run_pipeline(
     work_items: list[WorkItem] | None = None,
     label: str | None = None,
     progress: Callable[[dict[str, object]], None] | None = None,
+    existing_project_path: str | None = None,
 ) -> bool:
     """
     Run one full pipeline pass end-to-end (run-dir creation -> decompose
@@ -163,6 +178,10 @@ def run_pipeline(
             field. Defaults to user_input when user_input is given.
             Required when work_items is given, since there's no raw
             prompt string to derive it from.
+        existing_project_path: Optional absolute server-side project
+            directory. When set, specialists edit its owned files in place
+            and tests execute against that project; run artifacts remain
+            under pipeline.runs_dir.
         progress: Optional structured progress callback. Completed task
             counts represent specialist attempts; retries add to the count.
 
@@ -182,10 +201,93 @@ def run_pipeline(
             raise ValueError("label is required when work_items is given")
         label = user_input
 
+    run_config = config
+    project_root: str | None = None
+    baseline: dict[str, str] | None = None
+    run_failed = False
     try:
-        return _run_pipeline_body(config, user_input, work_items, label, progress)
+        if existing_project_path is not None:
+            run_config = copy.deepcopy(config)
+            pipeline_config = run_config["pipeline"]
+            runs_root = pipeline_config["runs_dir"]
+            runs_root = os.path.realpath(
+                runs_root if os.path.isabs(runs_root) else os.path.join(PROJECT_ROOT, runs_root)
+            )
+            project_root = validate_project_path(existing_project_path, runs_root)
+            context, baseline = build_project_context(project_root, (runs_root,))
+            pipeline_config["_existing_project_path"] = project_root
+            pipeline_config["_existing_project_context"] = context
+            pipeline_config["_protected_run_root"] = runs_root
+            # Existing-project changes must have passing automated validation;
+            # advisory-only test failures cannot produce a clean edit-mode pass.
+            pipeline_config["tests_blocking"] = True
+        result = _run_pipeline_body(run_config, user_input, work_items, label, progress)
+        if not result:
+            run_failed = True
+        return result
+    except BaseException:
+        run_failed = True
+        raise
     finally:
-        acp_client.teardown()
+        try:
+            if project_root is not None:
+                pipeline_config = run_config["pipeline"]
+                active_run_dir = pipeline_config.get("_active_run_dir")
+                if active_run_dir and baseline is not None:
+                    _finalize_existing_project_changes(
+                        active_run_dir,
+                        project_root,
+                        baseline,
+                        (pipeline_config.get("_protected_run_root", ""),),
+                        failed=run_failed,
+                    )
+        finally:
+            acp_client.teardown()
+
+
+def _finalize_existing_project_changes(
+    run_dir: str,
+    project_root: str,
+    baseline: dict[str, str],
+    excluded_roots: tuple[str, ...],
+    *,
+    failed: bool,
+) -> None:
+    current = snapshot_project_files(project_root, tuple(path for path in excluded_roots if path))
+    changes = summarize_project_changes(baseline, current)
+    warning = (
+        "The pipeline did not complete successfully. Existing-project edits are in place; "
+        "partial changes may remain and were not rolled back."
+        if failed
+        else None
+    )
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    manifest: dict | None = None
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+        manifest["project_path"] = project_root
+        manifest["changes"] = changes
+        manifest["partial_edits_possible"] = failed
+        if failed and manifest.get("status") == "in_progress":
+            manifest["status"] = "failed"
+            manifest["failure_reason"] = "pipeline_exception"
+            manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    summary = {
+        "project_path": project_root,
+        "status": manifest.get("status", "failed" if failed else "completed") if manifest else (
+            "failed" if failed else "completed"
+        ),
+        **changes,
+        "partial_edits_possible": failed,
+        "warning": warning,
+    }
+    with open(os.path.join(run_dir, "changes.json"), "w", encoding="utf-8") as change_file:
+        json.dump(summary, change_file, indent=2)
+
+    if manifest is not None:
+        write_manifest(run_dir, manifest)
 
 
 def _run_pipeline_body(
@@ -209,16 +311,18 @@ def _run_pipeline_body(
 
     runs_dir_abs = os.path.join(PROJECT_ROOT, config["pipeline"]["runs_dir"])
     run_dir = create_run_dir(runs_dir_abs, label)
+    if config["pipeline"].get("_existing_project_path"):
+        config["pipeline"]["_active_run_dir"] = run_dir
     run_id = os.path.basename(run_dir)
     print(f"\n📁 Run dir: {run_dir}\n")
 
-      # tests_blocking defaults to True (absent key == today's behavior):
-      # explicit False makes test-*content* failures advisory-only for the
-      # run's final pass/fail decision and the retry loop's test-driven
-      # trigger — it does NOT touch the vacuous-pass guard further down
-      # (specialist dispatch failures always block, regardless of this
-      # flag). See _run_pipeline_body's retry loop and final decision
-      # block below for where this is actually consumed.
+    # tests_blocking defaults to True (absent key == today's behavior):
+    # explicit False makes test-*content* failures advisory-only for the
+    # run's final pass/fail decision and the retry loop's test-driven
+    # trigger — it does NOT touch the vacuous-pass guard further down
+    # (specialist dispatch failures always block, regardless of this
+    # flag). See _run_pipeline_body's retry loop and final decision
+    # block below for where this is actually consumed.
     tests_blocking = config["pipeline"].get("tests_blocking", True)
 
     def report(**updates: object) -> None:
@@ -235,12 +339,19 @@ def _run_pipeline_body(
         "status": "in_progress",
         "tests_blocking": tests_blocking,
     }
+    existing_project_path = config["pipeline"].get("_existing_project_path")
+    if existing_project_path:
+        manifest["project_path"] = existing_project_path
     write_manifest(run_dir, manifest)
 
     if work_items is None:
         print("🧠 Planning... (MasterAgent LLM call in progress, this can take a while)\n")
         try:
-            work_items = master.decompose(user_input)
+            project_context = config["pipeline"].get("_existing_project_context")
+            if project_context:
+                work_items = master.decompose(user_input, project_context=project_context)
+            else:
+                work_items = master.decompose(user_input)
         except MasterPlanError as e:
             print(f"\n⚠️  MasterAgent failed to produce a valid plan: {e}\n")
             manifest["status"] = "failed"
@@ -346,7 +457,12 @@ def _run_pipeline_body(
     current_work_items = work_items
     all_agent_results: list[AgentResult] = list(agent_results)
     report(phase="testing", task=None, attempt_round=1)
-    test_result: TestResult = test_runner.run(config, work_items, run_dir)
+    existing_project_mode = bool(config["pipeline"].get("_existing_project_path"))
+    test_result: TestResult = (
+        test_runner.run(config, work_items, run_dir, require_tests=True)
+        if existing_project_mode
+        else test_runner.run(config, work_items, run_dir)
+    )
 
     attempt = 1
     with open(
@@ -416,7 +532,11 @@ def _run_pipeline_body(
         all_agent_results.extend(retry_results)
 
         report(phase="testing", task=None, attempt_round=attempt)
-        test_result = test_runner.run(config, work_items, run_dir)
+        test_result = (
+            test_runner.run(config, work_items, run_dir, require_tests=True)
+            if existing_project_mode
+            else test_runner.run(config, work_items, run_dir)
+        )
         with open(
             os.path.join(run_dir, "tests", "results", f"attempt-{attempt}.json"), "w"
         ) as f:

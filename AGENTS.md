@@ -104,6 +104,8 @@ Adapt the paths before running. This invokes real model calls; the subprocess/se
 
 Discover the extension at `agentCapabilities._meta["agents-pipeline"].runStatus.method` in `initialize`; it advertises `_agents-pipeline/run/status`. Pass the name **without** the leading underscore to Python's `conn.ext_method` (the SDK adds it); raw JSON-RPC uses the advertised name. Responses use `schema_version: 1`.
 
+New-project mode is the default. To edit an existing project, configure the fresh session before `prompt`: `await conn.ext_method("agents-pipeline/session/configure", {"sessionId": session_id, "mode": "existing_project", "projectPath": "/absolute/server/path/to/project"})`. `projectPath` must exist on the server filesystem. Edits happen in place; failures do not roll them back. Check the run's `changes.json` for additions/modifications/deletions and partial-edit warnings. Full behavior: [existing-project session configuration](docs/acp-integration.md#existing-project-session-configuration).
+
 - `status`: `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean passed.**
 - `outcome`: null until known, then `passed`, `failed`, `passed_with_test_failures` (advisory tests), `error`, `cancelled`, or `invalid_prompt`. A cancelled status can retain the underlying outcome; require `outcome == "passed"` for a clean pipeline pass and handle cancellation separately.
 - `queue_position`: one-based among waiting runs; null when active or not queued. `current_task`: null when no specialist is active. `run_id`: null until artifacts exist; otherwise an ID, not an absolute path.
@@ -125,6 +127,7 @@ With default directory settings, a run contains:
 - `tests/` — generated tests, plus `tests/results/` with per-attempt JSON results
 - `design/plan.json` — version-2 categorized, multi-file ownership/dependency plan with statuses and attempt details
 - `manifest.json` — run status, timestamps, attempt count, original prompt
+- Existing-project runs also include `changes.json` — detected project-relative additions, modifications, deletions, and a warning when the run fails
 - `instructions.md` — human-readable run summary
 
 `pipeline.output_dir` and `pipeline.tests_dir` configure the product/test directories. These files are on the server's own filesystem — not returned inline in the ACP response. Read them after `prompt` returns.

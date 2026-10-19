@@ -233,6 +233,7 @@ def dispatch_work_items(
 
     total = len(ordered)
     results: list[AgentResult] = []
+    dependency_root = config.get("pipeline", {}).get("_existing_project_path", run_dir)
     for index, item in enumerate(ordered, start=1):
         failed_dependencies = [
             dep_id for dep_id in item.depends_on
@@ -266,7 +267,7 @@ def dispatch_work_items(
             progress(item, index, total)
         agent = registry[item.category]
         retry_failures = (retry_context or {}).get(item.id, [])
-        dependency_context = build_dependency_context(item, results_by_id, run_dir)
+        dependency_context = build_dependency_context(item, results_by_id, dependency_root)
         result = agent.execute(
             item,
             config,
@@ -282,7 +283,12 @@ def dispatch_work_items(
                 number=len(item.attempts) + 1,
                 status="passed" if result.success else "failed",
                 files_written=list(result.files_written),
-                result_summary=f"Wrote {len(result.files_written)} file(s)" if result.success else "",
+                result_summary=(
+                    f"Wrote {len(result.files_written)} file(s); deleted {len(result.files_deleted)} file(s)"
+                    if result.success
+                    else ""
+                ),
+                files_deleted=list(result.files_deleted),
                 failure_details=(
                     result.notes
                     if not result.success

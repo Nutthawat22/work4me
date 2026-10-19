@@ -100,11 +100,33 @@ Use the interpreter from the venv you created in step 2.1 (it needs `agent-clien
 
 - Request: `cwd` (a working directory string — required by the ACP schema, but not otherwise consumed by this pipeline's own logic beyond being recorded on the session), optionally `additional_directories`, `mcp_servers`.
 - Response (`NewSessionResponse`): `session_id` — a fresh UUID-based identifier. You'll use this for the `prompt` call that follows.
+- New-project mode is the default. To edit an existing project, configure the new session with the extension below before its `prompt` call.
 
 **`prompt`** — sent once per session, with your task description.
 
 - Request: `session_id` (from `new_session`), `prompt` (a list of content blocks — see [3.3](#33-prompt-contract-v1)).
 - Response (`PromptResponse`): `stop_reason` — see [3.7](#37-final-response).
+
+#### Existing-project session configuration
+
+Existing-project mode is explicit and configured per session, leaving the current new-project behavior as the default. After `new_session`, but before its one `prompt`, call:
+
+```python
+await conn.ext_method(
+    "agents-pipeline/session/configure",
+    {
+        "sessionId": session_id,
+        "mode": "existing_project",
+        "projectPath": "/absolute/path/on/the/server/to/project",
+    },
+)
+```
+
+The extension is advertised at `agentCapabilities._meta["agents-pipeline"].sessionConfig.method` as `_agents-pipeline/session/configure`; Python SDK callers omit the leading underscore in `conn.ext_method`. `projectPath` must be an absolute path to an existing directory on the **server's filesystem** and must not overlap the pipeline's configured run-artifact directory. The server resolves it to a real path and rejects invalid locations. The option is accepted only while the session is new; configuration after the prompt starts is rejected. A new session without this call continues to use the existing generated-project mode.
+
+In existing-project mode, planning receives a bounded project tree/source context, and each specialist receives that context plus the current contents of its owned files (owned-file context is capped at 30,000 characters per file and 100,000 characters per task). Specialists update those files directly in the supplied project; they do not create an overlay or copy. Only planned owned paths may be written or intentionally deleted. Additions, modifications, and deletions are summarized in the run's `changes.json` and manifest. Symlink/path escapes, common generated/vendor directories, and overlap with the server's configured run-artifact directory are rejected. Change tracking excludes common generated/vendor/cache directories such as `.git`, `node_modules`, `venv`, build outputs, and test caches.
+
+Tests run from the target project's root and against its existing test tree. Existing-project runs require at least one matching automated test and treat test failures as blocking even when `pipeline.tests_blocking` is `false`, so an unvalidated edit cannot be reported as a clean pass. Edits are not rolled back on failure; check `changes.json` for the detected change set and treat a failed run's target as potentially partially edited.
 
 ### 3.3 Prompt contract (v1)
 
@@ -116,7 +138,7 @@ File-attachment support (e.g. passing a design document alongside a task prompt)
 
 ### 3.4 Session model
 
-**1 ACP session = 1 pipeline run.** Each `new_session` call, followed by exactly one `prompt` call on that session's `session_id`, produces one pipeline run. Calling `prompt` a second time on the same `session_id` raises an error (`invalid_params`, "session already used for a prompt"). To start another run, call `new_session` again to get a fresh `session_id`.
+**1 ACP session = 1 pipeline run.** Each `new_session` call, optional existing-project configuration, and exactly one `prompt` call on that session's `session_id` produces one pipeline run. Calling `prompt` a second time on the same `session_id` raises an error (`invalid_params`, "session already used for a prompt"). To start another run, call `new_session` again to get a fresh `session_id`.
 
 There is no multi-turn steering or follow-up prompting within a session.
 
@@ -144,21 +166,23 @@ With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {
   "queue_position": null,
   "tasks_total": 3,
   "tasks_started": 2,
-  "tasks_completed": 1,
-  "tasks_blocked": 0,
-  "current_task": {
-    "id": "TASK-auth",
-    "category": "feature",
-    "status": "running",
-    "attempt": 1
-  },
+    "tasks_completed": 1,
+    "tasks_blocked": 0,
+    "current_task": {
+      "id": "TASK-auth",
+      "category": "feature",
+      "status": "running",
+      "attempt": 1
+    },
   "attempt_round": 1,
   "max_attempts": 3,
-  "tests_blocking": true
+  "tests_blocking": true,
+  "mode": "existing_project",
+  "project_path": "/absolute/path/on/the/server/to/project"
 }
 ```
 
-`status` is `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean passed.** `phase` describes the current stage (`queued`, `planning`, `dispatch`, `testing`, `retrying`, `teardown`, and terminal/initial states). `outcome` is null until known, then `passed`, `failed`, `passed_with_test_failures`, `error`, `cancelled`, or `invalid_prompt`. A test failure with `tests_blocking: false` is reported as `passed_with_test_failures`, not as a clean pass. Require `outcome == "passed"` for a clean pipeline pass and handle cancellation separately: cancelled status can retain a known underlying outcome. `PromptResponse.stop_reason` remains a protocol turn status, not the pipeline outcome.
+`status` is `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean passed.** `phase` describes the current stage (`queued`, `planning`, `dispatch`, `testing`, `retrying`, `teardown`, and terminal/initial states). `outcome` is null until known, then `passed`, `failed`, `passed_with_test_failures`, `error`, `cancelled`, or `invalid_prompt`. A test failure with `tests_blocking: false` in new-project mode is reported as `passed_with_test_failures`, not as a clean pass. Existing-project mode always requires passing validation and reports validation failures as `failed`. Require `outcome == "passed"` for a clean pipeline pass and handle cancellation separately: cancelled status can retain a known underlying outcome. `PromptResponse.stop_reason` remains a protocol turn status, not the pipeline outcome.
 
 `queue_position` is one-based among waiting runs and null for the active run or a run without a queue ticket. Task counts describe specialist attempts: `tasks_total` counts planned work items; `tasks_started` counts attempts that began; `tasks_completed` counts attempts that returned passed or failed; retries increment these counters rather than resetting them, so completed attempts may exceed `tasks_total`. Dependency-blocked tasks are counted separately and do not count as started/completed attempts. `current_task` is null when no specialist task is active. `run_id` becomes available after run artifacts are created; `session_id` is available from session creation and remains the correlation key while queued.
 
@@ -257,6 +281,8 @@ Each pipeline run creates `<runs-root>/<run-id>/`. `pipeline.runs_dir` resolves 
 - **`manifest.json`** — run status (`passed`, `failed`, `passed_with_test_failures`, etc.), timestamps, attempt count, and the original prompt/label.
 - **`design/plan.json`** — version-2 task plan, explicit category and file ownership, dependencies, current task status, attempt results, and failure details.
 - **`instructions.md`** — a human-readable summary of the run.
+- Existing-project runs also include **`changes.json`** with project-relative `added`, `modified`, and `deleted` paths, a partial-edit warning on failure, and the resolved `project_path`. Run metadata remains under the pipeline server's configured run directory; it is not written into the target project by the pipeline.
+- In existing-project mode, actual product/test edits are in `project_path`; the run's `product/` and `tests/` directories remain part of the artifact layout and are not used as an overlay.
 
 This directory lives **on the server's filesystem**, at the configured location — it is not returned inline through ACP. If your automated flow needs the actual generated files (not just the streamed text summary), read them from this run directory after the `prompt` call returns.
 

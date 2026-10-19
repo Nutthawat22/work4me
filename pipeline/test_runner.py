@@ -60,6 +60,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 from pipeline.state import TestFailure, TestResult, WorkItem
+from pipeline.project_context import IGNORED_DIRECTORIES
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -67,27 +68,39 @@ MAX_ERROR_OUTPUT_LEN = 2000
 
 
 class TestRunner:
-    def run(self, config: dict, work_items: list[WorkItem], run_dir: str) -> TestResult:
+    def run(
+        self,
+        config: dict,
+        work_items: list[WorkItem],
+        run_dir: str,
+        *,
+        require_tests: bool = False,
+    ) -> TestResult:
         """
         Run each language's test suite that's actually represented in
         work_items, then merge results.
 
         For each unique WorkItem.language, look up config["languages"][language],
-        check whether any files under run_dir/config["pipeline"]["tests_dir"]
-        match that language's test_file_patterns, and if so run that
-        language's test_command. Languages with no matching test files
-        contribute nothing (not a failure). If no language across the
-        whole run has any test files, behavior matches the old no-tests
-        case: passed=True, total=0, failures=[].
+        check whether files under the run's tests directory (new-project
+        mode) or the existing project root match that language's
+        test_file_patterns, and run the configured command when they do.
+        New-project runs preserve the passing no-tests behavior; callers
+        can require a matching suite for existing-project validation.
 
         Args:
             run_dir: Path to this pipeline run's output directory (see
                 pipeline/run_paths.py). config["pipeline"]["tests_dir"]
                 and config["pipeline"]["output_dir"] are resolved relative
-                to run_dir, not PROJECT_ROOT.
+                to run_dir in new-project mode. Existing-project mode uses
+                the configured project root for both paths and subprocess cwd.
         """
-        tests_dir = os.path.join(run_dir, config["pipeline"]["tests_dir"])
-        output_dir = os.path.join(run_dir, config["pipeline"]["output_dir"])
+        project_root = config["pipeline"].get("_existing_project_path")
+        if project_root:
+            tests_dir = project_root
+            output_dir = project_root
+        else:
+            tests_dir = os.path.join(run_dir, config["pipeline"]["tests_dir"])
+            output_dir = os.path.join(run_dir, config["pipeline"]["output_dir"])
         languages_config = config.get("languages", {})
 
         seen_languages: list[str] = []
@@ -109,10 +122,28 @@ class TestRunner:
                 continue
 
             ran_results.append(
-                self._run_language_suite(language, lang_config, tests_dir, output_dir)
+                self._run_language_suite(
+                    language, lang_config, tests_dir, output_dir, project_mode=bool(project_root)
+                )
             )
 
         if not ran_results:
+            if require_tests:
+                return TestResult(
+                    passed=False,
+                    total=0,
+                    failed=0,
+                    failures=[
+                        TestFailure(
+                            test_name="<no project tests found>",
+                            work_item_id="",
+                            error_output=(
+                                "Existing-project mode requires an automated test suite "
+                                "for the planned task languages; no matching tests were found."
+                            ),
+                        )
+                    ],
+                )
             return TestResult(passed=True, total=0, failed=0, failures=[])
 
         total = sum(r.total for r in ran_results)
@@ -123,7 +154,13 @@ class TestRunner:
         return TestResult(passed=passed, total=total, failed=failed, failures=failures)
 
     def _run_language_suite(
-        self, language: str, lang_config: dict, tests_dir: str, output_dir: str
+        self,
+        language: str,
+        lang_config: dict,
+        tests_dir: str,
+        output_dir: str,
+        *,
+        project_mode: bool = False,
     ) -> TestResult:
         result_format = lang_config.get("result_format")
         test_command = lang_config["test_command"]
@@ -169,13 +206,13 @@ class TestRunner:
 
         command = [token.format(**format_context) for token in test_command]
 
-        # jest/vitest must run from the run's own product dir (output_dir):
-        # that's where package.json, jest.config.js/vitest config, and
-        # node_modules live — the repo root (PROJECT_ROOT) has none of
-        # that, so jest/vitest would hang trying to resolve themselves.
-        # pytest keeps using PROJECT_ROOT since it already works via the
-        # absolute tests_dir path plus PYTHONPATH=output_dir above.
-        run_cwd = output_dir if result_format in ("jest_json", "vitest_json") else PROJECT_ROOT
+        # New-project jest/vitest runs from product_dir; existing-project
+        # suites of every supported language run from the target project.
+        run_cwd = (
+            output_dir
+            if project_mode or result_format in ("jest_json", "vitest_json")
+            else PROJECT_ROOT
+        )
 
         if result_format in ("jest_json", "vitest_json"):
             install_failure = self._ensure_node_modules_installed(
@@ -240,12 +277,9 @@ class TestRunner:
         self, language: str, test_command: list[str], output_dir: str, env: dict
     ) -> TestResult | None:
         """
-        Before running jest/vitest, make sure output_dir (the run's
-        product dir) actually has node_modules installed — a fresh run's
-        generated package.json has never had `npm install`/`bun install`
-        run against it, so node_modules simply doesn't exist yet and
-        jest/vitest would fail immediately (or, pre-cwd-fix, hang trying
-        to resolve themselves from the repo root instead).
+        Before running jest/vitest, make sure output_dir has node_modules
+        installed. In new-project mode this is the generated product dir;
+        in existing-project mode it is the caller's target project.
 
         Toolchain choice mirrors pipeline/instructions.py's `uses_bun`
         heuristic: bun if the configured test_command itself invokes
@@ -333,7 +367,11 @@ class TestRunner:
     def _find_test_files(tests_dir: str, patterns: list[str]) -> bool:
         if not patterns:
             return False
-        for root, _dirs, files in os.walk(tests_dir):
+        for root, dirs, files in os.walk(tests_dir, followlinks=False):
+            dirs[:] = [
+                name for name in dirs
+                if name not in IGNORED_DIRECTORIES and not os.path.islink(os.path.join(root, name))
+            ]
             for name in files:
                 for pattern in patterns:
                     if fnmatch.fnmatch(name, pattern):

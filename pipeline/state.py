@@ -32,6 +32,7 @@ class TaskAttempt:
     files_written: list[str] = field(default_factory=list)
     result_summary: str = ""
     failure_details: str = ""
+    files_deleted: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -61,6 +62,7 @@ class AgentResult:
     success: bool
     files_written: list[str]         # relative paths
     notes: str = ""                  # agent commentary, warnings
+    files_deleted: list[str] = field(default_factory=list)
 
 
 # ── Test Result ──────────────────────────────────────────────────────────────
