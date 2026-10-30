@@ -4,7 +4,7 @@ src/specialists/shared.py
 SharedAgent: implements shared modules and contracts with one task owner.
 """
 
-from pipeline.state import AgentResult, TestFailure, WorkItem
+from pipeline.state import AgentResult, ValidationIssue, WorkItem
 from specialists.base import run_multifile_specialist
 
 SYSTEM_PROMPT = (
@@ -23,7 +23,7 @@ class SharedAgent:
         work_item: WorkItem,
         config: dict,
         run_dir: str,
-        retry_failures: list[TestFailure] | None = None,
+        retry_failures: list[ValidationIssue] | None = None,
         dependency_context: dict[str, str] | None = None,
     ) -> AgentResult:
         return run_multifile_specialist(

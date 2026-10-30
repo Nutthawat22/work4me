@@ -13,8 +13,8 @@ Absorbs the three planning methods formerly on the separate
   adapts architecture-grouped ownership into the same task model.
 
 Also retains Master's pre-existing (Phase 3, pre-rearchitecture)
-responsibilities: mapping test failures back to WorkItem ids
-(map_failures_to_work_items) and building the final FailReport
+responsibilities: mapping static validation issues back to WorkItem ids
+(map_validation_issues_to_work_items) and building the final FailReport
 (build_fail_report) when retries are exhausted.
 
 All LLM calls in this module route through
@@ -45,8 +45,8 @@ from pipeline.state import (
     Feature,
     FileManifest,
     OwnedFile,
-    TestFailure,
-    TestResult,
+    ValidationIssue,
+    ValidationResult,
     TaskAttempt,
     WorkItem,
 )
@@ -1047,23 +1047,19 @@ class MasterAgent:
 
         return features
 
-    def map_failures_to_work_items(
+    def map_validation_issues_to_work_items(
         self,
-        test_result: TestResult,
+        validation_result: ValidationResult,
         agent_results: list[AgentResult],
         work_items: list[WorkItem],
-    ) -> dict[str, list[TestFailure]]:
+      ) -> dict[str, list[ValidationIssue]]:
         """
         Resolve failing output files to their owning tasks. Validation-task
         failures also retry their declared implementation dependencies; any
         changed task then pulls in downstream dependents whose outputs may be
         stale. Unrelated successful tasks stay out of the retry subset.
 
-        Convention (must match pipeline/test_runner.py): TestFailure.test_name
-        is f"{file_path}::{classname}::{name}" — the file path is the first
-        "::"-delimited segment.
-
-        Returns a map from retry task id to its directly associated test
+        Returns a map from retry task id to its directly associated validation
         failures. Tasks added for repair have empty lists.
         """
         by_id = {item.id: item for item in work_items}
@@ -1074,23 +1070,26 @@ class MasterAgent:
             for path in result.files_written:
                 reverse_map[os.path.normcase(os.path.normpath(path))] = result.work_item_id
 
-        retry_failures: dict[str, list[TestFailure]] = {}
+        retry_failures: dict[str, list[ValidationIssue]] = {}
 
         for result in agent_results:
             item = by_id.get(result.work_item_id)
             if item is not None and item.status == "failed":
                 retry_failures.setdefault(item.id, [])
 
-        for failure in test_result.failures:
-            file_path = failure.test_name.split("::", 1)[0]
+        for failure in validation_result.errors:
+            file_path = failure.file_path
             normalized = os.path.normcase(os.path.normpath(file_path))
 
-            work_item_id = reverse_map.get(normalized)
+            work_item_id = (
+                failure.work_item_id
+                if failure.work_item_id in by_id
+                else reverse_map.get(normalized)
+            )
 
             if work_item_id is None:
-                # Fallback: endswith matching, handles relative vs
-                # project-root-relative path discrepancies between how
-                # pytest reports the file and how it's stored in the map.
+                # Fallback handles relative vs project-root-relative path
+                # differences between validation findings and recorded outputs.
                 matches = {
                     mapped_id
                     for mapped_path, mapped_id in reverse_map.items()
@@ -1101,8 +1100,7 @@ class MasterAgent:
 
             if work_item_id is None:
                 # Couldn't resolve — skip retry-targeting for this failure,
-                # but the raw failure still surfaces in the FailReport via
-                # test_result.failures regardless.
+                # but the raw finding still surfaces in the FailReport.
                 continue
 
             retry_failures.setdefault(work_item_id, []).append(failure)
@@ -1124,7 +1122,7 @@ class MasterAgent:
     def build_fail_report(
         self,
         run_number: int,
-        test_result: TestResult,
+        validation_result: ValidationResult,
         unresolved_work_item_ids: list[str],
     ) -> FailReport:
         """
@@ -1136,14 +1134,14 @@ class MasterAgent:
         notes.
         """
         summary = (
-            f"{test_result.failed} of {test_result.total} tests failed "
+            f"{len(validation_result.errors)} static validation error(s) "
             f"across {len(unresolved_work_item_ids)} unresolved work "
             f"item(s) after exhausting retries."
         )
 
         return FailReport(
             run_number=run_number,
-            failures=test_result.failures,
+            failures=validation_result.errors,
             unresolved_items=unresolved_work_item_ids,
             summary=summary,
         )

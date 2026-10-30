@@ -2,7 +2,7 @@
 src/pipeline/state.py
 
 Data structures shared across the agentic pipeline: WorkItem, AgentResult,
-TestResult, TestFailure, ReviewResult, FailReport, PipelineState.
+ValidationResult, ValidationIssue, ReviewResult, FailReport, PipelineState.
 
 See docs/task-workflow.md for the active task model and run artifact contract.
 """
@@ -65,21 +65,23 @@ class AgentResult:
     files_deleted: list[str] = field(default_factory=list)
 
 
-# ── Test Result ──────────────────────────────────────────────────────────────
+# ── Static Validation ────────────────────────────────────────────────────────
 
 @dataclass
-class TestFailure:
-    test_name: str
-    work_item_id: str                # which acceptance criterion failed
-    error_output: str                # raw pytest stderr/stdout for this test
+class ValidationIssue:
+    file_path: str
+    work_item_id: str
+    error_output: str
+    severity: Literal["error", "warning"] = "error"
 
 
 @dataclass
-class TestResult:
+class ValidationResult:
     passed: bool
-    total: int
-    failed: int
-    failures: list[TestFailure]
+    checked_files: int
+    errors: list[ValidationIssue] = field(default_factory=list)
+    warnings: list[ValidationIssue] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
 
 
 # ── Review Result ────────────────────────────────────────────────────────────
@@ -103,7 +105,7 @@ class ReviewResult:
 @dataclass
 class FailReport:
     run_number: int
-    failures: list[TestFailure]
+    failures: list[ValidationIssue]
     unresolved_items: list[str]      # WorkItem ids that still fail after max retries
     summary: str                     # human-readable produced by MasterAgent
 
@@ -180,7 +182,7 @@ class PipelineState:
     intent: str                      # MasterAgent's parsed intent
     work_items: list[WorkItem] = field(default_factory=list)
     agent_results: list[AgentResult] = field(default_factory=list)
-    test_results: list[TestResult] = field(default_factory=list)
+    validation_results: list[ValidationResult] = field(default_factory=list)
     retry_count: int = 0
     max_retries: int = 3
     status: Literal["running", "passed", "failed"] = "running"

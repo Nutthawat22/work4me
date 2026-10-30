@@ -19,7 +19,7 @@ import json
 import os
 import re
 
-from pipeline.state import AgentResult, ReviewResult, TestFailure, WorkItem
+from pipeline.state import AgentResult, ReviewResult, ValidationIssue, WorkItem
 from pipeline.project_context import IGNORED_DIRECTORIES
 from pipeline.task_validation import normalize_relative_path, truncate_with_marker
 from specialists.llm_client import call_llm
@@ -115,22 +115,21 @@ def _strip_code_fences(raw: str) -> str:
     return stripped
 
 
-def _build_retry_section(retry_failures: list[TestFailure]) -> str:
+def _build_retry_section(retry_failures: list[ValidationIssue]) -> str:
     """Build the '\\n\\nThis is a retry...' prompt section from the
     failures that implicated this WorkItem. Truncates each failure's
     error_output and caps the number of failures shown, to avoid
     bloating context."""
     shown = retry_failures[:MAX_RETRY_FAILURES_SHOWN]
     lines = [
-        f"- {failure.test_name}: "
+        f"- {failure.file_path}: "
         f"{failure.error_output[:MAX_ERROR_OUTPUT_CHARS_IN_PROMPT]}"
         for failure in shown
     ]
     return (
-        "\n\nThis is a retry. The previous implementation failed these "
-        "tests:\n"
+        "\n\nThis is a retry. Static validation reported these issues:\n"
         + "\n".join(lines)
-        + "\n\nFix the implementation so these tests pass, while still "
+        + "\n\nFix the reported validation errors, while still "
         "satisfying all acceptance criteria above."
     )
 
@@ -399,7 +398,7 @@ def run_multifile_specialist(
     run_dir: str,
     system_prompt: str,
     agent_name: str,
-    retry_failures: list[TestFailure] | None = None,
+    retry_failures: list[ValidationIssue] | None = None,
     dependency_context: dict[str, str] | None = None,
 ) -> AgentResult:
     """

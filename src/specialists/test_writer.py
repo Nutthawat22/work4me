@@ -1,6 +1,6 @@
 """ValidationAgent: writes task-owned automated validation assets."""
 
-from pipeline.state import AgentResult, TestFailure, WorkItem
+from pipeline.state import AgentResult, ValidationIssue, WorkItem
 from specialists.base import run_multifile_specialist
 
 SYSTEM_PROMPT = (
@@ -26,7 +26,7 @@ class ValidationAgent:
         work_item: WorkItem,
         config: dict,
         run_dir: str,
-        retry_failures: list[TestFailure] | None = None,
+        retry_failures: list[ValidationIssue] | None = None,
         dependency_context: dict[str, str] | None = None,
     ) -> AgentResult:
         system_prompt = build_system_prompt(work_item, config)

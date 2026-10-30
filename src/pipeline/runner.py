@@ -10,10 +10,12 @@ Usage: python src/pipeline/runner.py
 import copy
 import dataclasses
 import json
+import logging
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from types import TracebackType
 from typing import Callable
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -32,8 +34,9 @@ from pipeline.project_context import (
     summarize_project_changes,
     validate_project_path,
 )
-from pipeline.state import AgentResult, FailReport, TaskAttempt, TestResult, WorkItem
-from pipeline.test_runner import TestRunner
+from pipeline.state import AgentResult, FailReport, TaskAttempt, ValidationResult, WorkItem
+from pipeline.static_validator import StaticValidator
+from pipeline.testing_handoff import write_testing_handoff
 from specialists.providers import acp_client
 
 
@@ -140,7 +143,7 @@ def print_fail_report(report: FailReport) -> None:
     print()
     print("Failures:")
     for failure in report.failures:
-        print(f"  ✗ {failure.test_name}")
+        print(f"  ✗ {failure.file_path}")
         if failure.error_output:
             for line in failure.error_output.splitlines():
                 print(f"    {line}")
@@ -148,6 +151,203 @@ def print_fail_report(report: FailReport) -> None:
     print("Summary:")
     print(f"  {report.summary}")
     print("═" * 50)
+
+
+def _write_testing_handoff_safely(config: dict, run_dir: str) -> bool:
+    try:
+        write_testing_handoff(config, run_dir)
+        return True
+    except Exception:
+        logging.exception(
+            "Testing handoff artifact generation failed for run %s",
+            os.path.basename(run_dir),
+        )
+        for filename in ("testing-handoff.json", "testing-handoff.md"):
+            artifact_path = os.path.join(run_dir, filename)
+            try:
+                if os.path.lexists(artifact_path):
+                    os.unlink(artifact_path)
+            except OSError:
+                logging.exception(
+                    "Could not remove incomplete testing handoff artifact %s",
+                    filename,
+                )
+        return False
+
+
+def _finalize_pipeline_run(
+    config: dict,
+    run_dir: str,
+    *,
+    project_root: str | None,
+    baseline: dict[str, str] | None,
+    run_failed: bool,
+    result: bool,
+    pipeline_exception: tuple[BaseException, TracebackType | None] | None,
+    progress: Callable[[dict[str, object]], None] | None,
+) -> tuple[bool, tuple[BaseException, TracebackType | None] | None]:
+    pipeline_config = config["pipeline"]
+    if project_root is not None and baseline is not None:
+        try:
+            _finalize_existing_project_changes(
+                run_dir,
+                project_root,
+                baseline,
+                (pipeline_config.get("_protected_run_root", ""),),
+                failed=run_failed,
+            )
+        except Exception as error:
+            run_failed = True
+            result = False
+            logging.exception(
+                "Existing-project change finalization failed for run %s",
+                os.path.basename(run_dir),
+            )
+            if pipeline_exception is None:
+                pipeline_exception = (error, error.__traceback__)
+
+    manifest_path = os.path.join(run_dir, "manifest.json")
+    manifest: dict[str, object] = {}
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+            loaded_manifest = json.load(manifest_file)
+        if isinstance(loaded_manifest, dict):
+            manifest = loaded_manifest
+    except Exception as error:
+        run_failed = True
+        result = False
+        logging.exception(
+            "Could not read run manifest while finalizing run %s",
+            os.path.basename(run_dir),
+        )
+        if pipeline_exception is None:
+            pipeline_exception = (error, error.__traceback__)
+
+    if pipeline_exception is not None:
+        manifest.update(
+            status="failed",
+            failure_reason="pipeline_exception",
+            validation_status=manifest.get("validation_status", "not_completed"),
+            external_testing_status="pending",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+    elif manifest.get("status") == "in_progress":
+        manifest.update(
+            status="failed",
+            failure_reason="pipeline_exception",
+            validation_status="not_completed",
+            external_testing_status="pending",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        run_failed = True
+        result = False
+
+    candidate_status = str(manifest.get("status", "failed"))
+    if result and candidate_status == "validation_passed_external_testing_pending":
+        manifest["status"] = "finalizing"
+        try:
+            write_manifest(run_dir, manifest)
+        except Exception as error:
+            run_failed = True
+            result = False
+            candidate_status = "failed"
+            manifest.update(
+                status="failed",
+                failure_reason="manifest_finalization_failure",
+            )
+            logging.exception(
+                "Could not stage final run manifest for run %s",
+                os.path.basename(run_dir),
+            )
+            if pipeline_exception is None:
+                pipeline_exception = (error, error.__traceback__)
+
+    pipeline_config["_testing_handoff_pipeline_status"] = candidate_status
+    handoff_written = _write_testing_handoff_safely(config, run_dir)
+    pipeline_config.pop("_testing_handoff_pipeline_status", None)
+    manifest["testing_handoff_status"] = "written" if handoff_written else "failed"
+    if not handoff_written:
+        run_failed = True
+        if candidate_status == "validation_passed_external_testing_pending":
+            result = False
+            manifest.update(
+                status="failed",
+                failure_reason="testing_handoff_failure",
+            )
+        manifest["testing_handoff_warning"] = (
+            "Required testing handoff artifacts are incomplete; see pipeline logs."
+        )
+        print(
+            "⚠️ Required testing handoff artifacts are incomplete; "
+            "the run is not reported as successful.",
+            file=sys.stderr,
+        )
+    else:
+        if candidate_status == "validation_passed_external_testing_pending":
+            manifest["status"] = candidate_status
+        manifest.pop("testing_handoff_warning", None)
+
+    finalization_failed = False
+    try:
+        write_manifest(run_dir, manifest)
+    except Exception:
+        run_failed = True
+        result = False
+        finalization_failed = True
+        manifest["status"] = "failed"
+        manifest.setdefault("failure_reason", "manifest_finalization_failure")
+        logging.exception(
+            "Could not write finalized run manifest for run %s",
+            os.path.basename(run_dir),
+        )
+
+    try:
+        runs_dir = resolve_project_path(pipeline_config["runs_dir"])
+        append_index(runs_dir, manifest)
+    except Exception:
+        run_failed = True
+        result = False
+        finalization_failed = True
+        manifest["status"] = "failed"
+        manifest.setdefault("failure_reason", "run_index_finalization_failure")
+        logging.exception(
+            "Could not append finalized run index entry for run %s",
+            os.path.basename(run_dir),
+        )
+        try:
+            write_manifest(run_dir, manifest)
+        except Exception:
+            logging.exception(
+                "Could not correct run manifest after index failure for run %s; "
+                "the on-disk manifest may still report a completed workflow",
+                os.path.basename(run_dir),
+            )
+
+    if progress is not None:
+        try:
+            progress({
+                "run_id": manifest.get("run_id", os.path.basename(run_dir)),
+                "phase": "teardown",
+                "outcome": (
+                    "failed"
+                    if finalization_failed
+                    or (
+                        not result
+                        and candidate_status == "validation_passed_external_testing_pending"
+                    )
+                    else candidate_status
+                ),
+                "validation_status": manifest.get("validation_status", "not_completed"),
+                "external_testing_status": manifest.get("external_testing_status", "pending"),
+                "testing_handoff_status": manifest["testing_handoff_status"],
+            })
+        except Exception as error:
+            logging.exception(
+                "Could not publish final pipeline progress for run %s",
+                os.path.basename(run_dir),
+            )
+
+    return result, pipeline_exception
 
 
 def run_pipeline(
@@ -161,15 +361,15 @@ def run_pipeline(
 ) -> bool:
     """
     Run one full pipeline pass end-to-end (run-dir creation -> decompose
-    -> dispatch -> test/retry -> manifest finalize), driven either by a
+    -> dispatch -> static validation/repair -> manifest finalize), driven either by a
     raw free-text prompt (REPL path, routed through
     MasterAgent.decompose) or a pre-built WorkItem list (e.g. an
     ingestion tool — pipeline/ingest.py — that already called
     MasterAgent.plan_handoff()). Exactly one of user_input / work_items
     must be given.
 
-    This is a pure extraction of the former REPL while-loop body in
-    main() — no behavioral change for the REPL path.
+    Free-text planning, specialist dispatch, and deterministic static
+    validation run here. Generated-project tests/builds remain external.
 
     Args:
         config: Loaded pipeline config (see load_config()).
@@ -182,17 +382,15 @@ def run_pipeline(
             Required when work_items is given, since there's no raw
             prompt string to derive it from.
         existing_project_path: Optional absolute server-side project
-            directory. When set, specialists edit its owned files in place
-            and tests execute against that project; run artifacts remain
-            under pipeline.runs_dir.
+            directory. When set, specialists edit its owned files in place;
+            run artifacts remain under pipeline.runs_dir.
         progress: Optional structured progress callback. Completed task
             counts represent specialist attempts; retries add to the count.
 
     Returns:
-        True if the run's tests ultimately passed, False otherwise
-        (MasterPlanError, a dependency-cycle CycleError, or test
-        failures surviving all retries all count as False) — callers
-        can use this directly as a process exit-code signal.
+        True if planning, specialist dispatch, static validation, and both
+        required testing-handoff artifacts completed successfully. False
+        indicates pipeline, validation, or handoff artifact failure.
     """
     if (user_input is None) == (work_items is None):
         raise ValueError(
@@ -208,6 +406,8 @@ def run_pipeline(
     project_root: str | None = None
     baseline: dict[str, str] | None = None
     run_failed = False
+    result = False
+    pipeline_exception: tuple[BaseException, TracebackType | None] | None = None
     try:
         if existing_project_path is not None:
             run_config = copy.deepcopy(config)
@@ -219,31 +419,49 @@ def run_pipeline(
             pipeline_config["_existing_project_path"] = project_root
             pipeline_config["_existing_project_context"] = context
             pipeline_config["_protected_run_root"] = runs_root
-            # Existing-project changes must have passing automated validation;
-            # advisory-only test failures cannot produce a clean edit-mode pass.
-            pipeline_config["tests_blocking"] = True
+            pipeline_config["_existing_project_baseline"] = baseline
         result = _run_pipeline_body(run_config, user_input, work_items, label, progress)
         if not result:
             run_failed = True
-        return result
-    except BaseException:
+    except BaseException as error:
         run_failed = True
-        raise
+        pipeline_exception = (error, error.__traceback__)
+
+    try:
+        active_run_dir = run_config["pipeline"].get("_active_run_dir")
+        if active_run_dir:
+            try:
+                result, pipeline_exception = _finalize_pipeline_run(
+                    run_config,
+                    active_run_dir,
+                    project_root=project_root,
+                    baseline=baseline,
+                    run_failed=run_failed,
+                    result=result,
+                    pipeline_exception=pipeline_exception,
+                    progress=progress,
+                )
+            except BaseException as error:
+                logging.exception(
+                    "Unexpected run finalization failure for %s",
+                    os.path.basename(active_run_dir),
+                )
+                if pipeline_exception is None:
+                    pipeline_exception = (error, error.__traceback__)
+            finally:
+                run_config["pipeline"].pop("_testing_handoff_pipeline_status", None)
     finally:
         try:
-            if project_root is not None:
-                pipeline_config = run_config["pipeline"]
-                active_run_dir = pipeline_config.get("_active_run_dir")
-                if active_run_dir and baseline is not None:
-                    _finalize_existing_project_changes(
-                        active_run_dir,
-                        project_root,
-                        baseline,
-                        (pipeline_config.get("_protected_run_root", ""),),
-                        failed=run_failed,
-                    )
-        finally:
             acp_client.teardown()
+        except BaseException as error:
+            logging.exception("ACP teardown failed")
+            if pipeline_exception is None:
+                pipeline_exception = (error, error.__traceback__)
+
+    if pipeline_exception is not None:
+        error, traceback = pipeline_exception
+        raise error.with_traceback(traceback)
+    return result
 
 
 def _finalize_existing_project_changes(
@@ -273,6 +491,8 @@ def _finalize_existing_project_changes(
         if failed and manifest.get("status") == "in_progress":
             manifest["status"] = "failed"
             manifest["failure_reason"] = "pipeline_exception"
+            manifest["validation_status"] = "not_completed"
+            manifest["external_testing_status"] = "pending"
             manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
 
     summary = {
@@ -299,36 +519,22 @@ def _run_pipeline_body(
     progress: Callable[[dict[str, object]], None] | None = None,
 ) -> bool:
     """
-    The actual run_pipeline() body, extracted so run_pipeline() can wrap
-    it in a try/finally that unconditionally tears down the ACP session
-    pool (specialists.providers.acp_client) on every exit path — success,
-    test-failure, MasterPlanError, or CycleError — without needing to
-    duplicate the teardown call at each early return. See run_pipeline()
-    for the public contract; this function's behavior/return value is
-    identical to the pre-extraction run_pipeline() body.
+    The work body writes run artifacts and candidate status. The public
+    wrapper finalizes handoff artifacts, manifest, run index, progress, and
+    ACP teardown before returning.
     """
     master = MasterAgent(config)
     master.set_intent(label)
 
     runs_dir_abs = resolve_project_path(config["pipeline"]["runs_dir"])
     run_dir = create_run_dir(runs_dir_abs, label)
-    if config["pipeline"].get("_existing_project_path"):
-        config["pipeline"]["_active_run_dir"] = run_dir
+    config["pipeline"]["_active_run_dir"] = run_dir
     run_id = os.path.basename(run_dir)
     print(f"\n📁 Run dir: {run_dir}\n")
 
-    # tests_blocking defaults to True (absent key == today's behavior):
-    # explicit False makes test-*content* failures advisory-only for the
-    # run's final pass/fail decision and the retry loop's test-driven
-    # trigger — it does NOT touch the vacuous-pass guard further down
-    # (specialist dispatch failures always block, regardless of this
-    # flag). See _run_pipeline_body's retry loop and final decision
-    # block below for where this is actually consumed.
-    tests_blocking = config["pipeline"].get("tests_blocking", True)
-
     def report(**updates: object) -> None:
         if progress is not None:
-            progress({"run_id": run_id, "tests_blocking": tests_blocking, **updates})
+            progress({"run_id": run_id, **updates})
 
     report(phase="planning")
 
@@ -338,7 +544,8 @@ def _run_pipeline_body(
         "created_at": datetime.now(timezone.utc).isoformat(),
         "work_item_count": None,
         "status": "in_progress",
-        "tests_blocking": tests_blocking,
+        "validation_status": "pending",
+        "external_testing_status": "pending",
     }
     existing_project_path = config["pipeline"].get("_existing_project_path")
     if existing_project_path:
@@ -357,13 +564,13 @@ def _run_pipeline_body(
             print(f"\n⚠️  MasterAgent failed to produce a valid plan: {e}\n")
             manifest["status"] = "failed"
             manifest["failure_reason"] = "design_parse_error"
+            manifest["validation_status"] = "not_completed"
+            manifest["external_testing_status"] = "pending"
             manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
             write_manifest(run_dir, manifest)
-            append_index(runs_dir_abs, manifest)
             write_instructions_md(
                 run_dir, config, [], [], None, "design_parse_error"
             )
-            report(phase="teardown", outcome="failed")
             return False
 
     try:
@@ -372,11 +579,11 @@ def _run_pipeline_body(
         print(f"\n⚠️  Invalid task plan: {e}\n")
         manifest["status"] = "failed"
         manifest["failure_reason"] = "task_plan_invalid"
+        manifest["validation_status"] = "not_completed"
+        manifest["external_testing_status"] = "pending"
         manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
         write_manifest(run_dir, manifest)
-        append_index(runs_dir_abs, manifest)
         write_instructions_md(run_dir, config, [], [], None, "task_plan_invalid")
-        report(phase="teardown", outcome="failed")
         return False
 
     manifest["work_item_count"] = len(work_items)
@@ -434,13 +641,13 @@ def _run_pipeline_body(
         print(f"\n⚠️  Dispatch failed — dependency cycle: {e}\n")
         manifest["status"] = "failed"
         manifest["failure_reason"] = "dispatch_cycle_error"
+        manifest["validation_status"] = "not_completed"
+        manifest["external_testing_status"] = "pending"
         manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
         write_manifest(run_dir, manifest)
-        append_index(runs_dir_abs, manifest)
         write_instructions_md(
             run_dir, config, work_items, [], None, "dispatch_cycle_error"
         )
-        report(phase="teardown", outcome="failed")
         return False
 
     _sync_task_results(work_items, agent_results, attempts_before)
@@ -453,49 +660,46 @@ def _run_pipeline_body(
     print()
 
     max_retries = config["pipeline"]["max_retries"]
-    test_runner = TestRunner()
+    validator = StaticValidator()
 
     current_work_items = work_items
     all_agent_results: list[AgentResult] = list(agent_results)
-    report(phase="testing", task=None, attempt_round=1)
-    existing_project_mode = bool(config["pipeline"].get("_existing_project_path"))
-    test_result: TestResult = (
-        test_runner.run(config, work_items, run_dir, require_tests=True)
-        if existing_project_mode
-        else test_runner.run(config, work_items, run_dir)
+    report(phase="static_validation", task=None, attempt_round=1)
+    validation_result: ValidationResult = validator.run(
+        config, work_items, run_dir, all_agent_results
     )
 
     attempt = 1
     with open(
-        os.path.join(run_dir, "tests", "results", f"attempt-{attempt}.json"), "w"
+        os.path.join(run_dir, "validation", "results", f"attempt-{attempt}.json"), "w"
     ) as f:
-        json.dump(dataclasses.asdict(test_result), f, indent=2)
+        json.dump(dataclasses.asdict(validation_result), f, indent=2)
 
     print(
-        f"Test run (attempt {attempt}): "
-        f"{test_result.total - test_result.failed}/{test_result.total} passed"
+        f"Static validation (attempt {attempt}): "
+        f"{validation_result.checked_files} file(s) checked, "
+        f"{len(validation_result.errors)} error(s), "
+        f"{len(validation_result.warnings)} warning(s)"
     )
+    for warning in validation_result.warnings:
+        print(f"  ⚠️ {warning.file_path}: {warning.error_output}")
+    for limitation in validation_result.limitations:
+        print(f"  ℹ️ Validation limitation: {limitation}")
     print()
 
     while attempt < max_retries:
-        # Test-content failures trigger retries only when blocking is enabled;
-        # failed task executions always retry regardless of that setting.
         unresolved_specialist_ids = {
             r.work_item_id
             for r in _final_agent_results_by_work_item(all_agent_results)
             if not r.success
         }
-        should_retry = (
-            (not test_result.passed or bool(unresolved_specialist_ids))
-            if tests_blocking
-            else bool(unresolved_specialist_ids)
-        )
+        should_retry = not validation_result.passed or bool(unresolved_specialist_ids)
 
         if not should_retry:
             break
 
-        retry_context = master.map_failures_to_work_items(
-            test_result, all_agent_results, work_items
+        retry_context = master.map_validation_issues_to_work_items(
+            validation_result, all_agent_results, work_items
         )
         if not retry_context:
             print("⚠️  Could not map any failures to WorkItems — stopping retries.\n")
@@ -532,78 +736,68 @@ def _run_pipeline_body(
 
         all_agent_results.extend(retry_results)
 
-        report(phase="testing", task=None, attempt_round=attempt)
-        test_result = (
-            test_runner.run(config, work_items, run_dir, require_tests=True)
-            if existing_project_mode
-            else test_runner.run(config, work_items, run_dir)
+        report(phase="static_validation", task=None, attempt_round=attempt)
+        validation_result = validator.run(
+            config, work_items, run_dir, all_agent_results
         )
         with open(
-            os.path.join(run_dir, "tests", "results", f"attempt-{attempt}.json"), "w"
+            os.path.join(run_dir, "validation", "results", f"attempt-{attempt}.json"), "w"
         ) as f:
-            json.dump(dataclasses.asdict(test_result), f, indent=2)
+            json.dump(dataclasses.asdict(validation_result), f, indent=2)
 
         print(
-            f"Test run (attempt {attempt}): "
-            f"{test_result.total - test_result.failed}/{test_result.total} passed"
+            f"Static validation (attempt {attempt}): "
+            f"{validation_result.checked_files} file(s) checked, "
+            f"{len(validation_result.errors)} error(s), "
+            f"{len(validation_result.warnings)} warning(s)"
         )
+        for warning in validation_result.warnings:
+            print(f"  ⚠️ {warning.file_path}: {warning.error_output}")
+        for limitation in validation_result.limitations:
+            print(f"  ℹ️ Validation limitation: {limitation}")
         print()
 
-    # test_result.passed alone isn't sufficient evidence of a real pass:
-    # TestRunner.run() returns passed=True, total=0 both when a run
-    # legitimately needed no tests (fine) AND when every specialist
-    # failed before writing anything, so no test files existed to run
-    # (NOT fine — see _final_agent_results_by_work_item's docstring).
-    # TestResult has no visibility into AgentResults, so this
-    # combination has to be checked here, where both are in scope —
-    # reduce all_agent_results (initial dispatch + every retry round)
-    # down to one final AgentResult per work_item_id and confirm every
-    # one of them actually succeeded before trusting test_result.passed.
+      # Validation success alone is insufficient when a specialist failed;
+      # require both the planned files to validate and every task to finish.
     final_agent_results = _final_agent_results_by_work_item(all_agent_results)
     failed_work_item_ids = sorted(
         r.work_item_id for r in final_agent_results if not r.success
     )
 
-    if test_result.passed and not failed_work_item_ids:
-        print("✅ All tests passed.\n")
-        manifest["status"] = "passed"
+    if validation_result.passed and not failed_work_item_ids:
+        print("✅ Static validation passed; external runtime testing is pending.\n")
+        manifest["status"] = "validation_passed_external_testing_pending"
+        manifest["validation_status"] = "passed"
+        manifest["external_testing_status"] = "pending"
+        manifest["validation_warnings"] = [dataclasses.asdict(item) for item in validation_result.warnings]
+        manifest["validation_limitations"] = validation_result.limitations
         manifest["attempts"] = attempt
         manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
         write_manifest(run_dir, manifest)
-        append_index(runs_dir_abs, manifest)
         write_instructions_md(
-            run_dir, config, work_items, all_agent_results, test_result, "passed"
+            run_dir, config, work_items, all_agent_results, validation_result,
+            "validation_passed_external_testing_pending",
         )
-        report(phase="teardown", outcome="passed", attempt_round=attempt)
         return True
 
-    if test_result.passed and failed_work_item_ids:
-        # Vacuous pass: test_result.passed is True (0 tests ran) only
-        # because the failed WorkItems above never got far enough to
-        # write test files — not because there was genuinely nothing to
-        # test. Report this as a failed run rather than "✅ All tests
-        # passed.". This guard is NOT affected by tests_blocking: a
-        # specialist dispatch failure is a specialist-failure signal, not
-        # a test-content signal, and always blocks.
+    if failed_work_item_ids:
+        # A dispatch failure remains blocking even if the generated files
+        # happen to pass static checks.
         print(
             f"⚠️  {len(failed_work_item_ids)} of {len(final_agent_results)} "
-            "task(s) failed dispatch and produced no output — the "
-            "0/0 vacuous test pass does not mean this run succeeded.\n"
+            "task(s) failed specialist dispatch; the run did not pass.\n"
         )
         fail_report = FailReport(
             run_number=attempt,
-            failures=[],
+            failures=validation_result.errors,
             unresolved_items=failed_work_item_ids,
             summary=(
                 f"{len(failed_work_item_ids)} of {len(final_agent_results)} "
-                f"task(s) failed dispatch (specialist errors) after "
-                f"{attempt} attempt(s); no test files were produced for "
-                "them, so the 0/0 vacuous test pass cannot be treated as "
-                "a real pass."
+                f"task(s) failed specialist dispatch after {attempt} attempt(s)."
             ),
         )
         with open(
-            os.path.join(run_dir, "tests", "results", "fail_report.json"), "w"
+            os.path.join(run_dir, "validation", "results", "fail_report.json"), "w"
         ) as f:
             json.dump(dataclasses.asdict(fail_report), f, indent=2)
         print_fail_report(fail_report)
@@ -611,75 +805,49 @@ def _run_pipeline_body(
 
         manifest["status"] = "failed"
         manifest["failure_reason"] = "specialist_dispatch_failure"
+        manifest["validation_status"] = "passed" if validation_result.passed else "failed"
+        manifest["external_testing_status"] = "pending"
+        manifest["validation_warnings"] = [dataclasses.asdict(item) for item in validation_result.warnings]
+        manifest["validation_limitations"] = validation_result.limitations
         manifest["attempts"] = attempt
         manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
         write_manifest(run_dir, manifest)
-        append_index(runs_dir_abs, manifest)
         write_instructions_md(
-            run_dir, config, work_items, all_agent_results, test_result, "failed"
+            run_dir, config, work_items, all_agent_results, validation_result, "failed"
         )
-        report(phase="teardown", outcome="failed", attempt_round=attempt)
         return False
 
-    if not tests_blocking and not failed_work_item_ids:
-        # Non-blocking mode: test *content* failed, but every specialist's
-        # final dispatch succeeded — the vacuous-pass guard above doesn't
-        # apply (failed_work_item_ids is empty), so this is a genuine
-        # test-content failure, not a specialist failure. Per this run's
-        # explicit config, that's advisory-only: don't fail the run, but
-        # don't silently report "✅ passed" either — a distinct status
-        # string keeps this traceable/queryable separately from a real
-        # "passed" run.
-        print(
-            "⚠️  Tests failed but tests_blocking=false — treating as "
-            "advisory-only. Specialist dispatch succeeded for all "
-            "tasks; automated test results should be treated as "
-            "unverified.\n"
-        )
-        manifest["status"] = "passed_with_test_failures"
-        manifest["attempts"] = attempt
-        manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
-        write_manifest(run_dir, manifest)
-        append_index(runs_dir_abs, manifest)
-        write_instructions_md(
-            run_dir, config, work_items, all_agent_results, test_result,
-            "passed_with_test_failures",
-        )
-        report(
-            phase="teardown",
-            outcome="passed_with_test_failures",
-            attempt_round=attempt,
-        )
-        return True
-
-    # Recompute the mapping against the final failing test_result so
+    # Recompute the mapping against the final failing validation result so
     # "unresolved" reflects the WorkItems actually implicated by the
     # last failure — not just whatever subset happened to be
     # in-flight when the retry budget/mapping ran out (relevant
     # when max_retries==1 and no retry loop iteration ever ran).
-    final_retry_context = master.map_failures_to_work_items(
-        test_result, all_agent_results, work_items
+    final_retry_context = master.map_validation_issues_to_work_items(
+        validation_result, all_agent_results, work_items
     )
     unresolved = sorted(final_retry_context) or [
         wi.id for wi in current_work_items
     ]
-    fail_report = master.build_fail_report(attempt, test_result, unresolved)
+    fail_report = master.build_fail_report(attempt, validation_result, unresolved)
     with open(
-        os.path.join(run_dir, "tests", "results", "fail_report.json"), "w"
+        os.path.join(run_dir, "validation", "results", "fail_report.json"), "w"
     ) as f:
         json.dump(dataclasses.asdict(fail_report), f, indent=2)
     print_fail_report(fail_report)
     print()
 
-    manifest["status"] = "failed"
+    manifest["status"] = "validation_failed"
+    manifest["validation_status"] = "failed"
+    manifest["failure_reason"] = "static_validation_failed"
+    manifest["external_testing_status"] = "pending"
+    manifest["validation_warnings"] = [dataclasses.asdict(item) for item in validation_result.warnings]
+    manifest["validation_limitations"] = validation_result.limitations
     manifest["attempts"] = attempt
     manifest["finished_at"] = datetime.now(timezone.utc).isoformat()
     write_manifest(run_dir, manifest)
-    append_index(runs_dir_abs, manifest)
     write_instructions_md(
-        run_dir, config, work_items, all_agent_results, test_result, "failed"
+        run_dir, config, work_items, all_agent_results, validation_result, "validation_failed"
     )
-    report(phase="teardown", outcome="failed", attempt_round=attempt)
     return False
 
 

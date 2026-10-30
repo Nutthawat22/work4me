@@ -9,7 +9,7 @@ import os
 from collections import deque
 from typing import Callable
 
-from pipeline.state import AgentResult, TaskAttempt, TestFailure, WorkItem
+from pipeline.state import AgentResult, TaskAttempt, ValidationIssue, WorkItem
 from pipeline.task_validation import normalize_relative_path, truncate_with_marker
 from specialists.feature import FeatureAgent
 from specialists.integrate import IntegrationAgent
@@ -175,7 +175,7 @@ def dispatch_work_items(
     config: dict,
     run_dir: str,
     strict: bool = True,
-    retry_context: dict[str, list[TestFailure]] | None = None,
+    retry_context: dict[str, list[ValidationIssue]] | None = None,
     known_results: list[AgentResult] | None = None,
     progress: DispatchProgressCallback | None = None,
     task_update: TaskUpdateCallback | None = None,
@@ -192,8 +192,8 @@ def dispatch_work_items(
         strict: Passed through to topological_sort — True (default) for a
             full/self-contained batch, False for a retry subset where
             depends_on may reference ids outside this batch.
-        retry_context: Optional map of work_item_id -> TestFailures that
-            implicated it, from MasterAgent.map_failures_to_work_items().
+        retry_context: Optional map of work_item_id -> static validation
+            issues that implicated it, from MasterAgent.map_validation_issues_to_work_items().
             None (default) for the initial/strict dispatch, which has no
             failure history. Passed through to each specialist's
             execute() so it can inform the LLM prompt on retries.
@@ -293,7 +293,7 @@ def dispatch_work_items(
                     result.notes
                     if not result.success
                     else "\n".join(
-                        f"{failure.test_name}: {failure.error_output[:500]}"
+                        f"{failure.file_path}: {failure.error_output[:500]}"
                         for failure in retry_failures[:5]
                     )
                 ),

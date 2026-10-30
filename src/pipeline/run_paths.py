@@ -49,7 +49,7 @@ def next_run_seq(runs_dir: str) -> int:
 
 
 def create_run_dir(runs_dir: str, prompt: str) -> str:
-    """Create runs_dir/{NNNN-slug}/{design,product,tests/results} and
+    """Create runs_dir/{NNNN-slug}/{design,product,tests,validation/results} and
     return the full run dir path."""
     seq = next_run_seq(runs_dir)
     run_id = f"{seq:04d}-{slugify(prompt)}"
@@ -57,7 +57,7 @@ def create_run_dir(runs_dir: str, prompt: str) -> str:
 
     os.makedirs(os.path.join(run_dir, "design"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "product"), exist_ok=True)
-    os.makedirs(os.path.join(run_dir, "tests", "results"), exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "validation", "results"), exist_ok=True)
 
     return run_dir
 

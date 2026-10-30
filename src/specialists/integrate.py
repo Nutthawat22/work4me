@@ -5,7 +5,7 @@ IntegrationAgent: implements composition and wiring assets for a runnable
 application, using declared dependencies and owned files.
 """
 
-from pipeline.state import AgentResult, TestFailure, WorkItem
+from pipeline.state import AgentResult, ValidationIssue, WorkItem
 from specialists.base import run_multifile_specialist
 
 SYSTEM_PROMPT = (
@@ -25,7 +25,7 @@ class IntegrationAgent:
         work_item: WorkItem,
         config: dict,
         run_dir: str,
-        retry_failures: list[TestFailure] | None = None,
+        retry_failures: list[ValidationIssue] | None = None,
         dependency_context: dict[str, str] | None = None,
     ) -> AgentResult:
         return run_multifile_specialist(

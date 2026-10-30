@@ -5,7 +5,7 @@ FeatureAgent: implements one cohesive capability over its explicitly owned
 set of related files.
 """
 
-from pipeline.state import AgentResult, TestFailure, WorkItem
+from pipeline.state import AgentResult, ValidationIssue, WorkItem
 from specialists.base import run_multifile_specialist
 
 SYSTEM_PROMPT = (
@@ -24,7 +24,7 @@ class FeatureAgent:
         work_item: WorkItem,
         config: dict,
         run_dir: str,
-        retry_failures: list[TestFailure] | None = None,
+        retry_failures: list[ValidationIssue] | None = None,
         dependency_context: dict[str, str] | None = None,
     ) -> AgentResult:
         return run_multifile_specialist(

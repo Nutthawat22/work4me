@@ -4,7 +4,7 @@ This document describes how to invoke this repository's automated multi-agent co
 
 ## 1. What this is
 
-This repository implements an automated multi-agent code-generation pipeline (category-based multi-file task planning → sequential task dispatch → specialist code generation → test execution/retry). That pipeline is exposed as a standard **ACP Agent** — a subprocess that any ACP-compliant client can spawn, initialize, and drive through a `new_session` → `prompt` handshake to run one end-to-end pipeline run, with progress streamed back live as the run executes. See [Task Planning And Execution](task-workflow.md) for task categories, ownership, retries, and artifacts.
+This repository implements an automated multi-agent code-generation pipeline (category-based multi-file task planning → sequential task dispatch → specialist code generation → deterministic static validation/repair). It does not run generated-project tests/builds or install application dependencies. Every run creates an external testing handoff. The pipeline is exposed as a standard **ACP Agent** — a subprocess that any ACP-compliant client can spawn, initialize, and drive through a `new_session` → `prompt` handshake, with progress streamed back live as the run executes. See [Task Planning And Execution](task-workflow.md) for task categories, ownership, retries, and artifacts.
 
 If you already have (or are building) your own ACP client, you can drive this pipeline the same way you'd drive any other ACP agent (e.g. an editor plugin driving a coding assistant). If you don't, [section 4](#4-minimal-example-client-python) has a minimal working example.
 
@@ -51,12 +51,12 @@ client's cwd. Shape and fields:
     "runs_dir": "runs/",
     "output_dir": "product",
     "tests_dir": "tests",
-    "tests_blocking": true
+    "max_prompt_content_chars": 200000
   },
   "languages": {
-    "python": { "...": "see config.example.json for full test-runner config" },
-    "javascript": { "...": "see config.example.json for full test-runner config" },
-    "typescript": { "...": "see config.example.json for full test-runner config" }
+    "python": { "...": "see config.example.json for language and external test-command hints" },
+    "javascript": { "...": "see config.example.json for language and external test-command hints" },
+    "typescript": { "...": "see config.example.json for language and external test-command hints" }
   }
 }
 ```
@@ -67,13 +67,13 @@ Field-by-field, what you need to fill in:
 - **`litellm_key`** — your own API key for that proxy.
 - **`models.<role>.model`** — the model name to use for each role (`code`, `default`, `master`, `design`, `specialist`). Set these to whatever models your proxy exposes.
 - **`models.<role>.provider`** — must always be the literal string `"acp"` for every role. This is **not configurable**; there is no other valid value (older `chat_completions`/`responses` provider modes have been removed from this codebase). All model calls in this pipeline route through an ACP-based provider internally, regardless of which underlying LLM you point at via `litellm_url`.
-- **`pipeline.max_retries`** — max dispatch/test retry attempts per run.
+- **`pipeline.max_retries`** — max specialist dispatch/static-validation repair attempts per run.
 - **`pipeline.runs_dir`** — directory where per-run output directories are created; relative paths resolve from the server repo root, and absolute paths are honored. See [section 6](#6-where-output-lands).
 - **`pipeline.output_dir`** — subdirectory name (inside each run dir) where generated product code is written.
 - **`pipeline.tests_dir`** — subdirectory name (inside each run dir) where generated tests are written.
-- **`pipeline.tests_blocking`** — whether test failures block a run from being reported as passed (`true`) or are advisory-only once all specialists have dispatched successfully (`false`).
+- **`pipeline.tests_blocking`** — legacy config key; accepted but ignored. Static validation errors always block. A static-validation pass is not a runtime-test pass.
 - **`pipeline.max_prompt_content_chars`** *(optional, default `200000`)* — per-file truncation limit (in chars) for embedded text-resource attachments extracted from an ACP prompt (see `src/pipeline/acp_content.py`). Not yet wired into `acp_server.py`'s routing — prep work only.
-- **`languages.*`** — per-language test-runner configuration (test command, file patterns, result format). Copy these as-is from `config.example.json` unless you need to change how tests are invoked for a given language.
+- **`languages.*`** — language extensions/framework hints and optional `test_command` metadata copied into the external testing handoff. Commands are not executed by the pipeline. Legacy `test_file_patterns` and `result_format` are accepted but ignored.
 
 ### 2.3 Client-side requirements
 
@@ -127,9 +127,9 @@ await conn.ext_method(
 
 The extension is advertised at `agentCapabilities._meta["agents-pipeline"].sessionConfig.method` as `_agents-pipeline/session/configure`; Python SDK callers omit the leading underscore in `conn.ext_method`. `projectPath` must be an absolute path to an existing directory on the **server's filesystem** and must not overlap the pipeline's configured run-artifact directory. The server resolves it to a real path and rejects invalid locations. The option is accepted only while the session is new; configuration after the prompt starts is rejected. A new session without this call continues to use the existing generated-project mode.
 
-In existing-project mode, planning receives a bounded project tree/source context, and each specialist receives that context plus the current contents of its owned files (owned-file context is capped at 30,000 characters per file and 100,000 characters per task). Specialists update those files directly in the supplied project; they do not create an overlay or copy. Only planned owned paths may be written or intentionally deleted. Additions, modifications, and deletions are summarized in the run's `changes.json` and manifest. Symlink/path escapes, common generated/vendor directories, and overlap with the server's configured run-artifact directory are rejected. Change tracking excludes common generated/vendor/cache directories such as `.git`, `node_modules`, `venv`, build outputs, and test caches.
+In existing-project mode, planning receives a bounded project tree/source context, and each specialist receives that context plus the current contents of its owned files (owned-file context is capped at 30,000 characters per file and 100,000 characters per task). Specialists update those files directly in the supplied project; they do not create an overlay or copy. Only planned owned paths may be written or intentionally deleted. Additions, modifications, and deletions are summarized in the run's `changes.json` and manifest. Symlink/path escapes, common generated/vendor directories, and overlap with the server's configured run-artifact directory are rejected. Static validation checks expected owned files, supported manifests, Python syntax, and relative Python import targets where package resolution is reliable. JavaScript/TypeScript/JSX syntax and import targets are not parsed without a fixed parser and are reported as limitations. Change tracking excludes common generated/vendor/cache directories such as `.git`, `node_modules`, `venv`, build outputs, and test caches.
 
-Tests run from the target project's root and against its existing test tree. Existing-project runs require at least one matching automated test and treat test failures as blocking even when `pipeline.tests_blocking` is `false`, so an unvalidated edit cannot be reported as a clean pass. Edits are not rolled back on failure; check `changes.json` for the detected change set and treat a failed run's target as potentially partially edited.
+No generated-project commands run in this mode; an existing test suite is not required for static validation to pass. JavaScript/TypeScript/JSX syntax/type checking and unused-symbol analysis are unsupported without a fixed parser; these limitations are recorded in status, validation artifacts, and the testing handoff. Edits are not rolled back on failure; check `changes.json` for the detected change set and treat a failed run's target as potentially partially edited. External runtime testing must use an isolated copy, never the in-place target.
 
 ### 3.3 Prompt contract (v1)
 
@@ -147,7 +147,7 @@ There is no multi-turn steering or follow-up prompting within a session.
 
 ### 3.5 Progress streaming
 
-While a pipeline run executes — this can take anywhere from roughly 20 seconds to several minutes depending on task complexity — the server sends `session_update` notifications carrying `agent_message_chunk` updates. These chunks contain live console output: planning progress, per-task dispatch progress, and test results.
+While a pipeline run executes — this can take anywhere from roughly 20 seconds to several minutes depending on task complexity — the server sends `session_update` notifications carrying `agent_message_chunk` updates. These chunks contain live console output: planning progress, per-task dispatch progress, and deterministic static-validation findings, warnings, and limitations. Generated-project tests/builds are not run.
 
 Listen for these updates to display human-readable output. For machine-readable, queryable state, use the extension in section 3.6.
 
@@ -163,8 +163,12 @@ With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {
   "session_id": "<session id>",
   "run_id": "0001-build-a-cli",
   "status": "running",
-  "phase": "dispatch",
-  "outcome": null,
+    "phase": "dispatch",
+    "outcome": null,
+    "validation_status": "pending",
+    "validation_warnings": 0,
+    "validation_limitations": [],
+    "external_testing_status": "pending",
   "cancel_requested": false,
   "queue_position": null,
   "tasks_total": 3,
@@ -179,13 +183,12 @@ With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {
     },
   "attempt_round": 1,
   "max_attempts": 3,
-  "tests_blocking": true,
-  "mode": "existing_project",
+    "mode": "existing_project",
   "project_path": "/absolute/path/on/the/server/to/project"
 }
 ```
 
-`status` is `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean passed.** `phase` describes the current stage (`queued`, `planning`, `dispatch`, `testing`, `retrying`, `teardown`, and terminal/initial states). `outcome` is null until known, then `passed`, `failed`, `passed_with_test_failures`, `error`, `cancelled`, or `invalid_prompt`. A test failure with `tests_blocking: false` in new-project mode is reported as `passed_with_test_failures`, not as a clean pass. Existing-project mode always requires passing validation and reports validation failures as `failed`. Require `outcome == "passed"` for a clean pipeline pass and handle cancellation separately: cancelled status can retain a known underlying outcome. `PromptResponse.stop_reason` remains a protocol turn status, not the pipeline outcome.
+`status` is `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean runtime-tested.** `phase` describes the current stage (`queued`, `planning`, `dispatch`, `static_validation`, `retrying`, `teardown`, and terminal/initial states). New outcomes are `validation_passed_external_testing_pending`, `validation_failed`, `failed`, `error`, `cancelled`, or `invalid_prompt`. `validation_status` is `pending`, `passed`, `failed`, or `not_completed`; `external_testing_status` remains `pending` until an external tester records a result. Warnings and unsupported-analysis limitations are exposed in `validation_warnings` and `validation_limitations`. A legacy `outcome: "passed"` must never be interpreted as evidence of runtime tests; new server versions normalize it to `validation_passed_external_testing_pending`. `PromptResponse.stop_reason` remains a protocol turn status, not the pipeline outcome.
 
 `queue_position` is one-based among waiting runs and null for the active run or a run without a queue ticket. Task counts describe specialist attempts: `tasks_total` counts planned work items; `tasks_started` counts attempts that began; `tasks_completed` counts attempts that returned passed or failed; retries increment these counters rather than resetting them, so completed attempts may exceed `tasks_total`. Dependency-blocked tasks are counted separately and do not count as started/completed attempts. `current_task` is null when no specialist task is active. `run_id` becomes available after run artifacts are created; `session_id` is available from session creation and remains the correlation key while queued.
 
@@ -193,13 +196,13 @@ With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {
 
 When `prompt` resolves, `PromptResponse.stop_reason` is one of:
 
-- **`"end_turn"`** — the ACP prompt turn completed. Query structured run status to determine whether the pipeline passed, failed, or completed with advisory test failures.
+- **`"end_turn"`** — the ACP prompt turn completed. Query structured run status to determine whether static validation passed or failed; external runtime testing remains pending.
 - **`"refusal"`** — no usable text was found, or an unexpected pipeline error occurred. Status reports `invalid_prompt` or `error` respectively.
 - **`"cancelled"`** — the ACP prompt turn was cancelled. See section 3.9; this does not imply early termination of the pipeline.
 
 ### 3.8 Run serialization
 
-Prompts submitted to one server process are queued FIFO. Only one full pipeline run executes at a time, covering planning, sequential task dispatch, tests/retries, progress delivery, and run teardown. Independent work items also remain sequential. This is process-local coordination only; separate server processes do not share the queue.
+Prompts submitted to one server process are queued FIFO. Only one full pipeline run executes at a time, covering planning, sequential task dispatch, static validation/repair, progress delivery, and run teardown. Independent work items also remain sequential. This is process-local coordination only; separate server processes do not share the queue.
 
 ### 3.9 Cancellation caveat
 
@@ -280,14 +283,20 @@ For live status polling while `prompt` is in flight, query the extension describ
 Each pipeline run creates `<runs-root>/<run-id>/`. `pipeline.runs_dir` resolves relative to the server repo root (default `runs/`); an absolute configured path is honored. Neither subprocess cwd nor `new_session.cwd` relocates that root. Status returns `run_id`, not an absolute path, so clients must know the server repo/config location. With default `pipeline.output_dir` and `pipeline.tests_dir`, the directory contains:
 
 - **`product/`** — the generated code.
-- **`tests/`** — the generated tests, plus `tests/results/` with per-attempt JSON test-result files.
-- **`manifest.json`** — run status (`passed`, `failed`, `passed_with_test_failures`, etc.), timestamps, attempt count, and the original prompt/label.
+- **`tests/`** — generated test source files; they are not executed by the pipeline.
+- **`validation/results/`** — deterministic static validation findings per attempt and final failure report.
+- **`manifest.json`** — status (`validation_passed_external_testing_pending`, `validation_failed`, `failed`, etc.), validation status/limitations, timestamps, attempt count, and the original prompt/label.
 - **`design/plan.json`** — version-2 task plan, explicit category and file ownership, dependencies, current task status, attempt results, and failure details.
 - **`instructions.md`** — a human-readable summary of the run.
+- **`testing-handoff.md`** and **`testing-handoff.json`** — project/artifact paths, changed files, declared runtimes/dependencies, lockfiles, configured/project test/build commands, environment variable names, known services, validation findings/limitations, and an external result contract. Dependency versions come from project manifests/lockfiles; secrets and environment values are not included.
 - Existing-project runs also include **`changes.json`** with project-relative `added`, `modified`, and `deleted` paths, a partial-edit warning on failure, and the resolved `project_path`. Run metadata remains under the pipeline server's configured run directory; it is not written into the target project by the pipeline.
 - In existing-project mode, actual product/test edits are in `project_path`; the run's `product/` and `tests/` directories remain part of the artifact layout and are not used as an overlay.
 
 This directory lives **on the server's filesystem**, at the configured location — it is not returned inline through ACP. If your automated flow needs the actual generated files (not just the streamed text summary), read them from this run directory after the `prompt` call returns.
+
+### External test handoff
+
+Static validation never imports or executes generated code, installs application dependencies, or runs generated tests/builds. External testing must create an isolated copy/environment. In existing-project mode, do not set up or test in the original project directory; edits are in place and may remain after failure. Record `external-test-result.json` next to the handoff using schema version 1. Its `outcome` must distinguish `passed`, `code_or_test_failure`, `environment_setup_failure`, and `not_run`; `environment_setup.status` separately records `succeeded`, `failed`, or `not_attempted`, and each command records `passed`, `failed`, or `not_run`. Report summaries only—never environment values, credentials, or secret-bearing logs. There is no automatic external tester orchestration in this phase.
 
 ## 7. Support / contact
 

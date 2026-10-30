@@ -1,29 +1,16 @@
 """
 src/pipeline/instructions.py
 
-Generates a deterministic, templated instructions.md file at the end of
-every pipeline run (pass or fail) explaining how to actually run the
-product this run produced. Deliberately NOT an LLM call — this inspects
-the actual files written to run_dir/{output_dir} (looking for a
-recognized dependency manifest and reading its "scripts"/entry point) so
-the commands given are concrete and copy-pasteable, not a generic report.
+Generates deterministic pipeline status and points external testers to the
+testing handoff. This file does not execute or suggest project commands.
 
 Tasks own multiple declared files; run instructions inspect the complete
 successful output set instead of relying on single-file task labels.
 """
 
-import json
 import os
 
-from pipeline.state import AgentResult, TestResult, WorkItem
-
-# Recognized dependency manifest filenames, in priority order, mapped to
-# the (install_command, run_command_builder) needed to use them. Node/Bun
-# manifests are checked for an actual "scripts" entry so the run command
-# reflects what was really generated rather than guessing "npm start".
-NODE_MANIFEST_FILENAMES = ("package.json",)
-PYTHON_MANIFEST_FILENAMES = ("requirements.txt", "pyproject.toml")
-
+from pipeline.state import AgentResult, ValidationResult, WorkItem
 
 def _collect_languages(work_items: list[WorkItem]) -> list[str]:
     seen: list[str] = []
@@ -34,10 +21,6 @@ def _collect_languages(work_items: list[WorkItem]) -> list[str]:
     return seen
 
 
-def _find_assembly_work_items(work_items: list[WorkItem]) -> list[WorkItem]:
-    return [wi for wi in work_items if wi.category == "integration"]
-
-
 def _successful_files(agent_results: list[AgentResult]) -> list[str]:
     files: list[str] = []
     for result in agent_results:
@@ -46,101 +29,11 @@ def _successful_files(agent_results: list[AgentResult]) -> list[str]:
     return sorted(set(files))
 
 
-def _find_manifest_file(files: list[str], filenames: tuple[str, ...]) -> str | None:
-    """Return the first successfully-written file (relative to run_dir)
-    whose basename matches one of filenames, or None if none was
-    produced."""
-    for candidate in filenames:
-        for f in files:
-            if os.path.basename(f) == candidate:
-                return f
-    return None
-
-
-def _read_npm_scripts(run_dir: str, package_json_relpath: str) -> dict[str, str]:
-    """Read run_dir/package_json_relpath and return its "scripts" dict,
-    or {} if the file is missing/unreadable/malformed — callers should
-    fall back to a generic "npm start" suggestion in that case rather
-    than crash on a best-effort instructions file."""
-    full_path = os.path.join(run_dir, package_json_relpath)
-    try:
-        with open(full_path, "r") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    scripts = data.get("scripts")
-    return scripts if isinstance(scripts, dict) else {}
-
-
-def _pick_run_script(scripts: dict[str, str]) -> str | None:
-    """Prefer "dev", then "start", then the first script defined —
-    matches how most Node/Bun projects name their primary run command."""
-    for preferred in ("dev", "start"):
-        if preferred in scripts:
-            return preferred
-    return next(iter(scripts), None)
-
-
-def _build_run_steps(
-    run_dir: str, config: dict, work_items: list[WorkItem], successful_files: list[str]
-) -> list[str]:
-    """
-    Build a concrete, copy-pasteable list of shell steps to install and
-    run whatever this run produced, by inspecting the actual manifest
-    file on disk rather than assuming one exists. Returns an empty list
-    if no recognized manifest was found (caller reports this as a gap,
-    not silently).
-    """
-    manifest_path = _find_manifest_file(successful_files, NODE_MANIFEST_FILENAMES)
-    if manifest_path is not None:
-        directory = os.path.dirname(manifest_path)
-        scripts = _read_npm_scripts(run_dir, manifest_path)
-        run_script = _pick_run_script(scripts)
-        uses_bun = any(
-            "bun" in (wi.description + wi.title).lower() for wi in work_items
-        )
-        install_cmd = "bun install" if uses_bun else "npm install"
-        run_cmd = (
-            f"{'bun run' if uses_bun else 'npm run'} {run_script}"
-            if run_script
-            else f"{'bun run' if uses_bun else 'npm start'}"
-        )
-        steps = []
-        if directory:
-            steps.append(f"cd {directory}")
-        steps.append(install_cmd)
-        steps.append(run_cmd)
-        return steps
-
-    manifest_path = _find_manifest_file(successful_files, PYTHON_MANIFEST_FILENAMES)
-    if manifest_path is not None:
-        directory = os.path.dirname(manifest_path)
-        steps = []
-        if directory:
-            steps.append(f"cd {directory}")
-        if os.path.basename(manifest_path) == "requirements.txt":
-            steps.append("pip install -r requirements.txt")
-        else:
-            steps.append("pip install .")
-        entrypoint = next(
-            (f for f in successful_files if os.path.basename(f) in ("main.py", "app.py")),
-            None,
-        )
-        if entrypoint:
-            entry_relative = os.path.relpath(entrypoint, directory) if directory else entrypoint
-            steps.append(f"python {entry_relative}")
-        else:
-            steps.append("python main.py  # adjust to the actual entry-point file above")
-        return steps
-
-    return []
-
-
 def generate_instructions_md(
     config: dict,
     work_items: list[WorkItem],
     agent_results: list[AgentResult],
-    test_result: TestResult | None,
+    validation_result: ValidationResult | None,
     run_status: str,
     run_id: str,
     run_dir: str | None = None,
@@ -150,25 +43,16 @@ def generate_instructions_md(
     disk — see write_instructions_md).
 
     Args:
-        config: Loaded pipeline config — used to list per-language test
-            commands actually configured (not every language that
-            exists in config, only ones this run's work_items used).
+          config: Pipeline configuration associated with this run.
         work_items: The full WorkItem plan for this run.
         agent_results: All AgentResults produced across every dispatch
             round (initial + retries).
-        test_result: The final TestResult, or None if the run never
-            reached the test phase (e.g. MasterPlanError/CycleError).
-        run_status: One of "passed", "passed_with_test_failures", "failed",
-            "design_parse_error", "dispatch_cycle_error" — mirrors
-            manifest["status"]/manifest["failure_reason"].
-            "passed_with_test_failures" is the tests_blocking=false
-            non-blocking-test-failure case (see src/pipeline/runner.py).
+        validation_result: The latest deterministic static validation result,
+            or None if planning/dispatch failed before validation.
+        run_status: Mirrors manifest status. A successful pipeline status means
+            static validation passed; external runtime testing remains pending.
         run_id: The run directory's basename, for the header.
-        run_dir: Absolute path to the run directory, needed to actually
-            read a written package.json's "scripts" off disk. If None
-            (e.g. a design_parse_error/dispatch_cycle_error run with no
-            files written yet), manifest detection is skipped and the
-            "no manifest found" path is reported instead.
+          run_dir: Absolute run-artifact path, retained for the caller API.
 
     Returns:
         Markdown content as a string.
@@ -179,26 +63,13 @@ def generate_instructions_md(
 
     lines.append("## Status")
     lines.append("")
-    if run_status == "passed":
-        lines.append("✅ All configured tests passed.")
-    elif run_status == "passed_with_test_failures":
-        total = test_result.total if test_result else 0
-        failed = test_result.failed if test_result else 0
-        lines.append(
-            f"⚠️ Tests failed but were not enforced this run "
-            f"(tests_blocking=false) — {failed} of {total} test(s) "
-            "failed. Files were written and specialist dispatch "
-            "succeeded, but automated test results should be treated "
-            "as unverified/advisory only."
-        )
+    if run_status in {"passed", "validation_passed_external_testing_pending"}:
+        lines.append("✅ Static validation passed. External runtime tests/builds are pending; no runtime test was executed by this pipeline.")
+    elif run_status == "validation_failed":
+        count = len(validation_result.errors) if validation_result else 0
+        lines.append(f"❌ Static validation found {count} blocking error(s); see validation/results/fail_report.json. External runtime testing remains pending.")
     elif run_status == "failed":
-        total = test_result.total if test_result else 0
-        failed = test_result.failed if test_result else 0
-        lines.append(
-            f"❌ {failed} of {total} test(s) failed after exhausting "
-            "retries (see tests/results/fail_report.json). Files below "
-            "were still written — treat as unverified."
-        )
+        lines.append("❌ Specialist dispatch or pipeline execution failed. Files may be partial; external runtime testing remains pending.")
     elif run_status == "design_parse_error":
         lines.append("❌ Planning failed — no code was generated this run.")
     elif run_status == "dispatch_cycle_error":
@@ -213,43 +84,10 @@ def generate_instructions_md(
     lines.append("")
 
     successful_files = _successful_files(agent_results)
-    run_steps = (
-        _build_run_steps(run_dir, config, work_items, successful_files)
-        if run_dir is not None
-        else []
-    )
-
-    lines.append("## Run It")
+    lines.append("## External Testing")
     lines.append("")
-    if run_steps:
-        lines.append("```bash")
-        lines.extend(run_steps)
-        lines.append("```")
-    else:
-        assembly_items = _find_assembly_work_items(work_items)
-        if assembly_items:
-            lines.append(
-                "⚠️ No dependency manifest (package.json / requirements.txt "
-                "/ pyproject.toml) was found among the files this run "
-                "actually wrote, so there's no install/run command to "
-                "give — even though the plan included an integration task:"
-            )
-            lines.append("")
-            for wi in assembly_items:
-                paths = ", ".join(f"`{owned_file.path}`" for owned_file in wi.owned_files)
-                lines.append(f"- {wi.title} → {paths}")
-            lines.append("")
-            lines.append(
-                  "Check whether that task's specialist run failed or "
-                "wrote to an unexpected path (see files list below)."
-            )
-        else:
-            lines.append(
-                "⚠️ This run's plan had no integration task "
-                "at all — the files below are individual modules, not a "
-                "runnable application. There is no single install/run "
-                "command."
-            )
+    lines.append("No generated-project command, dependency installation, runtime test, or build was executed by the pipeline.")
+    lines.append("Review `testing-handoff.md` and `testing-handoff.json`, then test an isolated copy of the project. For existing-project mode, do not run setup or tests against the original project directory.")
     lines.append("")
 
     lines.append("## Files Written")
@@ -262,18 +100,20 @@ def generate_instructions_md(
     lines.append("")
 
     languages = _collect_languages(work_items)
-    languages_config = config.get("languages", {})
     if languages:
-        lines.append("## Running Tests")
+        lines.append("Planned code languages: " + ", ".join(languages))
+    if validation_result and validation_result.warnings:
         lines.append("")
-        for language in languages:
-            lang_config = languages_config.get(language)
-            if lang_config is None:
-                continue
-            command = " ".join(lang_config.get("test_command", []))
-            framework = lang_config.get("test_framework_name", "?")
-            lines.append(f"- **{language}** (`{framework}`): `{command}`")
+        lines.append("Static validation warnings:")
+        lines.extend(
+            f"- `{issue.file_path}`: {issue.error_output}"
+            for issue in validation_result.warnings
+        )
+    if validation_result and validation_result.limitations:
         lines.append("")
+        lines.append("Static validation limitations:")
+        lines.extend(f"- {limitation}" for limitation in validation_result.limitations)
+    lines.append("")
 
     return "\n".join(lines)
 
@@ -283,7 +123,7 @@ def write_instructions_md(
     config: dict,
     work_items: list[WorkItem],
     agent_results: list[AgentResult],
-    test_result: TestResult | None,
+    validation_result: ValidationResult | None,
     run_status: str,
 ) -> str:
     """
@@ -292,7 +132,7 @@ def write_instructions_md(
     """
     run_id = os.path.basename(run_dir.rstrip(os.sep))
     content = generate_instructions_md(
-        config, work_items, agent_results, test_result, run_status, run_id,
+        config, work_items, agent_results, validation_result, run_status, run_id,
         run_dir=run_dir,
     )
     path = os.path.join(run_dir, "instructions.md")

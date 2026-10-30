@@ -7,7 +7,6 @@ free of validation logic — this module is the single place that knows
 what keys/types every part of the pipeline actually reads.
 """
 
-VALID_RESULT_FORMATS = {"junit", "jest_json", "vitest_json"}
 VALID_PROVIDERS = {"acp"}
 
 REQUIRED_TOP_LEVEL: dict[str, type] = {
@@ -42,11 +41,17 @@ OPTIONAL_PIPELINE_KEYS: dict[str, type] = {
 }
 
 REQUIRED_LANGUAGE_KEYS: dict[str, tuple] = {
+    "file_extension": (str, list),
+    "test_framework_name": (str,),
+}
+
+# Legacy/configured commands are copied into external-testing handoffs only;
+# static validation never executes these commands. The other two fields are
+# accepted for compatibility with existing configs and otherwise ignored.
+OPTIONAL_LANGUAGE_KEYS: dict[str, tuple] = {
     "test_command": (list,),
     "test_file_patterns": (list,),
     "result_format": (str,),
-    "file_extension": (str, list),
-    "test_framework_name": (str,),
 }
 
 
@@ -163,11 +168,15 @@ def validate_config(config: dict) -> list[str]:
                         f"got {type(value).__name__}"
                     )
 
-            result_format = lang_cfg.get("result_format")
-            if isinstance(result_format, str) and result_format not in VALID_RESULT_FORMATS:
-                errors.append(
-                    f"languages.{lang_name}.result_format must be one of "
-                    f"{sorted(VALID_RESULT_FORMATS)}, got {result_format!r}"
-                )
+            for key, expected_types in OPTIONAL_LANGUAGE_KEYS.items():
+                if key not in lang_cfg:
+                    continue
+                value = lang_cfg[key]
+                if not isinstance(value, expected_types):
+                    type_names = " or ".join(_type_name(t) for t in expected_types)
+                    errors.append(
+                        f"languages.{lang_name}.{key} must be {type_names}, "
+                        f"got {type(value).__name__}"
+                    )
 
     return errors

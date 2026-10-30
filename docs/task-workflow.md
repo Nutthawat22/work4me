@@ -82,13 +82,15 @@ these budgets are called out in the context.
 
 ## Retry Behavior
 
-Test failures map to the task owning the failed test file. A validation task's
-declared implementation dependencies are included when a validation failure
-needs code repair. Dependents of changed tasks are also retried because their
-outputs may be stale. Unrelated successful tasks are not regenerated. Prior
-successful results remain available to retry subsets as dependency context.
-Failed task executions retry even when `tests_blocking` is false; that option
-only makes test-content failures advisory.
+Deterministic static-validation errors map to the task owning the failed file.
+A validation task's declared implementation dependencies are included when an
+owned test/source asset needs repair. Dependents of changed tasks are also
+retried because their outputs may be stale. Unrelated successful tasks are not
+regenerated. Prior successful results remain available to retry subsets as
+dependency context. Warning-only unused private declarations and unsupported
+analysis limitations do not trigger repair retries. Runtime tests/builds are
+external and do not participate in this retry loop. The legacy
+`pipeline.tests_blocking` option is accepted but ignored.
 
 ## Progress Counters
 
@@ -130,8 +132,14 @@ query method and complete response contract.
 
 Each task status is `blocked`, `ready`, `running`, `passed`, or `failed`.
 Attempt history records generated files, result summary, and failure details.
-`manifest.json` retains run-level status and attempt count; test results and
-failure reports remain under `tests/results/`.
+Task `passed` means that the specialist completed its owned output; it does not
+mean the generated project passed runtime tests. `manifest.json` records
+`validation_passed_external_testing_pending`, `validation_failed`, or a
+pipeline/dispatch `failed` status, plus `validation_status`, warnings, and
+analysis limitations. Per-attempt static findings and `fail_report.json` are
+under `validation/results/`. `tests/` contains generated test source only.
+Every run also includes `testing-handoff.md` and `testing-handoff.json` for
+isolated external runtime testing and the versioned result contract.
 
 ## Breaking Migration
 

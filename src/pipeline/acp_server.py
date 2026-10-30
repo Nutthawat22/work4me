@@ -299,8 +299,12 @@ class _SessionState:
             "session_id": session_id,
             "run_id": None,
             "status": "created",
-            "phase": "created",
-            "outcome": None,
+              "phase": "created",
+              "outcome": None,
+              "validation_status": "pending",
+              "validation_warnings": 0,
+              "validation_limitations": [],
+              "external_testing_status": "pending",
             "cancel_requested": False,
             "queue_position": None,
             "tasks_total": 0,
@@ -310,8 +314,7 @@ class _SessionState:
             "current_task": None,
             "attempt_round": 0,
             "max_attempts": None,
-            "tests_blocking": None,
-            "mode": "new_project",
+              "mode": "new_project",
             "project_path": None,
         }
         self.progress_lock = threading.Lock()
@@ -410,7 +413,14 @@ class PipelineAgent:
 
         text = _extract_prompt_text(prompt)
         if not text:
-            self._set_progress(state, status="failed", phase="completed", outcome="invalid_prompt")
+            self._set_progress(
+                state,
+                status="failed",
+                phase="completed",
+                outcome="invalid_prompt",
+                validation_status="not_completed",
+                external_testing_status="pending",
+            )
             await self._send_message(session_id, "⚠️  No text content found in prompt (v1 only reads TextContentBlock).")
             return PromptResponse(stop_reason="refusal")
 
@@ -488,12 +498,24 @@ class PipelineAgent:
                 )
             outcome = self._progress_outcome(state)
             if success is None:
+                handoff_failed = state.progress.get("testing_handoff_status") == "failed"
                 self._set_progress(
                     state,
                     status="failed",
                     phase="completed",
-                    outcome="failed" if state.project_path is not None else "error",
+                    outcome=(
+                        "failed"
+                        if handoff_failed or state.project_path is not None
+                        else "error"
+                    ),
+                    validation_status="not_completed",
+                    external_testing_status="pending",
                 )
+                if handoff_failed:
+                    await self._send_message(
+                        session_id,
+                        "❌ Pipeline request failed; required testing handoff artifacts are incomplete.\n",
+                    )
                 response = PromptResponse(stop_reason="refusal")
             elif state.cancelled or interrupted:
                 self._set_progress(state, status="cancelled", phase="completed", outcome=outcome or "cancelled")
@@ -503,11 +525,28 @@ class PipelineAgent:
                 )
                 response = PromptResponse(stop_reason="cancelled")
             else:
-                outcome = outcome or ("passed" if success else "failed")
-                self._set_progress(state, status="completed", phase="completed", outcome=outcome)
-                summary = "✅ Pipeline passed" if success else "❌ Pipeline failed"
-                if outcome == "passed_with_test_failures":
-                    summary = "⚠️ Pipeline completed with advisory test failures"
+                outcome = outcome or (
+                    "validation_passed_external_testing_pending" if success else "failed"
+                )
+                if outcome in {"passed", "passed_with_test_failures"}:
+                    outcome = "validation_passed_external_testing_pending"
+                self._set_progress(
+                    state,
+                    status="completed" if success else "failed",
+                    phase="completed",
+                    outcome=outcome,
+                )
+                if outcome == "validation_passed_external_testing_pending":
+                    summary = (
+                        "✅ Static validation passed; external runtime testing is pending. "
+                        "Review the testing handoff for limitations."
+                    )
+                elif state.progress.get("testing_handoff_status") == "failed":
+                    summary = (
+                        "❌ Pipeline failed; required testing handoff artifacts are incomplete."
+                    )
+                else:
+                    summary = "❌ Pipeline validation or execution failed"
                 await self._send_message(session_id, f"\n{summary}\n")
                 response = PromptResponse(stop_reason="end_turn")
         except asyncio.CancelledError:
@@ -516,7 +555,14 @@ class PipelineAgent:
             self._set_progress(state, status="cancelled", phase="completed", outcome="cancelled")
             response = PromptResponse(stop_reason="cancelled")
         except Exception as error:
-            self._set_progress(state, status="failed", phase="completed", outcome="error")
+            self._set_progress(
+                state,
+                status="failed",
+                phase="completed",
+                outcome="error",
+                validation_status="not_completed",
+                external_testing_status="pending",
+            )
             await self._send_message(session_id, f"⚠️  Pipeline request failed: {error}\n")
             response = PromptResponse(stop_reason="refusal")
         finally:
