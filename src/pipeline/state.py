@@ -33,6 +33,18 @@ class TaskAttempt:
     result_summary: str = ""
     failure_details: str = ""
     files_deleted: list[str] = field(default_factory=list)
+    file_attempts: list[dict[str, object]] = field(default_factory=list)
+
+
+@dataclass
+class FileAttempt:
+    path: str
+    number: int
+    status: Literal["pending", "generating", "staged", "rejected", "published"]
+    digest: str = ""
+    failure_details: str = ""
+    completion_status: str = "unsupported"
+    stop_reason: str | None = None
 
 
 @dataclass
@@ -51,6 +63,7 @@ class WorkItem:
     expected_interfaces: list[str] = field(default_factory=list)
     status: TaskStatus = "blocked"
     attempts: list[TaskAttempt] = field(default_factory=list)
+    file_progress: list[FileAttempt] = field(default_factory=list)
 
 
 # ── Agent Result ─────────────────────────────────────────────────────────────

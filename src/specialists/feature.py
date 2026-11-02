@@ -11,10 +11,9 @@ from specialists.base import run_multifile_specialist
 SYSTEM_PROMPT = (
     "You are implementing one cohesive end-user capability, including related "
     "frontend and backend modules when the task owns them. Use each owned file's "
-    "declared language, respect dependency contracts, and do not split work by "
-    "file or invent additional files. Output ONLY a JSON object "
-    '{"files": {"<relative path>": "<full file content>", ...}} — no '
-    "markdown fences, no explanation."
+    "declared language, respect dependency contracts, and do not split feature "
+    "ownership or invent additional files. Implement only the explicitly requested "
+    "owned file per response; the complete feature context is supplied each time."
 )
 
 

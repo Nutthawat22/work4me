@@ -7,7 +7,8 @@ SYSTEM_PROMPT = (
     "You implement the validation category for the configured test framework "
     "and each owned file's language. Write tests for the stated acceptance "
     "criteria and dependency contracts. Create exactly the owned test files. "
-    'Output ONLY {"files": {"relative/path": "complete test content"}}.'
+    "Implement only the explicitly requested owned test file per response; the "
+    "complete validation-task context is supplied each time."
 )
 
 

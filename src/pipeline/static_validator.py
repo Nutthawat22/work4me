@@ -7,6 +7,7 @@ import json
 import os
 import re
 import tomllib
+from collections.abc import Mapping, Set
 from pathlib import Path
 
 from pipeline.project_context import IGNORED_DIRECTORIES, snapshot_project_files, summarize_project_changes
@@ -122,7 +123,12 @@ def _other_toml_shape_error(name: str, data: object) -> str | None:
     return None
 
 
-def _python_local_target_exists(source_path: str, node: ast.ImportFrom, root: str) -> bool:
+def _python_local_target_exists(
+    source_path: str,
+    node: ast.ImportFrom,
+    root: str,
+    virtual_paths: set[str] | None = None,
+) -> bool:
     if node.level <= 0:
         return True
     source = Path(source_path)
@@ -133,19 +139,37 @@ def _python_local_target_exists(source_path: str, node: ast.ImportFrom, root: st
     package_parts = package_parts[: len(package_parts) - ascent]
     module_parts = node.module.split(".") if node.module else []
     parent = os.path.join(root, *package_parts, *module_parts)
-    if _safe_local_target(parent + ".py", root) or _safe_local_target(
-        os.path.join(parent, "__init__.py"), root
+    available = virtual_paths or set()
+
+    def exists(candidate: str) -> bool:
+        relative = os.path.relpath(candidate, root).replace(os.sep, "/").casefold()
+        return relative in available or _safe_local_target(candidate, root)
+
+    if exists(parent + ".py") or exists(
+        os.path.join(parent, "__init__.py")
     ):
         return True
-    if node.module and _safe_local_target(parent, root, allow_directory=True):
+    if node.module and (
+        _safe_local_target(parent, root, allow_directory=True)
+        or any(path.startswith(os.path.relpath(parent, root).replace(os.sep, "/").casefold() + "/") for path in available)
+    ):
         # A namespace package may have no __init__.py; its contents cannot be
         # proven statically, so an existing directory is treated as a possible target.
         return True
     if node.module is None:
         return any(
-            _safe_local_target(os.path.join(parent, alias.name, "__init__.py"), root)
-            or _safe_local_target(os.path.join(parent, alias.name + ".py"), root)
+            exists(os.path.join(parent, alias.name, "__init__.py"))
+            or exists(os.path.join(parent, alias.name + ".py"))
             or _safe_local_target(os.path.join(parent, alias.name), root, allow_directory=True)
+            or any(
+                path.startswith(
+                    os.path.relpath(os.path.join(parent, alias.name), root)
+                    .replace(os.sep, "/")
+                    .casefold()
+                    + "/"
+                )
+                for path in available
+            )
             for alias in node.names
         )
     return False
@@ -210,10 +234,33 @@ class StaticValidator:
         work_items: list[WorkItem],
         run_dir: str,
         agent_results: list[AgentResult] | None = None,
+        *,
+        staged_files: Mapping[str, str] | None = None,
+        staged_deletions: Set[str] | None = None,
+        dependency_files: Mapping[str, str] | None = None,
     ) -> ValidationResult:
         project_root = config["pipeline"].get("_existing_project_path")
         existing_project = bool(project_root)
         root = os.path.realpath(project_root if existing_project else run_dir)
+        staged_by_key = {
+            path.replace("\\", "/").casefold(): content
+            for path, content in (staged_files or {}).items()
+        }
+        deleted_keys = {
+            path.replace("\\", "/").casefold()
+            for path in (staged_deletions or set())
+        }
+        virtual_paths = set(staged_by_key)
+        virtual_paths.update(
+            path.replace("\\", "/").casefold() for path in (dependency_files or {})
+        )
+
+        def source_content(relative: str) -> str:
+            staged = staged_by_key.get(relative.replace("\\", "/").casefold())
+            if staged is not None:
+                return staged
+            with open(os.path.join(root, relative), "r", encoding="utf-8") as source:
+                return source.read()
         expected: dict[str, str] = {}
         expected_files: dict[str, str] = {}
         errors: list[ValidationIssue] = []
@@ -261,7 +308,12 @@ class StaticValidator:
             full_path = os.path.join(root, relative)
             if _has_symlink_component(root, relative):
                 continue
-            if not os.path.isfile(full_path) and key not in intentional_deletions:
+            if (
+                not os.path.isfile(full_path)
+                and key not in staged_by_key
+                and key not in intentional_deletions
+                and key not in deleted_keys
+            ):
                 add_error(relative, "Expected owned file is missing", expected[key])
 
         if existing_project:
@@ -275,10 +327,14 @@ class StaticValidator:
                     if relative.casefold() not in item_by_path:
                         add_error(relative, "Existing-project change is outside planned file ownership")
 
-        if existing_project:
+        if existing_project or staged_files is not None:
             project_files = [
               path for path in expected_files.values()
-              if os.path.isfile(os.path.join(root, path))
+              if (
+                  os.path.isfile(os.path.join(root, path))
+                  or path.casefold() in staged_by_key
+              )
+              and path.casefold() not in deleted_keys
               and not _has_symlink_component(root, path)
             ]
         else:
@@ -298,6 +354,12 @@ class StaticValidator:
                     project_files.append(project_relative)
                     if project_relative.casefold() not in item_by_path:
                         add_error(project_relative, "Generated file is not owned by a planned task")
+            for relative in staged_by_key:
+                if relative not in {path.casefold() for path in project_files}:
+                    project_files.append(relative)
+                if relative not in item_by_path:
+                    add_error(relative, "Staged file is not owned by a planned task")
+            project_files = [path for path in project_files if path.casefold() not in deleted_keys]
 
         manifest_limitations: list[str] = []
         for relative in sorted(set(project_files)):
@@ -305,8 +367,7 @@ class StaticValidator:
             owner_id = item_by_path.get(relative.casefold(), "")
             suffix = Path(relative).suffix.lower()
             try:
-                with open(path, "r", encoding="utf-8") as source:
-                    content = source.read()
+                content = source_content(relative)
             except (OSError, UnicodeDecodeError) as error:
                 if relative.casefold() in item_by_path:
                     add_error(relative, f"Cannot read expected source file: {error}", owner_id)
@@ -325,7 +386,9 @@ class StaticValidator:
                     add_error(relative, f"Python compile error at line {error.lineno}: {error.msg}", owner_id)
                     continue
                 for node in ast.walk(tree):
-                    if isinstance(node, ast.ImportFrom) and node.level and not _python_local_target_exists(relative, node, root):
+                    if isinstance(node, ast.ImportFrom) and node.level and not _python_local_target_exists(
+                        relative, node, root, virtual_paths
+                    ):
                         add_error(relative, f"Relative Python import target not found: {'.' * node.level}{node.module or ''}", owner_id)
                 for name in _unused_private_declarations(tree, relative):
                     warnings.append(

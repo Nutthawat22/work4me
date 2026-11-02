@@ -18,3 +18,7 @@ Pipeline success means deterministic static validation passed; generated-project
 runtime tests/builds are not executed. Each run writes `testing-handoff.md` and
 `testing-handoff.json` with an isolated external-testing procedure and result
 contract.
+
+Run external checks by explicitly delegating the handoff to the Docker-isolated
+agent. See [External Testing Agent](docs/external-testing-agent.md) for CLI/ACP
+usage, supported runtimes, result artifacts, and isolation limits.

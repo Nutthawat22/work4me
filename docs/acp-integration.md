@@ -4,7 +4,7 @@ This document describes how to invoke this repository's automated multi-agent co
 
 ## 1. What this is
 
-This repository implements an automated multi-agent code-generation pipeline (category-based multi-file task planning → sequential task dispatch → specialist code generation → deterministic static validation/repair). It does not run generated-project tests/builds or install application dependencies. Every run creates an external testing handoff. The pipeline is exposed as a standard **ACP Agent** — a subprocess that any ACP-compliant client can spawn, initialize, and drive through a `new_session` → `prompt` handshake, with progress streamed back live as the run executes. See [Task Planning And Execution](task-workflow.md) for task categories, ownership, retries, and artifacts.
+This repository implements an automated multi-agent code-generation pipeline (category-based multi-file task planning → sequential task dispatch → specialist code generation → deterministic static validation/repair). The pipeline does not run generated-project tests/builds or install application dependencies. Every run creates an external testing handoff. A separate Docker-isolated testing agent can be delegated manually over ACP or CLI; it is not launched by the implementation pipeline. The pipeline itself is exposed as a standard **ACP Agent** — a subprocess that any ACP-compliant client can spawn, initialize, and drive through a `new_session` → `prompt` handshake, with progress streamed back live as the run executes. See [Task Planning And Execution](task-workflow.md) for task categories, ownership, retries, and artifacts.
 
 If you already have (or are building) your own ACP client, you can drive this pipeline the same way you'd drive any other ACP agent (e.g. an editor plugin driving a coding assistant). If you don't, [section 4](#4-minimal-example-client-python) has a minimal working example.
 
@@ -27,6 +27,11 @@ This installs, among other things, `agent-client-protocol==0.12.1` — the Pytho
 Also install `opencode` with `acp` support and put its executable on the server process's `PATH`. Internal model calls spawn `opencode acp` with a temporary HOME/cwd and generated `OPENCODE_CONFIG` using this pipeline's proxy/model settings, not your normal home configuration or credentials. The executable must remain discoverable with that temporary HOME.
 
 ### 2.2 Create your config file
+
+Each LLM request attempt has a 15-minute timeout. OpenCode's provider request,
+response-header, and streamed-chunk timeouts are also set to 15 minutes. A
+retry receives a fresh per-attempt budget; there is no single 15-minute
+whole-pipeline deadline.
 
 The server loads its config from **`~/.config/Agents/config.json`** first; if that file doesn't exist, it falls back to the repo's own `config.json` at the project root. Configure one of these locations on the machine/environment where you run the server; the home config takes precedence.
 
@@ -179,7 +184,18 @@ With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {
       "id": "TASK-auth",
       "category": "feature",
       "status": "running",
-      "attempt": 1
+      "attempt": 1,
+      "files": [
+        {
+          "path": "product/src/auth/session.ts",
+          "attempt": 1,
+          "status": "generating",
+          "digest": "",
+          "failure": "",
+          "completion_status": "unsupported",
+          "stop_reason": null
+        }
+      ]
     },
   "attempt_round": 1,
   "max_attempts": 3,
@@ -190,7 +206,7 @@ With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {
 
 `status` is `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean runtime-tested.** `phase` describes the current stage (`queued`, `planning`, `dispatch`, `static_validation`, `retrying`, `teardown`, and terminal/initial states). New outcomes are `validation_passed_external_testing_pending`, `validation_failed`, `failed`, `error`, `cancelled`, or `invalid_prompt`. `validation_status` is `pending`, `passed`, `failed`, or `not_completed`; `external_testing_status` remains `pending` until an external tester records a result. Warnings and unsupported-analysis limitations are exposed in `validation_warnings` and `validation_limitations`. A legacy `outcome: "passed"` must never be interpreted as evidence of runtime tests; new server versions normalize it to `validation_passed_external_testing_pending`. `PromptResponse.stop_reason` remains a protocol turn status, not the pipeline outcome.
 
-`queue_position` is one-based among waiting runs and null for the active run or a run without a queue ticket. Task counts describe specialist attempts: `tasks_total` counts planned work items; `tasks_started` counts attempts that began; `tasks_completed` counts attempts that returned passed or failed; retries increment these counters rather than resetting them, so completed attempts may exceed `tasks_total`. Dependency-blocked tasks are counted separately and do not count as started/completed attempts. `current_task` is null when no specialist task is active. `run_id` becomes available after run artifacts are created; `session_id` is available from session creation and remains the correlation key while queued.
+`queue_position` is one-based among waiting runs and null for the active run or a run without a queue ticket. Task counts describe specialist attempts: `tasks_total` counts planned work items; `tasks_started` counts attempts that began; `tasks_completed` counts attempts that returned passed or failed; retries increment these counters rather than resetting them, so completed attempts may exceed `tasks_total`. Dependency-blocked tasks are counted separately and do not count as started/completed attempts. `current_task` is null when no specialist task is active. While active, it also contains up to 40 per-file attempts (`pending`, `generating`, `staged`, `rejected`, or `published`) with bounded failure details and accepted-source SHA-256 digests. Completion is `complete` only for ACP `end_turn`; other available stop reasons are reported as `incomplete` or `refused`, and providers without stop metadata remain `unsupported`. `run_id` becomes available after run artifacts are created; `session_id` is available from session creation and remains the correlation key while queued.
 
 ### 3.7 Final response
 
@@ -296,7 +312,7 @@ This directory lives **on the server's filesystem**, at the configured location 
 
 ### External test handoff
 
-Static validation never imports or executes generated code, installs application dependencies, or runs generated tests/builds. External testing must create an isolated copy/environment. In existing-project mode, do not set up or test in the original project directory; edits are in place and may remain after failure. Record `external-test-result.json` next to the handoff using schema version 1. Its `outcome` must distinguish `passed`, `code_or_test_failure`, `environment_setup_failure`, and `not_run`; `environment_setup.status` separately records `succeeded`, `failed`, or `not_attempted`, and each command records `passed`, `failed`, or `not_run`. Report summaries only—never environment values, credentials, or secret-bearing logs. There is no automatic external tester orchestration in this phase.
+Static validation never imports or executes generated code, installs application dependencies, or runs generated tests/builds. External testing must use an isolated copy. In existing-project mode, edits remain in the original target and may be partial; the testing agent requires explicit `--project-root` authorization and snapshots it before container execution. The manual Docker-isolated agent writes a unique `testing-result.json`, readable report, bounded logs, and immutable source snapshot under `external-testing/`; its statuses and result contract are documented in [External Testing Agent](external-testing-agent.md). The result is separate evidence keyed by pipeline `run_id` and tested-source SHA-256; it does not update static validation or the handoff automatically.
 
 ## 7. Support / contact
 

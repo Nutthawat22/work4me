@@ -9,6 +9,7 @@ Usage: python src/pipeline/runner.py
 
 import copy
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -130,8 +131,25 @@ def _sync_task_results(
                 ),
                 failure_details=result.notes if not result.success else "",
                 files_deleted=list(result.files_deleted),
+                file_attempts=[dataclasses.asdict(attempt) for attempt in item.file_progress],
             )
         )
+
+
+def _stage_plan_identity(work_items: list[WorkItem]) -> str:
+    stable_plan = [
+        {
+            field: getattr(item, field)
+            for field in (
+                "id", "category", "language", "module", "scope", "title", "description",
+                "acceptance_criteria", "requirement_refs", "owned_files", "depends_on",
+                "expected_interfaces",
+            )
+        }
+        for item in work_items
+    ]
+    encoded = json.dumps(stable_plan, sort_keys=True, default=dataclasses.asdict, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def print_fail_report(report: FailReport) -> None:
@@ -503,6 +521,7 @@ def _finalize_existing_project_changes(
         **changes,
         "partial_edits_possible": failed,
         "warning": warning,
+        "publication_failures": manifest.get("publication_failures", []) if manifest else [],
     }
     with open(os.path.join(run_dir, "changes.json"), "w", encoding="utf-8") as change_file:
         json.dump(summary, change_file, indent=2)
@@ -587,6 +606,7 @@ def _run_pipeline_body(
         return False
 
     manifest["work_item_count"] = len(work_items)
+    config["pipeline"]["_stage_plan_digest"] = _stage_plan_identity(work_items)
     write_manifest(run_dir, manifest)
 
     plan_path = os.path.join(run_dir, "design", "plan.json")
@@ -613,8 +633,20 @@ def _run_pipeline_body(
                     "category": _item.category,
                     "status": _item.status,
                     "attempt": len(_item.attempts) + (1 if _item.status == "running" else 0),
-                },
-            )
+                    "files": [
+                        {
+                            "path": attempt.path,
+                            "attempt": attempt.number,
+                            "status": attempt.status,
+                            "digest": attempt.digest,
+                            "failure": attempt.failure_details,
+                            "completion_status": attempt.completion_status,
+                            "stop_reason": attempt.stop_reason,
+                        }
+                        for attempt in _item.file_progress[-40:]
+                    ],
+                  },
+              )
 
     persist_plan()
 
@@ -757,8 +789,8 @@ def _run_pipeline_body(
             print(f"  ℹ️ Validation limitation: {limitation}")
         print()
 
-      # Validation success alone is insufficient when a specialist failed;
-      # require both the planned files to validate and every task to finish.
+    # Validation success alone is insufficient when a specialist failed;
+    # require both the planned files to validate and every task to finish.
     final_agent_results = _final_agent_results_by_work_item(all_agent_results)
     failed_work_item_ids = sorted(
         r.work_item_id for r in final_agent_results if not r.success
@@ -804,6 +836,11 @@ def _run_pipeline_body(
         print()
 
         manifest["status"] = "failed"
+        manifest["publication_failures"] = [
+            result.notes[:1200]
+            for result in _final_agent_results_by_work_item(all_agent_results)
+            if not result.success and "publication failed" in result.notes.casefold()
+        ]
         manifest["failure_reason"] = "specialist_dispatch_failure"
         manifest["validation_status"] = "passed" if validation_result.passed else "failed"
         manifest["external_testing_status"] = "pending"
@@ -837,6 +874,11 @@ def _run_pipeline_body(
     print()
 
     manifest["status"] = "validation_failed"
+    manifest["publication_failures"] = [
+        result.notes[:1200]
+        for result in _final_agent_results_by_work_item(all_agent_results)
+        if not result.success and "publication failed" in result.notes.casefold()
+    ]
     manifest["validation_status"] = "failed"
     manifest["failure_reason"] = "static_validation_failed"
     manifest["external_testing_status"] = "pending"

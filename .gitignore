@@ -5,6 +5,8 @@ app/
 /tests/
 !/tests/
 /tests/*
+!/tests/testing_agent/
+!/tests/testing_agent/*.py
 !/tests/pipeline/
 /tests/pipeline/*
 !/tests/pipeline/test_acp_server.py
@@ -14,6 +16,16 @@ app/
 !/tests/pipeline/test_static_validation.py
 !/tests/pipeline/test_static_validation_pipeline.py
 !/tests/pipeline/test_task_ownership_retry.py
+!/tests/pipeline/test_feature_publication.py
+!/tests/specialists/
+!/tests/specialists/test_file_delivery.py
+!/tests/specialists/test_existing_project_edits.py
+!/tests/specialists/test_base_self_check.py
+!/tests/specialists/test_multifile_output_validation.py
+!/tests/specialists/test_task_output_area_normalization.py
+!/tests/specialists/providers/
+/tests/specialists/providers/*
+!/tests/specialists/providers/test_acp_client.py
 __pycache__/
 spike/
 venv/

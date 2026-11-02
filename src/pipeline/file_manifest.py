@@ -53,9 +53,9 @@ from specialists.providers.acp_client import acp_call_with_retry
 from pipeline.master import PLANNING_MAX_ATTEMPTS
 
 
-# Longer timeout: the feature list plus the model's file-planning reasoning
-# can be large, well past acp_call_with_retry's 60s default.
-PLAN_FILE_MANIFEST_TIMEOUT_SECONDS = 240
+# Per-request budget for file-manifest planning; retries each receive this
+# budget independently.
+PLAN_FILE_MANIFEST_TIMEOUT_SECONDS = 900
 
 VALID_FILE_ROLES: list[str] = ["scaffold", "feature", "shared", "entrypoint", "validation"]
 

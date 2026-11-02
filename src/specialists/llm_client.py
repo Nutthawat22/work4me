@@ -7,9 +7,21 @@ specialists.providers.PROVIDERS registry and delegates the actual
 request/response handling to the resolved adapter.
 """
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from specialists.providers import PROVIDERS
+from specialists.providers.acp_client import acp_call_result
+
+DEFAULT_LLM_TIMEOUT_SECONDS = 900
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    content: str
+    completion_status: str = "unsupported"
+    stop_reason: str | None = None
+    error_kind: str | None = None
 
 
 def call_llm(
@@ -17,7 +29,7 @@ def call_llm(
     model: str,
     config: dict[str, Any],
     provider: str = "acp",
-    timeout: int = 60,
+    timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
     response_schema: Optional[dict[str, Any]] = None,
     session_scope: Optional[dict] = None,
 ) -> str:
@@ -59,3 +71,44 @@ def call_llm(
         messages, model, config, timeout,
         response_schema=response_schema, session_scope=session_scope,
     )
+
+
+def call_llm_result(
+    messages: list[dict],
+    model: str,
+    config: dict[str, Any],
+    provider: str = "acp",
+    timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
+    response_schema: Optional[dict[str, Any]] = None,
+    session_scope: Optional[dict] = None,
+) -> LLMResponse:
+    """Return text with provider completion metadata when the protocol exposes it.
+
+    The legacy ``call_llm`` remains a string-returning compatibility API.
+    """
+    if provider not in PROVIDERS:
+        raise ValueError(f"Unknown provider: {provider!r}. Valid providers: {sorted(PROVIDERS.keys())}")
+    if provider == "acp":
+        result = acp_call_result(
+            messages,
+            model,
+            config,
+            timeout,
+            response_schema=response_schema,
+            session_scope=session_scope,
+        )
+        return LLMResponse(
+            content=result.content,
+            completion_status=result.completion_status,
+            stop_reason=result.stop_reason,
+            error_kind=result.error_kind,
+        )
+    content = PROVIDERS[provider](
+        messages,
+        model,
+        config,
+        timeout,
+        response_schema=response_schema,
+        session_scope=session_scope,
+    )
+    return LLMResponse(content=content)

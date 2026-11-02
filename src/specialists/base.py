@@ -1,18 +1,10 @@
 """
 src/specialists/base.py
 
-Shared multi-file task execution helper. Category workers delegate to
-run_multifile_specialist() so output ownership and validation stay uniform.
-
-Self-check loop: after generating and writing its output, a specialist
-verifies its OWN work against the WorkItem's acceptance_criteria (and
-dependency_context, if given) via a SEPARATE self-check LLM call in the
-same pooled session. On rejection, the specialist regenerates with the
-    self-check's issues appended as feedback, up to SELF_CHECK_MAX_ATTEMPTS
-extra attempts. This is entirely contained within one run_multifile_specialist()
-call — callers (specialists/*.py's execute(),
-and in turn pipeline/dispatch.py) see a single call in, a single
-AgentResult out, same as before this loop existed.
+Shared task review/context helpers. Each owned file is delivered separately;
+the WorkItem remains the feature/ownership unit. The optional self-check reads
+the complete staged feature before publication. Its rejection is fed into the
+bounded pipeline retry budget.
 """
 
 import json
@@ -30,28 +22,10 @@ MAX_DEPENDENCY_FILES_SHOWN = 20
 MAX_DEPENDENCY_CHARS_IN_PROMPT = 3000
 MAX_DEPENDENCY_TOTAL_CHARS_IN_PROMPT = 30000
 
-# Timeout for every call_llm() in this module (generation AND self-check
-# — see _self_check's own call below). The old implicit 60s default
-# (specialists/llm_client.py's call_llm(timeout: int = 60)) is far too
-# short for real code-generation: a live production handoff-mode run hit
-# ALL 25 work items timing out identically at 60s, writing zero files.
-# 180s mirrors pipeline/master.py's own PLAN_HANDOFF_TIMEOUT_SECONDS /
-# DECOMPOSE_FEATURES_TIMEOUT_SECONDS (240s) and pipeline/file_manifest.py's
-# PLAN_FILE_MANIFEST_TIMEOUT_SECONDS (240s) precedent of hardcoded
-# module-level timeout constants rather than config-driven values — kept
-# slightly lower than those since a single-file/small-multi-file
-# specialist call is normally cheaper than whole-project planning, but
-# still 3x the old default. Self-check reuses this same constant rather
-# than a shorter one: its output (a small JSON verdict) is cheap, but its
-# input is NOT (full acceptance criteria + dependency context + the
-# specialist's own written files, same order of magnitude as a
-# generation call) and LLM latency here is dominated by upstream
-# think-time, not output size — a too-short self-check timeout would
-# silently fail open (see _self_check's None-on-error handling) and
-# disable the review loop under the same load that caused this bug in
-# the first place. Revisit if self-check timeouts turn out to be rare
-# in practice.
-SPECIALIST_TIMEOUT_SECONDS = 180
+# Per-request maximum for specialist generation and self-check calls.
+# Self-check uses the same budget because its input includes the generated
+# files and acceptance context. This is not a whole-pipeline deadline.
+SPECIALIST_TIMEOUT_SECONDS = 900
 
 # Self-check attempt cap: up to this many EXTRA generation attempts
 # beyond the first on self-check rejection, so 3 total generation
@@ -392,7 +366,7 @@ def _build_base_user_content(work_item: WorkItem, config: dict) -> str:
     )
 
 
-def run_multifile_specialist(
+def _legacy_json_multifile_specialist(
     work_item: WorkItem,
     config: dict,
     run_dir: str,
@@ -425,6 +399,16 @@ def run_multifile_specialist(
         the failure (LLM error, JSON parse error, wrong shape, write
         error, or self-check rejection exhausting all attempts).
     """
+    return run_multifile_specialist(
+        work_item,
+        config,
+        run_dir,
+        system_prompt,
+        agent_name,
+        retry_failures=retry_failures,
+        dependency_context=dependency_context,
+    )
+
     model_cfg = config["models"]["specialist"]
     model = model_cfg["model"]
     provider = model_cfg["provider"]
@@ -934,4 +918,7 @@ def run_multifile_specialist(
         attempt += 1
 
     # Unreachable: the loop above always returns on its final iteration.
-    raise AssertionError("run_multifile_specialist's self-check loop exited without returning")
+    raise AssertionError("legacy multi-file response loop exited without returning")
+
+
+from specialists.file_delivery import run_file_delivery as run_multifile_specialist

@@ -55,20 +55,11 @@ from specialists.providers.acp_client import acp_call_with_retry
 
 VALID_CATEGORIES: set[str] = {"foundation", "feature", "shared", "integration", "validation"}
 
-# Longer timeout: plan_handoff feeds the full design doc (~100K+ chars),
-# well past acp_call_with_retry's 60s default.
-PLAN_HANDOFF_TIMEOUT_SECONDS = 240
-
-# Longer timeout: decompose_features feeds the full design doc, like
-# plan_handoff, so reuse the same generous budget.
-DECOMPOSE_FEATURES_TIMEOUT_SECONDS = 240
-
-# Longer timeout: decompose takes a short free-text prompt (much less
-# input than plan_handoff/decompose_features's full design docs), so it
-# doesn't need the full 240s budget, but the 60s acp_call_with_retry
-# default is still risky for an LLM call producing a structured WorkItem
-# array — split the difference.
-DECOMPOSE_TIMEOUT_SECONDS = 120
+# Maximum wall time for each planning request attempt. Retries each receive
+# their own request budget; this is not a whole-pipeline deadline.
+PLAN_HANDOFF_TIMEOUT_SECONDS = 900
+DECOMPOSE_FEATURES_TIMEOUT_SECONDS = 900
+DECOMPOSE_TIMEOUT_SECONDS = 900
 
 # Retry-with-error-feedback attempt cap for every planning call in this
 # module (see acp_call_with_retry's max_attempts). Not yet exposed as a

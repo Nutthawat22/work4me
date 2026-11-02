@@ -11,9 +11,8 @@ SYSTEM_PROMPT = (
     "You implement the foundation category: project setup and shared primitives "
     "that multiple modules depend on. Follow the owned-file languages, implement "
     "only this task's scope, and state the real interfaces described by the task. "
-    'Output ONLY a JSON object of the exact shape {"files": {"<relative '
-    'path>": "<full file content>", ...}} — no markdown fences, no '
-    "explanation. Every value is the complete raw file content."
+    "Implement only the explicitly requested owned file per response; the complete "
+    "foundation task context is supplied each time."
 )
 
 

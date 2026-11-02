@@ -42,6 +42,14 @@ import acp
 
 DEFAULT_AGENT_NAME = "minimal"
 
+
+@dataclass(frozen=True)
+class AcpCallResult:
+    content: str
+    completion_status: str
+    stop_reason: str | None = None
+    error_kind: str | None = None
+
 DEFAULT_DENY_ALL_PERMISSIONS: dict[str, str] = {
     "edit": "deny",
     "bash": "deny",
@@ -94,6 +102,9 @@ def _build_minimal_opencode_config(config: dict[str, Any], model: str) -> dict[s
                 "options": {
                     "apiKey": config["litellm_key"],
                     "baseURL": config["litellm_url"],
+                    "timeout": 900_000,
+                    "headerTimeout": 900_000,
+                    "chunkTimeout": 900_000,
                 },
                 "models": {model: {"name": model}},
             },
@@ -590,14 +601,14 @@ def _role_key_for(model: str, config: dict[str, Any], session_scope: Optional[di
     return f"{model}::{config.get('litellm_url', '')}"
 
 
-def acp_call(
+def acp_call_result(
     messages: list[dict],
     model: str,
     config: dict[str, Any],
-    timeout: int = 60,
+    timeout: int = 900,
     response_schema: Optional[dict[str, Any]] = None,
     session_scope: Optional[dict] = None,
-) -> str:
+) -> AcpCallResult:
     """
     Send a prompt through a pooled `opencode acp` subprocess/session,
     routed to config["litellm_url"]/config["litellm_key"] via a
@@ -649,16 +660,68 @@ def acp_call(
     try:
         prompt_resp, accumulated_text = _POOL.prompt_sync(role_key, config, model, prompt_text, timeout)
     except asyncio.TimeoutError:
-        return f"[{model}] Error: ACP prompt timed out after {timeout}s."
+        return AcpCallResult(
+            f"[{model}] Error: ACP prompt timed out after {timeout}s.",
+            "incomplete",
+            error_kind="timeout",
+        )
     except FileNotFoundError as e:
-        return f"[{model}] Error: could not spawn 'opencode acp' subprocess: {e}"
+        return AcpCallResult(
+            f"[{model}] Error: could not spawn 'opencode acp' subprocess: {e}",
+            "unsupported",
+            error_kind="provider_error",
+        )
     except Exception as e:
-        return f"[{model}] Error: {e}"
+        return AcpCallResult(f"[{model}] Error: {e}", "unsupported", error_kind="provider_error")
 
+    raw_stop_reason = getattr(prompt_resp, "stopReason", None)
+    if raw_stop_reason is None:
+        raw_stop_reason = getattr(prompt_resp, "stop_reason", None)
+    stop_reason = str(raw_stop_reason) if raw_stop_reason is not None else None
     if not accumulated_text.strip():
-        return f"[{model}] Error: no agent_message_chunk text received (stopReason={getattr(prompt_resp, 'stopReason', None)!r})"
+        return AcpCallResult(
+            f"[{model}] Error: no agent_message_chunk text received (stopReason={stop_reason!r})",
+            "incomplete" if stop_reason is not None else "unsupported",
+            stop_reason=stop_reason,
+            error_kind="empty_response",
+        )
 
-    return accumulated_text
+    if stop_reason == "end_turn":
+        return AcpCallResult(accumulated_text, "complete", stop_reason=stop_reason)
+    if stop_reason == "refusal":
+        return AcpCallResult(
+            accumulated_text,
+            "refused",
+            stop_reason=stop_reason,
+            error_kind="refusal",
+        )
+    if stop_reason is not None:
+        return AcpCallResult(
+            accumulated_text,
+            "incomplete",
+            stop_reason=stop_reason,
+            error_kind="interrupted",
+        )
+    return AcpCallResult(accumulated_text, "unsupported", error_kind="metadata_unsupported")
+
+
+def acp_call(
+    messages: list[dict],
+    model: str,
+    config: dict[str, Any],
+    timeout: int = 900,
+    response_schema: Optional[dict[str, Any]] = None,
+    session_scope: Optional[dict] = None,
+) -> str:
+    """String-returning compatibility wrapper around :func:`acp_call_result`."""
+    return acp_call_result(
+        messages,
+        model,
+        config,
+        timeout,
+        response_schema=response_schema,
+        session_scope=session_scope,
+    ).content
 
 
 def _build_retry_feedback_prompt(response_schema: Optional[dict[str, Any]], failure_reason: str) -> str:
@@ -727,7 +790,7 @@ def acp_call_with_retry(
     messages: list[dict],
     model: str,
     config: dict[str, Any],
-    timeout: int = 60,
+    timeout: int = 900,
     response_schema: Optional[dict[str, Any]] = None,
     session_scope: Optional[dict] = None,
     parse_and_validate_fn: Optional[Callable[[str], Any]] = None,

@@ -11,9 +11,8 @@ SYSTEM_PROMPT = (
     "You implement a shared module or contract used by multiple features. "
     "Satisfy the combined requirements and preserve all stated interfaces. "
     "Use the complete dependency context and do not take ownership of files "
-    "outside this task. Output ONLY a JSON object "
-    '{"files": {"<relative path>": "<full file content>"}} — no fences, no '
-    "explanation."
+    "outside this task. Implement only the explicitly requested owned file per "
+    "response; the complete shared-task context is supplied each time."
 )
 
 

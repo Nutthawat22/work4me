@@ -343,6 +343,11 @@ def test_testing_handoff_lists_declared_metadata_without_secrets(tmp_path):
 
     assert metadata["run_id"] == "0001-demo"
     assert metadata["external_testing"]["status"] == "pending"
+    assert metadata["external_testing"]["result_file"] == "external-testing/<run-id>-<testing-run-id>/testing-result.json"
+    contract = metadata["external_testing"]["result_contract"]
+    assert contract["outcomes"] == ["passed", "tests_failed", "setup_failed", "no_tests", "cancelled"]
+    assert "source_snapshot" in contract["required_fields"]
+    assert "run_id" in contract["result_recording"]
     assert "package-lock.json" in metadata["lockfiles"][0]
     assert {"runtime": "Rust", "version": "1.81", "source": str(product / "Cargo.toml")} in metadata["runtime_version_requirements"]
     assert any(
@@ -357,6 +362,7 @@ def test_testing_handoff_lists_declared_metadata_without_secrets(tmp_path):
     assert "API-SUPER-SECRET" not in encoded
     assert "HEADER-SECRET" not in encoded
     assert "isolated copy" in (run_dir / "testing-handoff.md").read_text()
+    assert "does not update `manifest.json`" in (run_dir / "testing-handoff.md").read_text()
 
 
 def test_testing_handoff_omits_unsafe_and_unrecognized_runtime_version_contents(tmp_path):

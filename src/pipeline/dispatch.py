@@ -268,13 +268,27 @@ def dispatch_work_items(
         agent = registry[item.category]
         retry_failures = (retry_context or {}).get(item.id, [])
         dependency_context = build_dependency_context(item, results_by_id, dependency_root)
-        result = agent.execute(
-            item,
-            config,
-            run_dir,
-            retry_failures=retry_failures,
-            dependency_context=dependency_context,
-        )
+        pipeline_config = config.setdefault("pipeline", {})
+        previous_file_progress = pipeline_config.get("_file_progress_callback")
+
+        def file_progress(updated_item: WorkItem, _attempt) -> None:
+            if task_update is not None:
+                task_update(updated_item)
+
+        pipeline_config["_file_progress_callback"] = file_progress
+        try:
+            result = agent.execute(
+                item,
+                config,
+                run_dir,
+                retry_failures=retry_failures,
+                dependency_context=dependency_context,
+            )
+        finally:
+            if previous_file_progress is None:
+                pipeline_config.pop("_file_progress_callback", None)
+            else:
+                pipeline_config["_file_progress_callback"] = previous_file_progress
         results.append(result)
         results_by_id[item.id] = result
         item.status = "passed" if result.success else "failed"
@@ -297,6 +311,18 @@ def dispatch_work_items(
                         for failure in retry_failures[:5]
                     )
                 ),
+                file_attempts=[
+                    {
+                        "path": attempt.path,
+                        "number": attempt.number,
+                        "status": attempt.status,
+                        "digest": attempt.digest,
+                        "failure_details": attempt.failure_details,
+                        "completion_status": attempt.completion_status,
+                        "stop_reason": attempt.stop_reason,
+                    }
+                    for attempt in item.file_progress
+                ],
             )
         )
         if task_update is not None:
