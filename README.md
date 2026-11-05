@@ -22,3 +22,14 @@ contract.
 Run external checks by explicitly delegating the handoff to the Docker-isolated
 agent. See [External Testing Agent](docs/external-testing-agent.md) for CLI/ACP
 usage, supported runtimes, result artifacts, and isolation limits.
+
+For `web-sdlc-proposal`, register the repository's [SKILL.md](SKILL.md) as an
+external Code implementer with `bind: git` so ignored runtime files stay outside
+its fingerprint. Refresh provider activation after updating the registered
+source/skill files. The canonical ACP entry point is
+`venv/bin/python src/pipeline/acp_server.py`. Configure `existing_project` with
+the host's Code worktree. ACP status schema 2 reports `outcome: "passed"` for
+implementation completion; `pipeline_outcome`, `validation_status`, and
+`external_testing_status` describe verification separately. The finalized
+`implementation_result_path` points to task and declared AC-coverage evidence
+for the host's Code artifacts. See [ACP Integration](docs/acp-integration.md).

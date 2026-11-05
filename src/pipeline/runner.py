@@ -28,8 +28,10 @@ from pipeline.master import MasterAgent, MasterPlanError
 from pipeline.config_validation import validate_config
 from pipeline.dispatch import dispatch_work_items, CycleError
 from pipeline.instructions import write_instructions_md
+from pipeline.implementation_result import write_implementation_result
 from pipeline.run_paths import append_index, create_run_dir, write_manifest
 from pipeline.project_context import (
+    IGNORED_DIRECTORIES,
     build_project_context,
     snapshot_project_files,
     summarize_project_changes,
@@ -38,6 +40,18 @@ from pipeline.project_context import (
 from pipeline.state import AgentResult, FailReport, TaskAttempt, ValidationResult, WorkItem
 from pipeline.static_validator import StaticValidator
 from pipeline.testing_handoff import write_testing_handoff
+from pipeline.resume import (
+    PIPELINE_SCHEMA_VERSION,
+    TYPESCRIPT_VERSION,
+    ResumeRequest,
+    ResumeError,
+    compatibility_digest,
+    import_resume_sources,
+    load_resume_request,
+    resolve_resume_source,
+    resume_source_lock,
+    write_resume_history,
+)
 from specialists.providers import acp_client
 
 
@@ -104,6 +118,23 @@ def _final_agent_results_by_work_item(
     return list(by_id.values())
 
 
+def _contract_candidate_is_complete(
+    work_items: list[WorkItem], agent_results: list[AgentResult]
+) -> bool:
+    contract_task_ids = {
+        item.id for item in work_items
+        if item.design_contract_inventory or item.design_contracts
+    }
+    latest = {
+        result.work_item_id: result
+        for result in agent_results
+    }
+    return all(
+        task_id in latest and latest[task_id].success
+        for task_id in contract_task_ids
+    )
+
+
 def _sync_task_results(
     work_items: list[WorkItem],
     results: list[AgentResult],
@@ -137,19 +168,80 @@ def _sync_task_results(
 
 
 def _stage_plan_identity(work_items: list[WorkItem]) -> str:
+    identity_fields = (
+        "id", "category", "language", "module", "scope", "title", "description",
+        "acceptance_criteria", "requirement_refs", "owned_files", "depends_on",
+        "expected_interfaces", "design_contracts",
+    )
     stable_plan = [
         {
-            field: getattr(item, field)
-            for field in (
-                "id", "category", "language", "module", "scope", "title", "description",
-                "acceptance_criteria", "requirement_refs", "owned_files", "depends_on",
-                "expected_interfaces",
-            )
+            **{field: getattr(item, field) for field in identity_fields},
+            **({"design_contract_inventory": item.design_contract_inventory}
+               if item.design_contract_inventory else {}),
         }
         for item in work_items
     ]
     encoded = json.dumps(stable_plan, sort_keys=True, default=dataclasses.asdict, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _task_dependents(work_items: list[WorkItem]) -> dict[str, list[str]]:
+    direct: dict[str, set[str]] = {item.id: set() for item in work_items}
+    for item in work_items:
+        for dependency_id in item.depends_on:
+            if dependency_id in direct:
+                direct[dependency_id].add(item.id)
+    result: dict[str, list[str]] = {}
+    for task_id in direct:
+        reached: set[str] = set()
+        pending = list(direct[task_id])
+        while pending:
+            current = pending.pop()
+            if current in reached:
+                continue
+            reached.add(current)
+            pending.extend(direct.get(current, set()))
+        result[task_id] = sorted(reached)
+    return result
+
+
+def _published_file_snapshot(
+    config: dict,
+    run_dir: str,
+    project_root: str | None,
+) -> dict[str, str]:
+    if project_root:
+        return snapshot_project_files(
+            project_root,
+            (config["pipeline"].get("_protected_run_root", ""),),
+        )
+    root = os.path.realpath(run_dir)
+    result: dict[str, str] = {}
+    for key in ("output_dir", "tests_dir"):
+        area = os.path.normpath(config["pipeline"][key])
+        area_root = os.path.join(root, area)
+        if not os.path.isdir(area_root):
+            continue
+        for current, directories, filenames in os.walk(area_root, followlinks=False):
+            for name in directories:
+                directory = os.path.join(current, name)
+                if os.path.islink(directory):
+                    raise OSError("published output contains a symbolic-link directory")
+            directories[:] = [
+                name for name in directories
+                if name not in IGNORED_DIRECTORIES
+            ]
+            for name in filenames:
+                path = os.path.join(current, name)
+                if os.path.islink(path) or not os.path.isfile(path):
+                    raise OSError("published output contains a non-regular file")
+                relative = os.path.relpath(path, root).replace(os.sep, "/")
+                digest = hashlib.sha256()
+                with open(path, "rb") as source:
+                    for chunk in iter(lambda: source.read(65536), b""):
+                        digest.update(chunk)
+                result[relative] = digest.hexdigest()
+    return result
 
 
 def print_fail_report(report: FailReport) -> None:
@@ -241,6 +333,20 @@ def _finalize_pipeline_run(
         if pipeline_exception is None:
             pipeline_exception = (error, error.__traceback__)
 
+    try:
+        manifest["published_files"] = _published_file_snapshot(config, run_dir, project_root)
+    except Exception as error:
+        run_failed = True
+        result = False
+        manifest["published_files"] = {}
+        manifest["published_files_error"] = type(error).__name__
+        logging.exception(
+            "Could not record published source digests for run %s",
+            os.path.basename(run_dir),
+        )
+        if pipeline_exception is None:
+            pipeline_exception = (error, error.__traceback__)
+
     if pipeline_exception is not None:
         manifest.update(
             status="failed",
@@ -305,6 +411,20 @@ def _finalize_pipeline_run(
             manifest["status"] = candidate_status
         manifest.pop("testing_handoff_warning", None)
 
+    implementation_result_path = None
+    try:
+        implementation_result_path = write_implementation_result(config, run_dir, manifest)
+        manifest["implementation_result_status"] = "written"
+    except Exception:
+        run_failed = True
+        result = False
+        manifest.update(
+            status="failed",
+            failure_reason="implementation_result_failure",
+            implementation_result_status="failed",
+        )
+        logging.exception("Could not write implementation result for run %s", os.path.basename(run_dir))
+
     finalization_failed = False
     try:
         write_manifest(run_dir, manifest)
@@ -345,6 +465,8 @@ def _finalize_pipeline_run(
         try:
             progress({
                 "run_id": manifest.get("run_id", os.path.basename(run_dir)),
+                "run_dir": os.path.abspath(run_dir),
+                "implementation_result_path": implementation_result_path,
                 "phase": "teardown",
                 "outcome": (
                     "failed"
@@ -376,6 +498,7 @@ def run_pipeline(
     label: str | None = None,
     progress: Callable[[dict[str, object]], None] | None = None,
     existing_project_path: str | None = None,
+    resume_request: ResumeRequest | None = None,
 ) -> bool:
     """
     Run one full pipeline pass end-to-end (run-dir creation -> decompose
@@ -407,14 +530,12 @@ def run_pipeline(
 
     Returns:
         True if planning, specialist dispatch, static validation, and both
-        required testing-handoff artifacts completed successfully. False
+        required testing-handoff artifacts and the implementation result
+        completed successfully. False
         indicates pipeline, validation, or handoff artifact failure.
     """
     if (user_input is None) == (work_items is None):
-        raise ValueError(
-            "run_pipeline requires exactly one of user_input or work_items"
-        )
-
+        raise ValueError("run_pipeline requires exactly one of user_input or work_items")
     if label is None:
         if user_input is None:
             raise ValueError("label is required when work_items is given")
@@ -427,17 +548,24 @@ def run_pipeline(
     result = False
     pipeline_exception: tuple[BaseException, TracebackType | None] | None = None
     try:
-        if existing_project_path is not None:
+        if existing_project_path is not None or resume_request is not None:
             run_config = copy.deepcopy(config)
             pipeline_config = run_config["pipeline"]
-            runs_root = pipeline_config["runs_dir"]
-            runs_root = os.path.realpath(resolve_project_path(runs_root))
-            project_root = validate_project_path(existing_project_path, runs_root)
-            context, baseline = build_project_context(project_root, (runs_root,))
-            pipeline_config["_existing_project_path"] = project_root
-            pipeline_config["_existing_project_context"] = context
-            pipeline_config["_protected_run_root"] = runs_root
-            pipeline_config["_existing_project_baseline"] = baseline
+            if resume_request is not None:
+                requested_root = os.path.realpath(existing_project_path) if existing_project_path else None
+                if resume_request.project_root != requested_root:
+                    raise ResumeError("Resume request project mode differs from the selected project root")
+                pipeline_config["_resume_request"] = resume_request
+            if existing_project_path is not None:
+                runs_root = os.path.realpath(resolve_project_path(pipeline_config["runs_dir"]))
+                project_root = validate_project_path(existing_project_path, runs_root)
+                context, baseline = build_project_context(project_root, (runs_root,))
+                if resume_request is not None and baseline != resume_request.published_files:
+                    raise ResumeError("Existing project changed after resume preflight; refusing stale-source resume")
+                pipeline_config["_existing_project_path"] = project_root
+                pipeline_config["_existing_project_context"] = context
+                pipeline_config["_protected_run_root"] = runs_root
+                pipeline_config["_existing_project_baseline"] = baseline
         result = _run_pipeline_body(run_config, user_input, work_items, label, progress)
         if not result:
             run_failed = True
@@ -469,6 +597,8 @@ def run_pipeline(
             finally:
                 run_config["pipeline"].pop("_testing_handoff_pipeline_status", None)
     finally:
+        run_config.get("pipeline", {}).pop("_review_dependents", None)
+        run_config.get("pipeline", {}).pop("_resume_request", None)
         try:
             acp_client.teardown()
         except BaseException as error:
@@ -480,6 +610,33 @@ def run_pipeline(
         error, traceback = pipeline_exception
         raise error.with_traceback(traceback)
     return result
+
+
+def resume_pipeline(
+    config: dict,
+    source_run: str,
+    task_ids: list[str],
+    *,
+    progress: Callable[[dict[str, object]], None] | None = None,
+    existing_project_path: str | None = None,
+) -> bool:
+    source_directory = resolve_resume_source(config, source_run)
+    with resume_source_lock(config, source_directory):
+        request = load_resume_request(
+            config,
+            source_directory,
+            task_ids,
+            project_root=existing_project_path,
+        )
+        label = f"resume-{request.source_run_id}-{'-'.join(task_ids)}"
+        return run_pipeline(
+            config,
+            work_items=request.work_items,
+            label=label,
+            progress=progress,
+            existing_project_path=request.project_root,
+            resume_request=request,
+        )
 
 
 def _finalize_existing_project_changes(
@@ -553,10 +710,12 @@ def _run_pipeline_body(
 
     def report(**updates: object) -> None:
         if progress is not None:
-            progress({"run_id": run_id, **updates})
+            progress({"run_id": run_id, "run_dir": os.path.abspath(run_dir), **updates})
 
     report(phase="planning")
 
+    existing_project_path = config["pipeline"].get("_existing_project_path")
+    resume_request = config["pipeline"].get("_resume_request")
     manifest = {
         "run_id": os.path.basename(run_dir),
         "prompt": label,
@@ -565,10 +724,14 @@ def _run_pipeline_body(
         "status": "in_progress",
         "validation_status": "pending",
         "external_testing_status": "pending",
+        "pipeline_schema_version": PIPELINE_SCHEMA_VERSION,
+        "typescript_toolchain_version": TYPESCRIPT_VERSION,
+        "pipeline_config_digest": compatibility_digest(config, existing_project_path),
     }
-    existing_project_path = config["pipeline"].get("_existing_project_path")
     if existing_project_path:
         manifest["project_path"] = existing_project_path
+    if isinstance(resume_request, ResumeRequest):
+        manifest["resume"] = resume_request.provenance
     write_manifest(run_dir, manifest)
 
     if work_items is None:
@@ -592,8 +755,15 @@ def _run_pipeline_body(
             )
             return False
 
+    resume_request = config["pipeline"].get("_resume_request")
+    resume_statuses = {
+        item.id: item.status for item in work_items
+    } if isinstance(resume_request, ResumeRequest) else {}
     try:
         master._validate_task_plan(work_items)
+        if resume_statuses:
+            for item in work_items:
+                item.status = resume_statuses[item.id]
     except MasterPlanError as e:
         print(f"\n⚠️  Invalid task plan: {e}\n")
         manifest["status"] = "failed"
@@ -606,7 +776,15 @@ def _run_pipeline_body(
         return False
 
     manifest["work_item_count"] = len(work_items)
-    config["pipeline"]["_stage_plan_digest"] = _stage_plan_identity(work_items)
+    stage_plan_digest = _stage_plan_identity(work_items)
+    config["pipeline"]["_stage_plan_digest"] = stage_plan_digest
+    manifest["stage_plan_digest"] = stage_plan_digest
+    config["pipeline"]["_review_dependents"] = _task_dependents(work_items)
+    if isinstance(resume_request, ResumeRequest):
+        if _stage_plan_identity(work_items) != resume_request.provenance["source_plan_digest"]:
+            raise ResumeError("Resume child plan identity changed after preflight")
+        import_resume_sources(resume_request, config, run_dir)
+        write_resume_history(resume_request, run_dir)
     write_manifest(run_dir, manifest)
 
     plan_path = os.path.join(run_dir, "design", "plan.json")
@@ -652,7 +830,20 @@ def _run_pipeline_body(
 
     print(f"✅ Plan ready: {len(work_items)} task(s) (see design/plan.json for full detail)\n")
 
-    print(f"🚀 Dispatching {len(work_items)} task(s)...\n")
+    resume_request = config["pipeline"].get("_resume_request")
+    if isinstance(resume_request, ResumeRequest):
+        dispatch_items = [item for item in work_items if item.id in set(resume_request.selected_task_ids)]
+        prior_results = [*resume_request.successful_results, *resume_request.unselected_results]
+        initial_retry_context = resume_request.retry_context
+        print(
+            f"🚀 Resuming {len(dispatch_items)} selected task(s) from "
+            f"{resume_request.source_run_id}...\n"
+        )
+    else:
+        dispatch_items = work_items
+        prior_results = []
+        initial_retry_context = None
+        print(f"🚀 Dispatching {len(work_items)} task(s)...\n")
     report(
         phase="dispatch",
         tasks_total=len(work_items),
@@ -663,10 +854,14 @@ def _run_pipeline_body(
         attempt_round=1,
         max_attempts=config["pipeline"]["max_retries"],
     )
-    attempts_before = {item.id: len(item.attempts) for item in work_items}
+    attempts_before = {item.id: len(item.attempts) for item in dispatch_items}
     try:
         agent_results = dispatch_work_items(
-            work_items, config, run_dir, progress=_print_dispatch_progress,
+            dispatch_items, config, run_dir,
+            strict=not isinstance(resume_request, ResumeRequest),
+            retry_context=initial_retry_context,
+            known_results=prior_results,
+            progress=_print_dispatch_progress,
             task_update=persist_plan,
         )
     except CycleError as e:
@@ -682,7 +877,7 @@ def _run_pipeline_body(
         )
         return False
 
-    _sync_task_results(work_items, agent_results, attempts_before)
+    _sync_task_results(dispatch_items, agent_results, attempts_before)
     persist_plan()
 
     print(f"Dispatch results ({len(agent_results)} agent(s) ran):\n")
@@ -692,13 +887,21 @@ def _run_pipeline_body(
     print()
 
     max_retries = config["pipeline"]["max_retries"]
+    if isinstance(resume_request, ResumeRequest):
+        remaining_task_attempts = [
+            max_retries - len(item.attempts)
+            for item in work_items if item.id in set(resume_request.selected_task_ids)
+        ]
+        max_retries = min([max_retries, *remaining_task_attempts])
     validator = StaticValidator()
 
-    current_work_items = work_items
-    all_agent_results: list[AgentResult] = list(agent_results)
+    current_work_items = dispatch_items
+    all_agent_results: list[AgentResult] = [*prior_results, *agent_results]
+    contracts_complete = _contract_candidate_is_complete(work_items, all_agent_results)
     report(phase="static_validation", task=None, attempt_round=1)
     validation_result: ValidationResult = validator.run(
-        config, work_items, run_dir, all_agent_results
+        config, work_items, run_dir, all_agent_results,
+        contracts_complete=contracts_complete,
     )
 
     attempt = 1
@@ -733,6 +936,12 @@ def _run_pipeline_body(
         retry_context = master.map_validation_issues_to_work_items(
             validation_result, all_agent_results, work_items
         )
+        if isinstance(resume_request, ResumeRequest):
+            selected_ids = set(resume_request.selected_task_ids)
+            retry_context = {
+                task_id: failures for task_id, failures in retry_context.items()
+                if task_id in selected_ids
+            }
         if not retry_context:
             print("⚠️  Could not map any failures to WorkItems — stopping retries.\n")
             break
@@ -767,10 +976,12 @@ def _run_pipeline_body(
         print()
 
         all_agent_results.extend(retry_results)
+        contracts_complete = _contract_candidate_is_complete(work_items, all_agent_results)
 
         report(phase="static_validation", task=None, attempt_round=attempt)
         validation_result = validator.run(
-            config, work_items, run_dir, all_agent_results
+            config, work_items, run_dir, all_agent_results,
+            contracts_complete=contracts_complete,
         )
         with open(
             os.path.join(run_dir, "validation", "results", f"attempt-{attempt}.json"), "w"

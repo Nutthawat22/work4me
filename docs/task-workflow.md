@@ -70,7 +70,8 @@ earlier ACP turns and other owned paths are context only.
 The response is framed with request-unique `BEGIN-OWNED-FILE:<nonce>` and
 `END-OWNED-FILE:<nonce>` lines around raw source. The delivery layer removes
 those framing lines and one separator newline, preserving quotes and meaningful
-internal/trailing newlines. A complete Markdown fence surrounding the entire
+internal/trailing newlines. LF and CRLF framing are both accepted without
+normalizing source line endings. A complete Markdown fence surrounding the entire
 framed response is accepted and removed; an unterminated outer fence, mismatched
 or stale nonce, or malformed framing is rejected. Fences inside the source body
 are preserved as source. ASCII controls other than line feed, carriage return,
@@ -97,6 +98,24 @@ dependency files before any of that feature's actions are published. The
 validator reads source only; it does not import or execute generated code,
 install application dependencies, or launch tests/builds.
 
+Rejected response bodies are retained separately under
+`diagnostics/rejected/<task-key>/` as source-only evidence plus bounded framing
+and completion metadata. The directory is owner-only, files are mode 0600, and
+raw source retention has per-candidate and per-run byte budgets. Prompts,
+provider logs, and configured API keys are not copied into these records. Stage
+resets do not erase rejected-candidate evidence. Diagnostics are excluded from
+product, tests, and external handoff inventories.
+
+For new Node projects, planning requires exact ownership of root
+`package.json` and `tsconfig.json` (TypeScript) or `jsconfig.json` (JavaScript).
+The manifest task acceptance criteria cover the requested runtime, manager,
+runtime dependencies, and test command. An explicitly requested manager is
+preserved; npm is the default when none is named. Existing-project changes do
+not require replacement scaffolding. The pipeline does not invent or resolve an
+application lockfile. An npm project without `package-lock.json` is handed off
+as `lock_pending`; external lock preparation is a separate manual step. The
+external tester currently supports npm lockfiles only.
+
 Publication uses per-file same-filesystem replacements and backups. A feature's
 publication set is not filesystem-atomic. If any write/delete fails, changed
 paths are best-effort restored and rollback failures are recorded in stage and
@@ -114,14 +133,18 @@ these budgets are called out in the context.
 ## Retry Behavior
 
 Deterministic static-validation errors map to the task owning the failed file.
-A validation task's declared implementation dependencies are included when an
-owned test/source asset needs repair. Dependents of changed tasks are also
-retried because their outputs may be stale. Unrelated successful tasks are not
-regenerated. Valid staged sibling files remain available on retries; rejected,
-missing, stale, or explicitly implicated files are the only files regenerated.
-An unowned/cross-file consistency failure without a safe file-specific mapping
-invalidates the feature's staged set and carries bounded feedback into its next
-request. Stage reuse requires the same plan identity, owned paths, feature
+Missing files from blocked or failed tasks are incomplete dispatch state, not
+defects in implementation dependencies. A failing validation task is repaired
+as that task; its implementation dependencies are not regenerated merely
+because a test was missing or invalid. Successful dependents are regenerated
+only when structured review identifies an affected contract. Dependents that
+were blocked and never generated are dispatched after their selected failed
+prerequisite is repaired. Unrelated successful tasks are not regenerated. Valid
+staged sibling files remain available; only rejected, missing, stale, or
+explicitly implicated files are regenerated. Review results report exact
+owned paths and permitted downstream task ids. Reliable scoped findings
+invalidate only those paths; unknown paths or unscoped findings use an explicit
+conservative feature-wide fallback. Stage reuse requires the same plan identity, owned paths, feature
 context, and existing-source snapshot; a mismatch resets that feature's stage.
 `pipeline.max_retries` remains the bounded outer attempt budget; there is no
 additional per-file retry loop. The optional feature-level self-check is one
@@ -130,6 +153,34 @@ never unpublished product paths. Warning-only unused private declarations and
 unsupported analysis limitations do not trigger repair retries. Runtime
 tests/builds are external and do not participate in this retry loop. The legacy
 `pipeline.tests_blocking` option is accepted but ignored.
+
+## TypeScript/JavaScript Static Coverage
+
+The pipeline-owned checker is pinned to TypeScript 6.0.3 in
+`tools/typescript-checker/`. It uses a fixed `noEmit` compiler profile and a
+restricted compiler host over the authorized source overlay (staged files,
+published dependencies, and bounded project sources) plus TypeScript's trusted
+declaration libraries. It ignores generated `tsconfig.json` options, plugins,
+scripts, and package dependencies. Input is never executed, imported by Python,
+installed, built, or tested. Limits are 30 seconds, 512 MiB V8 heap, 2,000
+files, 4 MiB source text, and 200 diagnostics. Static results record
+`typescript_status` (`checked`, `unsupported`, or `not_applicable`); missing
+tooling and budget exhaustion are explicit limitations, not silent passes.
+Provision the trusted checker with
+`npm ci --ignore-scripts --prefix tools/typescript-checker`; this installs only
+the lock-pinned pipeline tool and never resolves generated-project dependencies.
+
+TS/TSX/JS/JSX/MJS/CJS syntax and parser-derived imports are inventoried.
+Machine-extractable named interface/type contracts are checked with TypeScript
+structural assignability in both directions. Free-text semantic requirements
+remain review/acceptance concerns. Own-source TypeScript errors block when type
+origins resolve. Unresolved external modules and Node builtin typings (including
+`node:async_hooks`) contaminate their source and transitive dependents; semantic
+diagnostics there are suppressed with explicit limitations. The checker does
+not install `@types/node` or application dependencies. JavaScript/JSX
+semantic checking and unused-symbol analysis are unsupported. TypeScript also
+cannot establish domain meaning such as whether a UUID identifies a team or a
+user.
 
 ## Progress Counters
 
@@ -182,16 +233,53 @@ metadata while task-count and status fields retain their existing meaning.
 `manifest.json` records
 `validation_passed_external_testing_pending`, `validation_failed`, or a
 pipeline/dispatch `failed` status, plus `validation_status`, warnings, and
-analysis limitations. Per-attempt static findings and `fail_report.json` are
+analysis limitations. Schema version 3 also records plan/toolchain/config
+compatibility identities and a published-file SHA-256 snapshot. Per-attempt
+static findings (including parser-derived import inventory) and
+`fail_report.json` are
 under `validation/results/`. `tests/` contains generated test source only.
 Every run also includes `testing-handoff.md` and `testing-handoff.json` for
 isolated external runtime testing and the versioned result contract.
 
+`implementation-result.json` exposes completed task and declared AC/file
+coverage for an external Code-stage host. Its deterministic `T-001` ids map
+back to original WorkItem ids without changing the execution plan. Runtime
+test counts remain null and lint remains `not_run`. ACP schema 2 uses
+`outcome: "passed"` for implementation completion and keeps the explicit
+static outcome in `pipeline_outcome`; manifest and testing-handoff semantics
+remain the same. In AI-SDLC existing-project mode the host owns its Code
+artifacts and index; the provider updates only the assigned source worktree.
+
+## Explicit Resume
+
+Resume creates a child run; the source run's manifest, plan, stage, and
+diagnostics remain unchanged. Preflight requires a finalized schema-3 source
+run, exact task ids, compatible output/config/toolchain identity, unchanged
+published source digests, and verified stages for passed dependencies. The
+child imports only hash-verified published files and selected stage/attempt
+history, skips paid planning, and dispatches the selected repair set plus
+declared blocked/contract-affected closure. `resume-history.json` and manifest
+`resume` provenance link the child to its source.
+
+```sh
+venv/bin/python src/pipeline/resume_cli.py \
+  --run 0004-original-run \
+  --task TASK-feature-auth
+```
+
+For existing-project runs, add `--project-root` with the exact original
+project path. ACP clients configure `_agents-pipeline/run/resume` with
+`sessionId`, `runId`, and exact `taskIds`, then send the prompt `resume` in
+that session. A legacy run such as `0018` lacks the required schema/tooling/source
+identity; it needs an authorized plan amendment before resume.
+
 ## Breaking Migration
 
-New runs require the version-2 task schema. The previous `type` plus scalar
+New runs require the version-2 task schema and schema-3 run provenance. The previous `type` plus scalar
 `output_path` plan format is not read or converted. Existing `runs/` outputs are
-left untouched and remain available for inspection. Start a new run through the
-current free-text, handoff, or manifest planning path to generate a version-2
-plan. External file manifests still use file entries, but are adapted and
-validated into the common task model before dispatch.
+left untouched and remain available for inspection. Schema-2 plan artifacts
+remain readable but cannot safely resume because their tooling/config/source
+identities are missing. Start a new run through the current free-text, handoff,
+or manifest planning path to generate a compatible plan. External file
+manifests still use file entries, but are adapted and validated into the common
+task model before dispatch.

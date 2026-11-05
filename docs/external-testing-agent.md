@@ -80,6 +80,14 @@ Quote path arguments containing spaces using shell-style quotes. The prompt is p
 - Commands declared in the handoff are advisory and are never executed as shell text. Node tests run only a directly declared Vitest, Jest, Mocha, TAP, or `node --test` command; npm shell wrappers are rejected. A recognized npm `build` script and npm install lifecycle hooks can still run arbitrary project code **inside Docker**.
 - Missing manifests, unsupported lockfiles, incompatible runtime declarations, missing test runners, unavailable Docker, and setup timeouts are recorded as setup failures. Test command failures/timeouts are recorded in command evidence; user cancellation is `cancelled`.
 
+The pipeline handoff reports `external_testing.lock_preparation`. `lock_pending`
+means an npm project has no root `package-lock.json`; an operator must prepare
+the lockfile in the isolated project workflow before delegating this tester.
+The pipeline does not run `npm install`, resolve application dependencies, or
+generate the lockfile. If a request explicitly selected pnpm, Yarn, or Bun, the
+pipeline preserves that manager and reports `unsupported_package_manager`
+because this tester currently supports npm only.
+
 ## Result and evidence
 
 Each run writes:

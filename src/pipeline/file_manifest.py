@@ -185,6 +185,16 @@ def _render_features(features: list[Feature]) -> str:
             lines.append("  acceptance_criteria: (none)")
         lines.append(f"  source_ids: {', '.join(feat.source_ids) if feat.source_ids else '(none)'}")
         lines.append(f"  depends_on: {', '.join(feat.depends_on) if feat.depends_on else '(none)'}")
+        for contract in feat.design_contract_inventory:
+            lines.append(
+                f"  global design contract inventory {contract['name']} ({contract['source_ref']}):"
+            )
+            lines.append("    " + contract["declaration"].replace("\n", "\n    "))
+        for contract in feat.design_contracts:
+            lines.append(
+                f"  explicitly assigned design contract {contract['name']} ({contract['source_ref']}):"
+            )
+            lines.append("    " + contract["declaration"].replace("\n", "\n    "))
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
 
@@ -482,6 +492,8 @@ def file_groups_to_work_items(
         feats = ", ".join(group.contributing_features) if group.contributing_features else "(none)"
         lines = [f"Module: {group.title}", f"Contributing features: {feats}", "Owned files:"]
         source_ids: list[str] = []
+        design_contracts: list[dict[str, str]] = []
+        design_contract_inventory: list[dict[str, str]] = []
         owned_files: list[OwnedFile] = []
         requirements = list(group.requirements)
         for path in group.files:
@@ -495,6 +507,8 @@ def file_groups_to_work_items(
             feature = feature_by_id.get(feature_id)
             if feature is not None:
                 source_ids.extend(feature.source_ids)
+                design_contracts.extend(feature.design_contracts)
+                design_contract_inventory.extend(feature.design_contract_inventory)
                 requirements.extend(feature.acceptance_criteria if group.role == "feature" else [])
         description = "\n".join(lines)
         dependencies = set(group.depends_on)
@@ -521,6 +535,14 @@ def file_groups_to_work_items(
                 owned_files=owned_files,
                 depends_on=sorted(dependencies),
                 expected_interfaces=list(group.interfaces),
+                design_contracts=list({
+                    (contract["name"], contract["declaration"]): contract
+                    for contract in design_contracts
+                }.values()),
+                design_contract_inventory=list({
+                    (contract["name"], contract["declaration"]): contract
+                    for contract in design_contract_inventory
+                }.values()),
             )
         )
 

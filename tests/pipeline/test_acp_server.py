@@ -87,8 +87,13 @@ def test_initialize_returns_well_formed_response(agent):
     assert resp.agent_capabilities.field_meta["agents-pipeline"]["runStatus"]["method"] == (
         "_agents-pipeline/run/status"
     )
+    assert resp.agent_capabilities.field_meta["agents-pipeline"]["runStatus"]["schemaVersion"] == 2
+    assert resp.agent_capabilities.field_meta["agents-pipeline"]["runStatus"]["outcomeScope"] == "implementation"
     assert resp.agent_capabilities.field_meta["agents-pipeline"]["sessionConfig"]["method"] == (
         "_agents-pipeline/session/configure"
+    )
+    assert resp.agent_capabilities.field_meta["agents-pipeline"]["runResume"]["method"] == (
+        "_agents-pipeline/run/resume"
     )
 
 
@@ -107,6 +112,29 @@ def test_new_session_ids_are_unique(agent):
     r2 = asyncio.run(agent.new_session(cwd="/tmp/a"))
 
     assert r1.session_id != r2.session_id
+
+
+def test_resume_extension_dispatches_exact_tasks_without_planning(agent, monkeypatch):
+    agent._conn = _RecordingConn()
+    session = asyncio.run(agent.new_session(cwd="/tmp/client-cwd"))
+    configured = asyncio.run(agent.ext_method(
+        "agents-pipeline/run/resume",
+        {"sessionId": session.session_id, "runId": "0001-source", "taskIds": ["TASK-feature"]},
+    ))
+    captured = []
+
+    def fake_resume(config, source_run, task_ids, **kwargs):
+        captured.append((source_run, task_ids, kwargs))
+        kwargs["progress"]({"phase": "teardown", "outcome": "validation_passed_external_testing_pending"})
+        return True
+
+    monkeypatch.setattr(acp_server, "resume_pipeline", fake_resume)
+
+    result = asyncio.run(agent.prompt(session.session_id, [_text_block("resume")]))
+
+    assert configured["configured"] is True
+    assert captured[0][0:2] == ("0001-source", ["TASK-feature"])
+    assert result.stop_reason == "end_turn"
 
 
 def test_existing_project_configuration_is_validated_and_passed_to_pipeline(
@@ -659,7 +687,9 @@ def test_failed_run_releases_queue_and_final_update_precedes_response(agent, mon
         "agents-pipeline/run/status", {"sessionId": sessions[1].session_id}
     ))
     assert status["status"] == "completed"
-    assert status["outcome"] == "validation_passed_external_testing_pending"
+    assert status["outcome"] == "passed"
+    assert status["outcome_scope"] == "implementation"
+    assert status["pipeline_outcome"] == "validation_passed_external_testing_pending"
 
 
 def test_legacy_success_outcome_is_normalized_to_external_testing_pending(agent, monkeypatch):
@@ -682,7 +712,8 @@ def test_legacy_success_outcome_is_normalized_to_external_testing_pending(agent,
     ))
     assert result.stop_reason == "end_turn"
     assert status["status"] == "completed"
-    assert status["outcome"] == "validation_passed_external_testing_pending"
+    assert status["outcome"] == "passed"
+    assert status["pipeline_outcome"] == "validation_passed_external_testing_pending"
     assert status["validation_status"] == "passed"
     assert status["external_testing_status"] == "pending"
     assert any("external runtime testing is pending" in text for _, text in agent._conn.updates)

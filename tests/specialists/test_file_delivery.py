@@ -12,7 +12,7 @@ import pytest
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_ROOT)
 
-from pipeline.state import OwnedFile, ValidationIssue, WorkItem
+from pipeline.state import OwnedFile, ReviewResult, ValidationIssue, WorkItem
 from specialists import file_delivery
 from specialists.llm_client import LLMResponse
 
@@ -112,6 +112,120 @@ def test_each_owned_file_is_delivered_as_plain_framed_source_with_quotes_and_new
     data = json.loads(stage_manifest.read_text())
     assert data["schema_version"] == 1
     assert all(record["status"] == "staged" for record in data["files"].values())
+
+
+def test_crlf_framing_preserves_source_line_endings(monkeypatch, tmp_path):
+    source = "FIRST = 1\r\nSECOND = 2\r\n"
+
+    def respond(messages, model, config, **kwargs):
+        request = messages[1]["content"]
+        markers = re.search(
+            r"Framing: first line is (BEGIN-OWNED-FILE:[A-Za-z0-9_-]+); last line is (END-OWNED-FILE:[A-Za-z0-9_-]+)",
+            request,
+        )
+        assert markers is not None
+        return LLMResponse(
+            f"{markers.group(1)}\r\n{source}\r\n{markers.group(2)}",
+            "complete",
+            "end_turn",
+        )
+
+    _install(monkeypatch, respond)
+    result = _deliver(_task("value.py"), _config(), tmp_path)
+
+    assert result.success
+    assert (tmp_path / "product/value.py").read_bytes() == source.encode()
+
+
+def test_unterminated_outer_fence_is_rejected_and_retained(monkeypatch, tmp_path):
+    def respond(messages, model, config, **kwargs):
+        return LLMResponse(f"```python\n{_frame(messages, 'VALUE = 1')}\n", "complete", "end_turn")
+
+    _install(monkeypatch, respond)
+    result = _deliver(_task("value.py"), _config(max_retries=1), tmp_path)
+
+    assert not result.success
+    candidate = next((tmp_path / "diagnostics/rejected").rglob("*.source"))
+    retained = candidate.read_text()
+    assert retained.startswith("```python\nBEGIN-OWNED-FILE:")
+    assert "VALUE = 1" in retained
+    assert retained.endswith("\n")
+
+
+def test_rejected_candidate_source_and_nonce_metrics_are_protected_and_retained(monkeypatch, tmp_path):
+    def respond(messages, model, config, **kwargs):
+        request = messages[1]["content"]
+        markers = re.search(
+            r"Framing: first line is (BEGIN-OWNED-FILE:[A-Za-z0-9_-]+); last line is (END-OWNED-FILE:[A-Za-z0-9_-]+)",
+            request,
+        )
+        assert markers is not None
+        return LLMResponse(
+            "BEGIN-OWNED-FILE:stale-nonce\nTOKEN_VALUE = 'candidate'\nEND-OWNED-FILE:stale-nonce",
+            "complete",
+            "end_turn",
+        )
+
+    _install(monkeypatch, respond)
+    result = _deliver(_task("value.py"), _config(max_retries=1), tmp_path)
+
+    assert not result.success
+    task_dir = next((tmp_path / "diagnostics/rejected").iterdir())
+    source = next(task_dir.glob("*.source"))
+    metadata_path = next(task_dir.glob("*.json"))
+    metadata = json.loads(metadata_path.read_text())
+    assert source.read_text() == "TOKEN_VALUE = 'candidate'"
+    assert source.stat().st_mode & 0o777 == 0o600
+    assert metadata_path.stat().st_mode & 0o777 == 0o600
+    assert metadata["stale_nonce"] is True
+    assert metadata["current_nonce"] is False
+    assert metadata["source_length"] == len("TOKEN_VALUE = 'candidate'")
+    assert metadata["completion_status"] == "complete"
+    assert "test-secret" not in metadata_path.read_text()
+
+
+def test_scoped_review_rejects_one_file_and_preserves_staged_siblings(monkeypatch, tmp_path):
+    calls: list[str] = []
+    reviews = iter([
+        ReviewResult(
+            False,
+            ["a.py has a mismatch"],
+            "Only a.py needs a repair",
+            affected_paths=["a.py"],
+            scope_reliable=True,
+        ),
+        ReviewResult(True, [], "fixed"),
+    ])
+
+    def respond(messages, model, config, **kwargs):
+        target = re.search(r"CURRENT TARGET FILE .*?: ([^\n]+)", messages[1]["content"])
+        assert target is not None
+        path = target.group(1)
+        calls.append(path)
+        return LLMResponse(_frame(messages, f"VALUE_{path[-4]} = 1\n"), "complete", "end_turn")
+
+    _install(monkeypatch, respond)
+    monkeypatch.setattr("specialists.base._self_check", lambda *args, **kwargs: next(reviews))
+    item = _task("a.py", "b.py", "c.py")
+    first = _deliver(item, _config(), tmp_path)
+
+    assert not first.success
+    stage_manifest = next((tmp_path / "staging").rglob("stage.json"))
+    stage = json.loads(stage_manifest.read_text())
+    assert stage["repair_scope"] == {
+        "kind": "review_scoped",
+        "paths": ["product/a.py"],
+        "work_item_ids": [],
+    }
+    assert stage["files"]["product/a.py"]["status"] == "rejected"
+    assert stage["files"]["product/b.py"]["status"] == "staged"
+    assert stage["files"]["product/c.py"]["status"] == "staged"
+    assert (tmp_path / "staging" / stage_manifest.parent.name / "files/product/b.py").is_file()
+
+    second = _deliver(item, _config(), tmp_path)
+
+    assert second.success
+    assert calls == ["product/a.py", "product/b.py", "product/c.py", "product/a.py"]
 
 
 def test_retry_retains_accepted_file_and_regenerates_only_rejected_file(monkeypatch, tmp_path):

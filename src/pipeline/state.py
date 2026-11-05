@@ -61,9 +61,11 @@ class WorkItem:
     owned_files: list[OwnedFile]
     depends_on: list[str] = field(default_factory=list)
     expected_interfaces: list[str] = field(default_factory=list)
+    design_contracts: list[dict[str, str]] = field(default_factory=list)
     status: TaskStatus = "blocked"
     attempts: list[TaskAttempt] = field(default_factory=list)
     file_progress: list[FileAttempt] = field(default_factory=list)
+    design_contract_inventory: list[dict[str, str]] = field(default_factory=list)
 
 
 # ── Agent Result ─────────────────────────────────────────────────────────────
@@ -76,6 +78,7 @@ class AgentResult:
     files_written: list[str]         # relative paths
     notes: str = ""                  # agent commentary, warnings
     files_deleted: list[str] = field(default_factory=list)
+    affected_work_item_ids: list[str] = field(default_factory=list)
 
 
 # ── Static Validation ────────────────────────────────────────────────────────
@@ -95,6 +98,8 @@ class ValidationResult:
     errors: list[ValidationIssue] = field(default_factory=list)
     warnings: list[ValidationIssue] = field(default_factory=list)
     limitations: list[str] = field(default_factory=list)
+    typescript_status: str = "not_applicable"
+    import_inventory: list[dict[str, str]] = field(default_factory=list)
 
 
 # ── Review Result ────────────────────────────────────────────────────────────
@@ -111,6 +116,9 @@ class ReviewResult:
     accepted: bool
     issues: list[str]
     reasoning: str
+    affected_paths: list[str] = field(default_factory=list)
+    affected_work_item_ids: list[str] = field(default_factory=list)
+    scope_reliable: bool = False
 
 
 # ── Fail Report ──────────────────────────────────────────────────────────────
@@ -136,6 +144,8 @@ class Feature:
     language: str
     source_ids: list[str] = field(default_factory=list)   # REQ-*/AC-*/TEST-* traceability
     depends_on: list[str] = field(default_factory=list)    # other Feature ids
+    design_contracts: list[dict[str, str]] = field(default_factory=list)
+    design_contract_inventory: list[dict[str, str]] = field(default_factory=list)
 
 
 # ── File Spec ────────────────────────────────────────────────────────────────

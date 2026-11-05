@@ -164,12 +164,16 @@ With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "session_id": "<session id>",
   "run_id": "0001-build-a-cli",
+  "run_dir": "/absolute/server/runs/0001-build-a-cli",
+  "implementation_result_path": null,
   "status": "running",
     "phase": "dispatch",
     "outcome": null,
+    "outcome_scope": "implementation",
+    "pipeline_outcome": null,
     "validation_status": "pending",
     "validation_warnings": 0,
     "validation_limitations": [],
@@ -204,7 +208,9 @@ With the Python SDK, call `await conn.ext_method("agents-pipeline/run/status", {
 }
 ```
 
-`status` is `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean runtime-tested.** `phase` describes the current stage (`queued`, `planning`, `dispatch`, `static_validation`, `retrying`, `teardown`, and terminal/initial states). New outcomes are `validation_passed_external_testing_pending`, `validation_failed`, `failed`, `error`, `cancelled`, or `invalid_prompt`. `validation_status` is `pending`, `passed`, `failed`, or `not_completed`; `external_testing_status` remains `pending` until an external tester records a result. Warnings and unsupported-analysis limitations are exposed in `validation_warnings` and `validation_limitations`. A legacy `outcome: "passed"` must never be interpreted as evidence of runtime tests; new server versions normalize it to `validation_passed_external_testing_pending`. `PromptResponse.stop_reason` remains a protocol turn status, not the pipeline outcome.
+`status` is `created`, `queued`, `running`, `completed`, `failed`, or `cancelled`. **`completed` does not mean runtime-tested.** `phase` describes the current stage (`queued`, `planning`, `dispatch`, `static_validation`, `retrying`, `teardown`, and terminal/initial states). In schema 2, `outcome: "passed"` with `outcome_scope: "implementation"` means that implementation, static validation, required result/handoff artifacts, indexing, and teardown completed. This is the completion predicate used by AI-SDLC's external Code bridge. `outcome` remains null during execution; failures retain `validation_failed`, `failed`, `error`, `cancelled`, or `invalid_prompt` as applicable. Cancellation never returns `passed`.
+
+`pipeline_outcome` preserves the detailed static outcome, including `validation_passed_external_testing_pending`; run manifests retain this explicit status. `validation_status` is `pending`, `passed`, `failed`, or `not_completed`; `external_testing_status` remains `pending` and requires separate external evidence before a runtime success claim. Warnings and unsupported-analysis limitations are exposed in `validation_warnings` and `validation_limitations`. Schema-1 clients that read static success from `outcome` must use `pipeline_outcome` under schema 2. `PromptResponse.stop_reason` remains a protocol turn status, not the assignment outcome.
 
 `queue_position` is one-based among waiting runs and null for the active run or a run without a queue ticket. Task counts describe specialist attempts: `tasks_total` counts planned work items; `tasks_started` counts attempts that began; `tasks_completed` counts attempts that returned passed or failed; retries increment these counters rather than resetting them, so completed attempts may exceed `tasks_total`. Dependency-blocked tasks are counted separately and do not count as started/completed attempts. `current_task` is null when no specialist task is active. While active, it also contains up to 40 per-file attempts (`pending`, `generating`, `staged`, `rejected`, or `published`) with bounded failure details and accepted-source SHA-256 digests. Completion is `complete` only for ACP `end_turn`; other available stop reasons are reported as `incomplete` or `refused`, and providers without stop metadata remain `unsupported`. `run_id` becomes available after run artifacts are created; `session_id` is available from session creation and remains the correlation key while queued.
 
@@ -222,9 +228,34 @@ Prompts submitted to one server process are queued FIFO. Only one full pipeline 
 
 ### 3.9 Cancellation caveat
 
-Calling `session/cancel` is **best-effort only**. It sets `cancel_requested`, but does not stop the active pipeline or remove a queued run. The pipeline completes, including file writes and teardown, before the prompt responds with `stop_reason: "cancelled"`; structured status becomes `cancelled` and retains a known pipeline outcome where available. Cancelling the ACP request itself while queued removes that queue entry. Cancelling it while active waits for the blocking pipeline to finish before releasing the queue slot.
+Calling `session/cancel` is **best-effort only**. It sets `cancel_requested`, but does not stop the active pipeline or remove a queued run. The pipeline completes, including file writes and teardown, before the prompt responds with `stop_reason: "cancelled"`; structured status and `outcome` become `cancelled`, while `pipeline_outcome` retains a known static outcome where available. Cancelling the ACP request itself while queued removes that queue entry. Cancelling it while active waits for the blocking pipeline to finish before releasing the queue slot.
 
 An unexpected pipeline error can still produce `status: "failed"`, `outcome: "error"` and `stop_reason: "refusal"` even when cancellation was requested.
+
+### 3.10 Selective resume
+
+Resume is an explicit child run, not a second prompt against the source run.
+Before prompting, configure the extension with the source run id/path and exact
+task ids, then send the single text prompt `resume`:
+
+```python
+await conn.ext_method(
+    "agents-pipeline/run/resume",
+    {"sessionId": session_id, "runId": "0004-original", "taskIds": ["TASK-auth"]},
+)
+await conn.prompt(session_id, "resume")
+```
+
+For existing-project mode, configure `agents-pipeline/session/configure` with
+the exact original project root before setting the resume request. Resume
+preflight checks schema/toolchain/config identity, plan digest, published-source
+digests, stage history, task ids, and dependency closure. Planning is skipped;
+the child imports verified published sources and selected task stages, then
+uses the normal bounded dispatch, validation, review, and publication path.
+The source run stays unchanged. Read the child run id from structured status
+and inspect its `resume-history.json` provenance. Legacy runs without schema-3
+metadata are refused until an authorized plan amendment supplies the missing
+identities.
 
 ## 4. Minimal example client (Python)
 
@@ -296,12 +327,13 @@ For live status polling while `prompt` is in flight, query the extension describ
 
 ## 6. Where output lands
 
-Each pipeline run creates `<runs-root>/<run-id>/`. `pipeline.runs_dir` resolves relative to the server repo root (default `runs/`); an absolute configured path is honored. Neither subprocess cwd nor `new_session.cwd` relocates that root. Status returns `run_id`, not an absolute path, so clients must know the server repo/config location. With default `pipeline.output_dir` and `pipeline.tests_dir`, the directory contains:
+Each pipeline run creates `<runs-root>/<run-id>/`. `pipeline.runs_dir` resolves relative to the server repo root (default `runs/`); an absolute configured path is honored. Neither subprocess cwd nor `new_session.cwd` relocates that root. Status returns the absolute `run_dir` and finalized `implementation_result_path`, so clients can read output without assuming a checkout location. With default `pipeline.output_dir` and `pipeline.tests_dir`, the directory contains:
 
 - **`product/`** — the generated code.
 - **`tests/`** — generated test source files; they are not executed by the pipeline.
 - **`validation/results/`** — deterministic static validation findings per attempt and final failure report.
 - **`manifest.json`** — status (`validation_passed_external_testing_pending`, `validation_failed`, `failed`, etc.), validation status/limitations, timestamps, attempt count, and the original prompt/label.
+- **`implementation-result.json`** — schema-1 Code delivery evidence: tasks with deterministic host `T-001` ids and original WorkItem ids, declared AC/file coverage from completed tasks, published-file digests, and separate validation/test state. `lint` is `not_run`, `unit_tests` is null, and delivery is `working_tree`. The host creates its own `tasks.md`, `code_manifest.json`, and index from this record. Failure to write this required result prevents a successful ACP outcome.
 - **`design/plan.json`** — version-2 task plan, explicit category and file ownership, dependencies, current task status, attempt results, and failure details.
 - **`instructions.md`** — a human-readable summary of the run.
 - **`testing-handoff.md`** and **`testing-handoff.json`** — project/artifact paths, changed files, declared runtimes/dependencies, lockfiles, configured/project test/build commands, environment variable names, known services, validation findings/limitations, and an external result contract. Dependency versions come from project manifests/lockfiles; secrets and environment values are not included.

@@ -39,6 +39,7 @@ import os
 import re
 
 from pipeline.dispatch import CycleError, topological_sort
+from pipeline.design_contracts import extract_typescript_contracts, merge_contracts
 from pipeline.state import (
     AgentResult,
     FailReport,
@@ -327,9 +328,13 @@ Rules:
   "product" or "tests". Every path has exactly one owner across the plan.
 - Dependencies reference task ids in this plan. State the concrete interfaces
   each task promises and expects so dependent tasks can integrate without guessing.
-- Preserve all requested/design scope and trace requirement/test identifiers.
-- Emit JSON only. Do not use legacy logic/ui/config/test/scaffold/integrate types.
-"""
+  - Preserve all requested/design scope and trace requirement/test identifiers.
+  - Put every applicable approved AC-<number> identifier verbatim in requirement_refs. Never invent an AC identifier or replace it with a newly numbered requirement.
+  - Treat explicit interface/type declarations in the supplied request/design as authoritative contract sources. Preserve their exact names, members, optionality, and types in task interfaces and plan context; cite source references instead of substituting a different domain model.
+  - For a new TypeScript project, assign exactly one owner for root package.json and root tsconfig.json. Include runtime/package-manager dependencies and intended test command in acceptance criteria. Prefer npm unless the request explicitly names another manager. Do not invent lockfiles; lock preparation remains a separate handoff status. Existing projects retain their manifests unless the requested change needs them.
+  - For a new JavaScript Node project, assign exactly one owner for root package.json and root jsconfig.json. Existing projects retain their manifests unless the requested change needs them.
+  - Emit JSON only. Do not use legacy logic/ui/config/test/scaffold/integrate types.
+  """
 
 
 FEATURES_SYSTEM_PROMPT_TEMPLATE = """You are the FEATURE-DECOMPOSITION stage in an autonomous coding pipeline.
@@ -453,6 +458,17 @@ class MasterAgent:
         """Update the held intent for a new pipeline run."""
         self.intent = user_prompt
 
+    @staticmethod
+    def _attach_design_contracts(
+        work_items: list[WorkItem], contracts: list[dict[str, str]]
+    ) -> None:
+        for item in work_items:
+            if item.language == "typescript" or any(
+                file.language == "typescript" or file.path.casefold().endswith((".ts", ".tsx"))
+                for file in item.owned_files
+            ):
+                item.design_contract_inventory = [dict(contract) for contract in contracts]
+
     def decompose(
         self, user_prompt: str, project_context: str | None = None
     ) -> list[WorkItem]:
@@ -466,7 +482,6 @@ class MasterAgent:
                 acp_call_with_retry).
         """
         valid_languages = set(self.config["languages"].keys())
-
         model_cfg = self.config["models"]["design"]
         model = model_cfg["model"]
         system_prompt = TASK_PLANNING_PROMPT_TEMPLATE.format(
@@ -496,6 +511,9 @@ class MasterAgent:
 
         def _parse_and_validate(raw: str):
             work_items = self._validate_and_build(self._parse_json(raw), valid_languages)
+            self._attach_design_contracts(
+                work_items, extract_typescript_contracts(user_prompt, "user prompt")
+            )
             self._validate_task_plan(work_items)
             return work_items
 
@@ -512,6 +530,9 @@ class MasterAgent:
 
         parsed = self._parse_json(raw)
         work_items = self._validate_and_build(parsed, valid_languages)
+        self._attach_design_contracts(
+            work_items, extract_typescript_contracts(user_prompt, "user prompt")
+        )
         self._validate_task_plan(work_items)
         return work_items
 
@@ -541,6 +562,10 @@ class MasterAgent:
                 graph is invalid.
         """
         valid_languages = set(self.config["languages"].keys())
+        contracts = merge_contracts(
+            extract_typescript_contracts(design_text, "approved design input"),
+            extract_typescript_contracts(requirements_text or "", "requirements input"),
+        )
 
         model_cfg = self.config["models"]["design"]
         model = model_cfg["model"]
@@ -555,6 +580,15 @@ class MasterAgent:
                 f"--- Additional requirements excerpt (context only) ---\n"
                 f"{requirements_text}"
             )
+        if contracts:
+            user_content += (
+                "\n\nExact extracted TypeScript contract authorities. Preserve each declaration, "
+                "its source reference, member names, and optionality in the resulting plan:\n"
+                + "\n\n".join(
+                    f"--- {contract['name']} ({contract['source_ref']}) ---\n{contract['declaration']}"
+                    for contract in contracts
+                )
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -564,6 +598,7 @@ class MasterAgent:
 
         def _parse_and_validate(raw: str):
             work_items = self._validate_and_build(self._parse_json(raw), valid_languages)
+            self._attach_design_contracts(work_items, contracts)
             self._validate_task_plan(work_items)
             return work_items
 
@@ -580,6 +615,7 @@ class MasterAgent:
 
         parsed = self._parse_json(raw)
         work_items = self._validate_and_build(parsed, valid_languages)
+        self._attach_design_contracts(work_items, contracts)
         self._validate_task_plan(work_items)
         return work_items
 
@@ -606,6 +642,10 @@ class MasterAgent:
                 schema validation.
         """
         valid_languages = set(self.config["languages"].keys())
+        contracts = merge_contracts(
+            extract_typescript_contracts(design_text, "approved design input"),
+            extract_typescript_contracts(requirements_text or "", "requirements input"),
+        )
 
         model_cfg = self.config["models"]["design"]
         model = model_cfg["model"]
@@ -620,6 +660,15 @@ class MasterAgent:
                 f"--- Additional requirements excerpt (context only) ---\n"
                 f"{requirements_text}"
             )
+        if contracts:
+            user_content += (
+                "\n\nExact extracted TypeScript contract authorities. Preserve each declaration, "
+                "its source reference, member names, and optionality in the resulting work plan:\n"
+                + "\n\n".join(
+                    f"--- {contract['name']} ({contract['source_ref']}) ---\n{contract['declaration']}"
+                    for contract in contracts
+                )
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -628,7 +677,11 @@ class MasterAgent:
         response_schema = _build_features_response_schema(valid_languages)
 
         def _parse_and_validate(raw: str):
-            return self._validate_and_build_features(self._parse_features_json(raw), valid_languages)
+            features = self._validate_and_build_features(self._parse_features_json(raw), valid_languages)
+            for feature in features:
+                if feature.language == "typescript":
+                    feature.design_contract_inventory = [dict(contract) for contract in contracts]
+            return features
 
         raw = acp_call_with_retry(
             messages, model, self.config,
@@ -642,7 +695,11 @@ class MasterAgent:
             raise MasterPlanError(raw)
 
         parsed = self._parse_features_json(raw)
-        return self._validate_and_build_features(parsed, valid_languages)
+        features = self._validate_and_build_features(parsed, valid_languages)
+        for feature in features:
+            if feature.language == "typescript":
+                feature.design_contract_inventory = [dict(contract) for contract in contracts]
+        return features
 
     def plan_layout(
         self,
@@ -756,6 +813,8 @@ class MasterAgent:
 
         groups = group_into_work_items(manifest)
         work_items = file_groups_to_work_items(groups, manifest, features)
+        all_contracts = merge_contracts(*(feature.design_contract_inventory for feature in features))
+        self._attach_design_contracts(work_items, all_contracts)
         self._validate_task_plan(work_items)
         return work_items
 
@@ -899,8 +958,8 @@ class MasterAgent:
                 if not isinstance(value, str) or not value.strip():
                     raise MasterPlanError(f"Task {item.id} must have a non-empty {field_name}")
             for field_name in (
-                "acceptance_criteria", "requirement_refs", "depends_on", "expected_interfaces"
-            ):
+                  "acceptance_criteria", "requirement_refs", "depends_on", "expected_interfaces"
+              ):
                 values = getattr(item, field_name)
                 if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
                     raise MasterPlanError(f"Task {item.id} {field_name} must be a list of strings")
@@ -908,6 +967,22 @@ class MasterAgent:
                 raise MasterPlanError(f"Task {item.id} must have acceptance criteria")
             if not item.owned_files:
                 raise MasterPlanError(f"Task {item.id} must own at least one file")
+            if not isinstance(item.design_contracts, list) or any(
+                not isinstance(contract, dict)
+                or set(contract) != {"name", "source_ref", "declaration"}
+                or not all(isinstance(value, str) and value for value in contract.values())
+                for contract in item.design_contracts
+            ):
+                raise MasterPlanError(f"Task {item.id} design_contracts must contain exact named source declarations")
+            if not isinstance(item.design_contract_inventory, list) or any(
+                not isinstance(contract, dict)
+                or set(contract) != {"name", "source_ref", "declaration"}
+                or not all(isinstance(value, str) and value for value in contract.values())
+                for contract in item.design_contract_inventory
+            ):
+                raise MasterPlanError(
+                    f"Task {item.id} design_contract_inventory must contain exact named source declarations"
+                )
             for owned_file in item.owned_files:
                 if not isinstance(owned_file, OwnedFile):
                     raise MasterPlanError(f"Task {item.id} owned files must use the OwnedFile model")
@@ -946,6 +1021,52 @@ class MasterAgent:
                         f"{previous} and {item.id}"
                     )
                 owners[key] = item.id
+
+        pipeline = self.config.get("pipeline", {})
+        if not pipeline.get("_existing_project_path"):
+            node_files = [
+                owned_file
+                for item in work_items
+                for owned_file in item.owned_files
+                if owned_file.area == "product"
+                and (
+                    owned_file.language in {"javascript", "typescript"}
+                    or owned_file.path.casefold().endswith((".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"))
+                )
+            ]
+            if node_files:
+                output_dir = normalize_relative_path(pipeline.get("output_dir", "product"))
+                planned_root_files: dict[str, tuple[WorkItem, OwnedFile]] = {}
+                for item in work_items:
+                    for owned_file in item.owned_files:
+                        if owned_file.area != "product":
+                            continue
+                        path = normalize_relative_path(owned_file.path)
+                        if path.startswith(output_dir + "/"):
+                            path = path[len(output_dir) + 1:]
+                        if "/" not in path:
+                            planned_root_files[path.casefold()] = (item, owned_file)
+                is_typescript = any(
+                    owned_file.language == "typescript"
+                    or owned_file.path.casefold().endswith((".ts", ".tsx"))
+                    for owned_file in node_files
+                )
+                required_manifests = ["package.json", "tsconfig.json" if is_typescript else "jsconfig.json"]
+                for required in required_manifests:
+                    if required not in planned_root_files:
+                        raise MasterPlanError(
+                            f"New Node/TypeScript project must plan exact-owned root {required}"
+                        )
+                manifest_owner = planned_root_files["package.json"][0]
+                manifest_owner.acceptance_criteria = list(dict.fromkeys([
+                    *manifest_owner.acceptance_criteria,
+                    "Root package.json declares the intended runtime, package-manager choice, runtime dependencies, and test command from the supplied design without inventing versions or a lockfile.",
+                ]))
+                compiler_owner = planned_root_files["tsconfig.json" if is_typescript else "jsconfig.json"][0]
+                compiler_owner.acceptance_criteria = list(dict.fromkeys([
+                    *compiler_owner.acceptance_criteria,
+                    f"Root {'tsconfig.json' if is_typescript else 'jsconfig.json'} records the intended compiler/runtime profile and does not extend an untrusted external configuration.",
+                ]))
 
         try:
             topological_sort(work_items, strict=True)
@@ -1045,33 +1166,43 @@ class MasterAgent:
         work_items: list[WorkItem],
       ) -> dict[str, list[ValidationIssue]]:
         """
-        Resolve failing output files to their owning tasks. Validation-task
-        failures also retry their declared implementation dependencies; any
-        changed task then pulls in downstream dependents whose outputs may be
-        stale. Unrelated successful tasks stay out of the retry subset.
+        Resolve failing output files to their owning tasks. Re-run blocked,
+        not-yet-generated dependents after an actual failed prerequisite;
+        previously-passed dependents are included only when structured review
+        explicitly marks their contracts affected. Validation failures do not
+        expand into implementation dependencies.
 
         Returns a map from retry task id to its directly associated validation
         failures. Tasks added for repair have empty lists.
         """
         by_id = {item.id: item for item in work_items}
 
-        # Run-relative output path -> task id from every AgentResult.
+        latest_results = {result.work_item_id: result for result in agent_results}
+        # Run-relative output path -> task id from the latest successful result.
         reverse_map: dict[str, str] = {}
-        for result in agent_results:
+        for result in latest_results.values():
+            if not result.success:
+                continue
             for path in result.files_written:
                 reverse_map[os.path.normcase(os.path.normpath(path))] = result.work_item_id
 
         retry_failures: dict[str, list[ValidationIssue]] = {}
 
-        for result in agent_results:
+        for result in latest_results.values():
             item = by_id.get(result.work_item_id)
-            if item is not None and item.status == "failed":
+            if (
+                item is not None
+                and not result.success
+                and not result.notes.startswith("Task blocked by dependencies:")
+            ):
                 retry_failures.setdefault(item.id, [])
+            for affected_id in result.affected_work_item_ids:
+                if affected_id in by_id:
+                    retry_failures.setdefault(affected_id, [])
 
         for failure in validation_result.errors:
             file_path = failure.file_path
             normalized = os.path.normcase(os.path.normpath(file_path))
-
             work_item_id = (
                 failure.work_item_id
                 if failure.work_item_id in by_id
@@ -1079,8 +1210,6 @@ class MasterAgent:
             )
 
             if work_item_id is None:
-                # Fallback handles relative vs project-root-relative path
-                # differences between validation findings and recorded outputs.
                 matches = {
                     mapped_id
                     for mapped_path, mapped_id in reverse_map.items()
@@ -1090,22 +1219,35 @@ class MasterAgent:
                     work_item_id = matches.pop()
 
             if work_item_id is None:
-                # Couldn't resolve — skip retry-targeting for this failure,
-                # but the raw finding still surfaces in the FailReport.
+                continue
+
+            latest = latest_results.get(work_item_id)
+            if (
+                latest is not None
+                and latest.notes.startswith("Task blocked by dependencies:")
+                and "expected owned file is missing" in failure.error_output.casefold()
+            ):
                 continue
 
             retry_failures.setdefault(work_item_id, []).append(failure)
-            item = by_id.get(work_item_id)
-            if item is not None and item.category == "validation":
-                for dep_id in item.depends_on:
-                    retry_failures.setdefault(dep_id, [])
-
-        changed = set(retry_failures)
+        # A blocked downstream task has not produced candidate output yet;
+        # dispatch it once its failed dependency is included in this repair.
+        # Previously-passed dependents are regenerated only when a structured
+        # review explicitly lists them in affected_work_item_ids.
+        changed = {
+            work_item_id
+            for work_item_id, result in latest_results.items()
+            if not result.success and not result.notes.startswith("Task blocked by dependencies:")
+        }
+        visited = set(changed)
         while changed:
             current = changed.pop()
             for item in work_items:
-                if current in item.depends_on and item.id not in retry_failures:
-                    retry_failures[item.id] = []
+                result = latest_results.get(item.id)
+                is_blocked = result is not None and result.notes.startswith("Task blocked by dependencies:")
+                if current in item.depends_on and is_blocked and item.id not in visited:
+                    retry_failures.setdefault(item.id, [])
+                    visited.add(item.id)
                     changed.add(item.id)
 
         return retry_failures

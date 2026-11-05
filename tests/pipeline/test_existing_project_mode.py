@@ -1,8 +1,13 @@
 """Existing-project context, static validation, and run-artifact isolation."""
 
+import asyncio
 import json
 import os
 import sys
+from pathlib import Path
+
+import acp
+import pytest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_ROOT)
@@ -232,3 +237,93 @@ def test_existing_project_pipeline_passes_static_validation_without_runtime_test
     assert changes["partial_edits_possible"] is False
     assert handoff["external_testing"]["status"] == "pending"
     assert not (project / "tests").exists()
+
+
+@pytest.mark.parametrize("failure", [None, "static", "handoff", "result", "index", "teardown", "cancel"])
+def test_external_code_bridge_receives_final_outcome_and_honest_delivery_evidence(
+    monkeypatch, tmp_path, failure
+):
+    from pipeline import acp_server
+
+    project = tmp_path / "code-worktree"
+    (project / "src").mkdir(parents=True)
+    (project / "src/app.py").write_text("value = 1\n")
+    runs = tmp_path / "provider-runs"
+    config = {
+        "pipeline": {"runs_dir": str(runs), "output_dir": "product", "tests_dir": "tests", "max_retries": 1},
+        "languages": {"python": {}},
+    }
+    item = _work_item()
+    item.requirement_refs = ["AC-1", "REQ-2", "TEST-3"]
+    monkeypatch.setattr(acp_server, "load_config", lambda: (config, "/test/config.json"))
+    monkeypatch.setattr(MasterAgent, "decompose", lambda self, *args, **kwargs: [item])
+    monkeypatch.setattr(pipeline_runner.acp_client, "teardown", lambda: None)
+    agent = acp_server.PipelineAgent()
+
+    def dispatch(*args, **kwargs):
+        (project / "src/app.py").write_text("return\n" if failure == "static" else "value = 2\n")
+        if failure == "cancel":
+            next(iter(agent._sessions.values())).cancelled = True
+        return [AgentResult(item.id, "FeatureAgent", True, ["src/app.py"])]
+
+    monkeypatch.setattr(pipeline_runner, "dispatch_work_items", dispatch)
+
+    def fail(*args, **kwargs):
+        raise OSError("forced finalization failure")
+
+    if failure == "handoff":
+        monkeypatch.setattr(pipeline_runner, "write_testing_handoff", fail)
+    elif failure == "result":
+        monkeypatch.setattr(pipeline_runner, "write_implementation_result", fail)
+    elif failure == "index":
+        monkeypatch.setattr(pipeline_runner, "append_index", fail)
+    elif failure == "teardown":
+        monkeypatch.setattr(pipeline_runner.acp_client, "teardown", fail)
+
+    async def host_exchange():
+        await agent.initialize(protocol_version=acp.PROTOCOL_VERSION)
+        session = await agent.new_session(cwd=str(tmp_path))
+        await agent.ext_method("agents-pipeline/session/configure", {
+            "sessionId": session.session_id, "mode": "existing_project", "projectPath": str(project),
+        })
+        response = await agent.prompt(session.session_id, [acp.text_block("Implement approved AC-1 in the Code worktree.")])
+        status = await agent.ext_method("agents-pipeline/run/status", {"sessionId": session.session_id})
+        return response, status
+
+    response, status = asyncio.run(host_exchange())
+    # This is exactly the completion predicate in AI-SDLC's external bridge.
+    assert (status["outcome"] == "passed") is (failure is None)
+    assert status["schema_version"] == 2
+    assert status["outcome_scope"] == "implementation"
+    assert status["external_testing_status"] == "pending"
+    assert response.stop_reason == ("refusal" if failure == "teardown" else "cancelled" if failure == "cancel" else "end_turn")
+    assert status["project_path"] == str(project)
+    assert sorted(path.relative_to(project).as_posix() for path in project.rglob("*") if path.is_file()) == ["src/app.py"]
+
+    run_dir = Path(status["run_dir"])
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    if failure == "result":
+        assert status["implementation_result_path"] is None
+        assert manifest["failure_reason"] == "implementation_result_failure"
+        return
+    evidence = json.loads(Path(status["implementation_result_path"]).read_text())
+    assert evidence["mode"] == "existing_project"
+    assert evidence["project_path"] == str(project)
+    assert evidence["delivery_mode"] == "working_tree"
+    assert evidence["unit_tests"] is None
+    assert evidence["lint"] == "not_run"
+    assert evidence["tasks"] == [{
+        "id": "T-001", "work_item_id": item.id, "title": item.title,
+        "status": "done", "commits": [], "files": ["src/app.py"],
+    }]
+    assert evidence["ac_coverage"] == [{"ac_id": "AC-1", "tasks": ["T-001"], "files": ["src/app.py"]}]
+    assert evidence["published_files"] == manifest["published_files"]
+    if failure is None:
+        assert status["status"] == "completed"
+        assert status["pipeline_outcome"] == "validation_passed_external_testing_pending"
+        assert status["validation_status"] == "passed"
+        assert manifest["status"] == "validation_passed_external_testing_pending"
+        handoff = json.loads((run_dir / "testing-handoff.json").read_text())
+        assert handoff["external_testing"]["status"] == "pending"
+    elif failure == "cancel":
+        assert status["outcome"] == "cancelled"

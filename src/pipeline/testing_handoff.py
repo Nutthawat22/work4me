@@ -59,9 +59,20 @@ ENV_NAME_PATTERNS = (
     re.compile(r"\bos\.environ(?:\.get)?\(\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]"),
     re.compile(r"\bos\.environ\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]"),
 )
-JS_PACKAGE_PATTERN = re.compile(
-    r"(?:\bfrom\s*|\bimport\s*|\brequire\s*\(\s*|\bimport\s*\(\s*)['\"]([^.'\"][^'\"]*)['\"]"
-)
+NODE_BUILTIN_MODULES = frozenset({
+    "_http_agent", "_http_client", "_http_common", "_http_incoming", "_http_outgoing",
+    "_http_server", "_stream_duplex", "_stream_passthrough", "_stream_readable",
+    "_stream_transform", "_stream_wrap", "_stream_writable", "_tls_common", "_tls_wrap",
+    "assert", "assert/strict", "async_hooks", "buffer", "child_process", "cluster",
+    "console", "constants", "crypto", "dgram", "diagnostics_channel", "dns", "dns/promises",
+    "domain", "events", "fs", "fs/promises", "http", "http2", "https", "inspector",
+    "inspector/promises", "module", "net", "os", "path", "path/posix", "path/win32",
+    "perf_hooks", "process", "punycode", "querystring", "readline", "readline/promises",
+    "repl", "sqlite", "stream", "stream/consumers", "stream/promises", "stream/web",
+    "string_decoder", "sys", "test", "test/reporters", "timers", "timers/promises", "tls",
+    "trace_events", "tty", "url", "util", "util/types", "v8", "vm", "wasi", "worker_threads",
+    "zlib", "sea", "single-executable",
+})
 SECRET_URL_CREDENTIALS = re.compile(r"(https?://)[^/@\s]+@", re.IGNORECASE)
 SECRET_ASSIGNMENT = re.compile(
     r"(?i)(password|passwd|token|secret|key|auth|bearer|credential)(\s*[=:]\s*)[^,\s\"']+"
@@ -313,6 +324,9 @@ def _manifest_data(
                     if _manifest_has_malformed_shapes(basename, data):
                         manifest["read_status"] = "invalid_or_unsupported_shape"
                         warnings.append(f"{basename} contains malformed metadata shapes; some declarations may be omitted from the handoff.")
+                    package_manager = data.get("packageManager") if isinstance(data, dict) else None
+                    if isinstance(package_manager, str):
+                        manifest["package_manager"] = _safe_specification(package_manager)
                     for group in ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies"):
                         group_data = data.get(group, {}) if isinstance(data, dict) else {}
                         if isinstance(group_data, dict):
@@ -523,7 +537,16 @@ def _commands(project_roots: list[str], config: dict) -> list[dict[str, str]]:
                 continue
             folder = os.path.dirname(full_path)
             lock_names = set(os.listdir(folder)) if os.path.isdir(folder) else set()
-            manager = "pnpm" if "pnpm-lock.yaml" in lock_names else "yarn" if "yarn.lock" in lock_names else "bun" if {"bun.lock", "bun.lockb"} & lock_names else "npm"
+            package_manager = data.get("packageManager") if isinstance(data, dict) else None
+            requested_manager = package_manager.split("@", 1)[0] if isinstance(package_manager, str) else ""
+            manager = (
+                requested_manager
+                if requested_manager in {"npm", "pnpm", "yarn", "bun"}
+                else "pnpm" if "pnpm-lock.yaml" in lock_names
+                else "yarn" if "yarn.lock" in lock_names
+                else "bun" if {"bun.lock", "bun.lockb"} & lock_names
+                else "npm"
+            )
             for script_name in ("test", "build", "typecheck", "check", "lint"):
                 if script_name in scripts:
                     commands.append({"kind": script_name, "command": f"{manager} run {script_name}", "source": full_path})
@@ -557,6 +580,45 @@ def _commands(project_roots: list[str], config: dict) -> list[dict[str, str]]:
         if command:
             commands.append({"kind": "pipeline-configured-test", "language": language, "command": command, "source": "pipeline configuration"})
     return commands
+
+
+def _lock_preparation(
+    project_roots: list[str], manifests: list[dict[str, Any]]
+) -> dict[str, str]:
+    for root in project_roots:
+        for manifest in manifests:
+            if manifest.get("type") != "package.json":
+                continue
+            package_path = manifest.get("path")
+            if not isinstance(package_path, str) or os.path.dirname(package_path) != root:
+                continue
+            folder_entries = set(_walk_files(root))
+            has_npm_lock = "package-lock.json" in folder_entries
+            package_manager = manifest.get("package_manager")
+            if isinstance(package_manager, str):
+                manager = package_manager.split("@", 1)[0]
+            elif "pnpm-lock.yaml" in folder_entries:
+                manager = "pnpm"
+            elif "yarn.lock" in folder_entries:
+                manager = "yarn"
+            elif {"bun.lock", "bun.lockb"} & folder_entries:
+                manager = "bun"
+            else:
+                manager = "npm"
+            if manager != "npm":
+                return {
+                    "status": "unsupported_package_manager",
+                    "manager": manager,
+                    "detail": "The external tester currently supports npm package-lock.json only; the requested manager was preserved.",
+                }
+            if has_npm_lock:
+                return {"status": "ready", "manager": "npm", "detail": "Root package-lock.json is present."}
+            return {
+                "status": "lock_pending",
+                "manager": "npm",
+                "detail": "External npm lock preparation is required before delegation; the pipeline did not generate or resolve a lockfile.",
+            }
+    return {"status": "not_applicable", "manager": "", "detail": "No root Node package manifest was inventoried."}
 
 
 def _changed_files(run_dir: str, project_root: str | None, output_dir: str, tests_dir: str) -> dict[str, list[str]]:
@@ -623,7 +685,11 @@ def _required_environment(project_roots: list[str], changed: dict[str, list[str]
     return sorted(names)
 
 
-def _unresolved_dependencies(project_roots: list[str], dependencies: dict[str, str]) -> list[str]:
+def _unresolved_dependencies(
+    project_roots: list[str],
+    dependencies: dict[str, str],
+    import_inventory: list[dict[str, Any]] | None = None,
+) -> list[str]:
     declared = {_normalized_name(name) for name in dependencies}
     imports: set[str] = set()
     for root in project_roots:
@@ -650,12 +716,22 @@ def _unresolved_dependencies(project_roots: list[str], dependencies: dict[str, s
                         names.add(node.module.split(".", 1)[0])
                 from sys import stdlib_module_names
                 names.difference_update(stdlib_module_names)
-            else:
-                names.update(match.group(1).split("/", 1)[0] if not match.group(1).startswith("@") else "/".join(match.group(1).split("/")[:2]) for match in JS_PACKAGE_PATTERN.finditer(content))
-                names.difference_update({"node:assert", "node:fs", "node:path", "node:crypto", "node:util", "node:os", "node:http", "node:url", "node:events"})
             for name in names:
                 if name not in local_roots and _normalized_name(name) not in declared:
                     imports.add(name)
+    for entry in import_inventory or []:
+        if not isinstance(entry, dict) or entry.get("classification") != "external_unresolved":
+            continue
+        specifier = entry.get("specifier")
+        if (
+            not isinstance(specifier, str)
+            or specifier.startswith("node:")
+            or specifier in NODE_BUILTIN_MODULES
+        ):
+            continue
+        root_name = "/".join(specifier.split("/")[:2]) if specifier.startswith("@") else specifier.split("/", 1)[0]
+        if root_name not in declared:
+            imports.add(root_name)
     return sorted(imports)
 
 
@@ -746,6 +822,13 @@ def build_testing_handoff(config: dict, run_dir: str) -> dict[str, Any]:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             pass
     validation = _validation_findings(inventory_run_dir)
+    if validation.get("typescript_status") not in {"checked", "not_applicable"} and any(
+        Path(path).suffix.lower() in {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx"}
+        for root in project_roots for path in _walk_files(root)
+    ):
+        validation.setdefault("limitations", []).append(
+            "Parser-derived JavaScript/TypeScript import inventory is unavailable for this run; unresolved external package detection may be incomplete."
+        )
     manifest_path = os.path.join(inventory_run_dir, "manifest.json")
     try:
         run_manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -783,6 +866,11 @@ def build_testing_handoff(config: dict, run_dir: str) -> dict[str, Any]:
           "changes_json": os.path.join(inventory_run_dir, "changes.json") if project_root else None,
     }
     runtime_requirements, runtime_warnings = _runtime_requirements(project_roots, manifests)
+    lock_preparation = _lock_preparation(project_roots, manifests)
+    if lock_preparation["status"] == "lock_pending":
+        manifest_warnings.append(lock_preparation["detail"])
+    elif lock_preparation["status"] == "unsupported_package_manager":
+        manifest_warnings.append(lock_preparation["detail"])
     result: dict[str, Any] = {
         "schema_version": 1,
           "run_id": run_manifest.get("run_id", os.path.basename(inventory_run_dir.rstrip(os.sep))),
@@ -798,7 +886,10 @@ def build_testing_handoff(config: dict, run_dir: str) -> dict[str, Any]:
         "dependency_manifests": manifests,
         "lockfiles": lockfiles,
         "declared_dependencies": dependency_records,
-        "unresolved_or_undeclared_dependencies": _unresolved_dependencies(project_roots, dependencies),
+          "unresolved_or_undeclared_dependencies": _unresolved_dependencies(
+              project_roots, dependencies,
+              validation.get("import_inventory") if isinstance(validation.get("import_inventory"), list) else [],
+          ),
         "test_and_build_commands": _commands(project_roots, config),
         "required_environment_variable_names": _required_environment(project_roots, changes),
         "environment_variable_detection": "Names are detected conservatively from dotenv example filenames and Python/JavaScript/TypeScript source patterns; dynamic lookups may be missed.",
@@ -806,8 +897,9 @@ def build_testing_handoff(config: dict, run_dir: str) -> dict[str, Any]:
         "declared_services": services,
         "validation": validation,
           "handoff_warnings": sorted(set(path_warnings + manifest_warnings + runtime_warnings)),
-        "external_testing": {
-            "status": "pending",
+          "external_testing": {
+              "status": "pending",
+              "lock_preparation": lock_preparation,
             "result_file": EXTERNAL_TEST_RESULT_CONTRACT["result_file_pattern"],
             "contract_version": 1,
             "result_contract": EXTERNAL_TEST_RESULT_CONTRACT,

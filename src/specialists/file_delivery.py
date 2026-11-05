@@ -7,6 +7,7 @@ import json
 import os
 import re
 import secrets
+import stat
 from typing import Any
 
 from pipeline.staging import (
@@ -29,6 +30,8 @@ from specialists.llm_client import LLMResponse, call_llm_result
 MAX_DIAGNOSTIC_CHARS = 1200
 MAX_CURRENT_FILE_CONTEXT_CHARS = 30000
 MAX_FEATURE_CONTEXT_CHARS = 100000
+MAX_REJECTED_CANDIDATE_BYTES = 128 * 1024
+MAX_REJECTED_DIAGNOSTIC_BYTES = 5 * 1024 * 1024
 ALLOWED_CONTROLS = {"\n", "\r", "\t"}
 
 
@@ -163,12 +166,11 @@ def _file_prompt(
 
 
 def _unwrap_outer_fence(raw: str) -> tuple[str, str | None]:
-    stripped = raw.strip()
-    if not stripped.startswith("```"):
-        return stripped, None
-    match = re.fullmatch(r"```[A-Za-z0-9_-]*\r?\n([\s\S]*?)\r?\n?```", stripped)
+    if not raw.startswith("```"):
+        return raw, None
+    match = re.fullmatch(r"```[A-Za-z0-9_-]*\r?\n([\s\S]*?)\r?\n?```[ \t]*", raw)
     if match is None:
-        return stripped, "Malformed or unterminated outer Markdown fence"
+        return raw, "Malformed or unterminated outer Markdown fence"
     return match.group(1), None
 
 
@@ -182,13 +184,13 @@ def _extract_file_source(
     framed, framing_error = _unwrap_outer_fence(raw)
     if framing_error:
         return None, None, framing_error
-    if not framed.startswith(begin + "\n") or not framed.endswith("\n" + end):
+    begin_separator = "\r\n" if framed.startswith(begin + "\r\n") else "\n"
+    if not framed.startswith(begin + begin_separator):
         return None, None, "File response framing did not match the current path-bound request"
-    content = framed[len(begin) + 1 : -len(end)]
-    if content.endswith("\r\n"):
-        content = content[:-2]
-    elif content.endswith("\n"):
-        content = content[:-1]
+    end_separator = "\r\n" if framed.endswith("\r\n" + end) else "\n"
+    if not framed.endswith(end_separator + end):
+        return None, None, "File response framing did not match the current path-bound request"
+    content = framed[len(begin) + len(begin_separator) : -(len(end_separator) + len(end))]
 
     empty_token, delete_token = action_tokens.split("\0", 1)
     if content == empty_token:
@@ -203,6 +205,125 @@ def _extract_file_source(
     if invalid:
         return None, None, f"Source contains disallowed control character(s): {', '.join(invalid)}"
     return content, "write", None
+
+
+def _diagnostic_source(raw: str, begin: str, end: str) -> str:
+    framed, fence_error = _unwrap_outer_fence(raw)
+    if fence_error:
+        return raw
+    lines = framed.splitlines(keepends=True)
+    if len(lines) < 2:
+        return framed
+    first = lines[0].rstrip("\r\n")
+    last = lines[-1].rstrip("\r\n")
+    if not first.startswith("BEGIN-OWNED-FILE:") or not last.startswith("END-OWNED-FILE:"):
+        return framed
+    body = "".join(lines[1:-1])
+    if body.endswith("\r\n"):
+        body = body[:-2]
+    elif body.endswith("\n"):
+        body = body[:-1]
+    return body
+
+
+def _save_rejected_candidate(
+    run_dir: str,
+    work_item: WorkItem,
+    relative_path: str,
+    attempt_number: int,
+    raw: str,
+    begin: str,
+    end: str,
+    *,
+    failure: str,
+    completion_status: str,
+    stop_reason: str | None,
+) -> None:
+    """Keep bounded response evidence outside publishable project inventory."""
+    root = os.path.realpath(run_dir)
+    if not os.path.isdir(root) or os.path.islink(run_dir):
+        return
+    diagnostic_parent = os.path.join(root, "diagnostics")
+    if os.path.islink(diagnostic_parent):
+        return
+    os.makedirs(diagnostic_parent, mode=0o700, exist_ok=True)
+    diagnostics_root = os.path.join(root, "diagnostics", "rejected")
+    if os.path.islink(diagnostics_root):
+        return
+    os.makedirs(diagnostics_root, mode=0o700, exist_ok=True)
+    task_dir = os.path.join(diagnostics_root, hashlib.sha256(work_item.id.encode()).hexdigest()[:24])
+    os.makedirs(task_dir, mode=0o700, exist_ok=True)
+    if os.path.islink(diagnostics_root) or os.path.islink(task_dir):
+        return
+    owner = getattr(os, "getuid", lambda: None)()
+    for directory in (diagnostic_parent, diagnostics_root, task_dir):
+        info = os.stat(directory, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or (owner is not None and info.st_uid != owner):
+            return
+        os.chmod(directory, 0o700)
+
+    candidate = _diagnostic_source(raw, begin, end)
+    encoded = candidate.encode("utf-8", errors="replace")
+    digest = hashlib.sha256(encoded).hexdigest()
+    try:
+        used = sum(
+            entry.stat(follow_symlinks=False).st_size
+            for entry in os.scandir(diagnostics_root)
+            if entry.is_file(follow_symlinks=False)
+        )
+        used += sum(
+            os.stat(entry, follow_symlinks=False).st_size
+          for current, directories, files in os.walk(diagnostics_root, followlinks=False)
+          if os.path.realpath(current) != diagnostics_root
+          for entry in (os.path.join(current, name) for name in files)
+          if os.path.isfile(entry) and not os.path.islink(entry)
+      )
+    except OSError:
+        return
+    metadata = {
+        "schema_version": 1,
+        "task_id": work_item.id,
+        "path": relative_path,
+        "attempt": attempt_number,
+        "source_length": len(candidate),
+        "source_sha256": digest,
+        "stored_bytes": min(len(encoded), MAX_REJECTED_CANDIDATE_BYTES),
+        "stored_complete": len(encoded) <= MAX_REJECTED_CANDIDATE_BYTES,
+        "response_sha256": hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest(),
+        "response_length": len(raw),
+        "line_endings": sorted({
+            "crlf" if "\r\n" in raw else "",
+            "lf" if re.search(r"(?<!\r)\n", raw) else "",
+            "cr" if re.search(r"\r(?!\n)", raw) else "",
+        } - {""}),
+        "begin_present": bool(re.search(r"(?m)^BEGIN-OWNED-FILE:[A-Za-z0-9_-]+$", raw)),
+        "end_present": bool(re.search(r"(?m)^END-OWNED-FILE:[A-Za-z0-9_-]+$", raw)),
+        "current_nonce": bool(begin and end and begin in raw and end in raw),
+        "stale_nonce": any(
+            marker not in {begin, end}
+            for marker in re.findall(r"(?:BEGIN|END)-OWNED-FILE:[A-Za-z0-9_-]+", raw)
+        ),
+        "completion_status": _safe_diagnostic(completion_status, {"litellm_key": ""}),
+        "stop_reason": _safe_diagnostic(stop_reason or "", {"litellm_key": ""})[:120],
+        "failure": failure[:MAX_DIAGNOSTIC_CHARS],
+    }
+    name = hashlib.sha256(relative_path.encode()).hexdigest()[:20] + f"-{attempt_number}"
+    source_path = os.path.join(task_dir, name + ".source")
+    metadata_path = os.path.join(task_dir, name + ".json")
+    if used + min(len(encoded), MAX_REJECTED_CANDIDATE_BYTES) > MAX_REJECTED_DIAGNOSTIC_BYTES:
+        metadata["stored_bytes"] = 0
+        metadata["stored_complete"] = False
+        metadata["retention_limit_reached"] = True
+    else:
+        descriptor = os.open(source_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(encoded[:MAX_REJECTED_CANDIDATE_BYTES])
+        os.chmod(source_path, 0o600)
+    descriptor = os.open(metadata_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        json.dump(metadata, output, ensure_ascii=True, indent=2)
+        output.write("\n")
+    os.chmod(metadata_path, 0o600)
 
 
 def _safe_diagnostic(value: str, config: dict[str, Any]) -> str:
@@ -446,8 +567,23 @@ def run_file_delivery(
                     _append_file_attempt(work_item, file_attempt, config)
                     persist_stage(stage, manifest)
                     continue
-        failure = failure or "File response was rejected"
-        failure = _safe_diagnostic(failure, config)
+
+        failure = _safe_diagnostic(failure or "File response was rejected", config)
+        try:
+            _save_rejected_candidate(
+                run_dir,
+                work_item,
+                relative,
+                attempt_number,
+                response.content,
+                begin,
+                end,
+                failure=failure,
+                completion_status=response.completion_status,
+                stop_reason=response.stop_reason,
+            )
+        except (OSError, ValueError):
+            pass
         failures.append(f"{relative}: {failure}")
         record.update(status="rejected", failure_details=failure, action=None)
         attempt_record.update(status="rejected", failure_details=failure)
@@ -508,25 +644,72 @@ def run_file_delivery(
         manifest["status"] = "consistency_review_failed"
         feedback = "; ".join(review.issues[:8]) or review.reasoning
         manifest["consistency_feedback"] = _safe_diagnostic(feedback, config)
-        for path, record in records.items():
-            if isinstance(record, dict) and record.get("status") == "staged":
-                record["status"] = "rejected"
-                record["failure_details"] = "Feature-level staged-content consistency review rejected the file"
-                record["action"] = None
-                staged_path = os.path.join(stage.files_directory, path)
-                if os.path.lexists(staged_path):
-                    os.remove(staged_path)
-                attempt_history = record.get("attempts", [])
-                if attempt_history and isinstance(attempt_history[-1], dict):
-                    attempt_history[-1].update(
-                        status="rejected",
-                        failure_details=record["failure_details"],
+        owned_by_key = {path.casefold(): path for path in owned_paths}
+        selected_paths: set[str] = set()
+        scope_valid = review.scope_reliable
+        for reported in review.affected_paths:
+            normalized = reported.replace("\\", "/").casefold()
+            matches = [
+                path for path in owned_by_key.values()
+                if normalized in {path.casefold(), os.path.basename(path).casefold()}
+                or normalized.endswith("/" + path.casefold())
+            ]
+            if len(matches) != 1:
+                scope_valid = False
+                break
+            selected_paths.add(matches[0])
+        allowed_affected = set(
+            config.get("pipeline", {}).get("_review_dependents", {}).get(work_item.id, [])
+        )
+        affected_work_items = set(review.affected_work_item_ids)
+        if not affected_work_items.issubset(allowed_affected):
+            scope_valid = False
+            affected_work_items.clear()
+        if not selected_paths and not affected_work_items:
+            scope_valid = False
+        if not scope_valid:
+            selected_paths = {
+                path for path, record in records.items()
+                if isinstance(record, dict) and record.get("status") == "staged"
+            }
+            affected_work_items.clear()
+        manifest["repair_scope"] = {
+            "kind": "review_scoped" if scope_valid else "conservative_feature_fallback",
+            "paths": sorted(selected_paths),
+            "work_item_ids": sorted(affected_work_items),
+        }
+        for path in selected_paths:
+            record = records.get(path)
+            if not isinstance(record, dict) or record.get("status") != "staged":
+                continue
+            attempt_history = record.get("attempts", [])
+            attempt_number = int(attempt_history[-1].get("number", 1)) if attempt_history else 1
+            if record.get("action") == "write":
+                try:
+                    _save_rejected_candidate(
+                        run_dir, work_item, path, attempt_number,
+                        stage_file_content(stage, path), "", "",
+                        failure=_safe_diagnostic(feedback, config),
+                        completion_status="complete", stop_reason="review_rejected",
                     )
-                _append_file_attempt(
-                    work_item,
-                    FileAttempt(path, len(attempt_history), "rejected", failure_details=record["failure_details"]),
-                    config,
+                except (OSError, ValueError):
+                    pass
+            record["status"] = "rejected"
+            record["failure_details"] = _safe_diagnostic(feedback, config)
+            record["action"] = None
+            if attempt_history and isinstance(attempt_history[-1], dict):
+                attempt_history[-1].update(
+                    status="rejected", failure_details=record["failure_details"]
                 )
+            _append_file_attempt(
+                work_item,
+                FileAttempt(
+                    path, attempt_number, "rejected",
+                    digest=str(record.get("digest", "")),
+                    failure_details=record["failure_details"],
+                ),
+                config,
+            )
         persist_stage(stage, manifest)
         return AgentResult(
             work_item.id,
@@ -534,6 +717,7 @@ def run_file_delivery(
             False,
             [],
             f"Feature-level staged-content consistency review rejected output: {_safe_diagnostic(feedback, config)}",
+            affected_work_item_ids=sorted(affected_work_items),
         )
 
     dependency_files = dependency_context or {}
@@ -545,11 +729,16 @@ def run_file_delivery(
         staged_files=staged_files,
         staged_deletions=staged_deletions,
         dependency_files=dependency_files,
+        contracts_complete=False,
     )
     if not candidate.passed:
-        detail = _safe_diagnostic("; ".join(
-            f"{issue.file_path}: {issue.error_output[:300]}" for issue in candidate.errors[:8]
-        ), config)
+        detail = _safe_diagnostic(
+            "; ".join(
+                f"{issue.file_path}: {issue.error_output[:300]}"
+                for issue in candidate.errors[:8]
+            ),
+            config,
+        )
         manifest["status"] = "static_validation_failed"
         manifest["consistency_feedback"] = detail
         affected = {
@@ -562,30 +751,55 @@ def run_file_delivery(
             or any(candidate_path.endswith("/" + path.casefold()) for candidate_path in affected)
         }
         if not selected:
-            selected = set(records)
+            selected = {
+                path for path, record in records.items()
+                if isinstance(record, dict) and record.get("status") == "staged"
+            }
+            scope_kind = "conservative_feature_fallback"
+        else:
+            scope_kind = "static_finding_paths"
+        manifest["repair_scope"] = {
+            "kind": scope_kind,
+            "paths": sorted(selected),
+            "work_item_ids": [],
+        }
         for path in selected:
             record = records.get(path)
             if not isinstance(record, dict) or record.get("status") != "staged":
                 continue
+            attempt_history = record.get("attempts", [])
+            file_number = int(attempt_history[-1].get("number", 1)) if attempt_history else 1
+            if record.get("action") == "write":
+                try:
+                    _save_rejected_candidate(
+                        run_dir, work_item, path, file_number,
+                        stage_file_content(stage, path), "", "",
+                        failure=detail,
+                        completion_status="complete", stop_reason="static_validation_rejected",
+                    )
+                except (OSError, ValueError):
+                    pass
             record["status"] = "rejected"
             record["action"] = None
             record["failure_details"] = detail[:MAX_DIAGNOSTIC_CHARS]
-            staged_path = os.path.join(stage.files_directory, path)
-            if os.path.lexists(staged_path):
-                os.remove(staged_path)
-            history = record.get("attempts", [])
-            if history and isinstance(history[-1], dict):
-                history[-1].update(status="rejected", failure_details=record["failure_details"])
-                file_number = int(history[-1].get("number", 1))
-            else:
-                file_number = 1
+            if attempt_history and isinstance(attempt_history[-1], dict):
+                attempt_history[-1].update(
+                    status="rejected", failure_details=record["failure_details"]
+                )
             _append_file_attempt(
                 work_item,
-                FileAttempt(path, file_number, "rejected", failure_details=record["failure_details"]),
+                FileAttempt(
+                    path, file_number, "rejected",
+                    digest=str(record.get("digest", "")),
+                    failure_details=record["failure_details"],
+                ),
                 config,
             )
         persist_stage(stage, manifest)
-        return AgentResult(work_item.id, agent_name, False, [], f"Staged feature validation failed: {detail}")
+        return AgentResult(
+            work_item.id, agent_name, False, [],
+            f"Staged feature validation failed: {detail}",
+        )
 
     if project_mode and not owned_source_matches(stage, work_item, config, run_dir):
         manifest["status"] = "stale_source_snapshot"

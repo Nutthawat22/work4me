@@ -69,10 +69,17 @@ SELF_CHECK_SYSTEM_PROMPT = (
     "actually expose (do imports/function names/class names/exported "
     "symbols/API endpoints match, or does the output invent names that "
     "don't exist in the dependencies shown)? Do not reject for stylistic "
-    "preferences or issues unrelated to these two checks. Output ONLY a "
+    "preferences or issues unrelated to these two checks. Supplied design "
+    "contracts are authoritative and their exact source reference must be "
+    "preserved. For each rejection, report only exact owned file paths that "
+    "need repair and downstream WorkItem ids whose contract is affected. "
+    "Set scope_reliable false when attribution is uncertain; never guess. "
+    "Output ONLY a "
     'JSON object of this exact shape: {"accepted": true|false, "issues": '
     '["specific issue 1", ...], "reasoning": "one paragraph explaining '
-    'the verdict"} — no markdown fences, no other text. "issues" must be '
+    'the verdict", "affected_paths": ["exact owned path"], '
+    '"affected_work_item_ids": ["declared downstream task id"], '
+    '"scope_reliable": true|false} — no markdown fences, no other text. "issues" must be '
     "empty if accepted, and each issue must be concrete/actionable if not."
 )
 
@@ -163,6 +170,7 @@ def _build_self_check_user_content(
     work_item: WorkItem,
     written_content: dict[str, str],
     dependency_context: dict[str, str] | None,
+    config: dict,
     deleted_files: list[str] | None = None,
 ) -> str:
     """Build the self-check call's user-turn prompt: the WorkItem's own
@@ -181,6 +189,22 @@ def _build_self_check_user_content(
     lines.extend(f"- {c}" for c in work_item.acceptance_criteria)
     lines.append(f"Requirement references: {', '.join(work_item.requirement_refs) or '(none)'}")
     lines.extend(f"Expected interface: {contract}" for contract in work_item.expected_interfaces)
+    lines.append("Exact design contract authorities (preserve these definitions and cite their source):")
+    if work_item.design_contracts:
+        for contract in work_item.design_contracts[:20]:
+            lines.append(
+                f"\n--- {contract.get('name', 'unnamed')} — {contract.get('source_ref', 'planning input')} ---\n"
+                f"{contract.get('declaration', '')[:10000]}"
+            )
+    else:
+        lines.append("(none extracted from the supplied planning text)")
+    lines.append("Exact owned output paths:")
+    lines.extend(f"- {owned.path}" for owned in work_item.owned_files)
+    permitted = config.get("pipeline", {}).get("_review_dependents", {}).get(work_item.id, [])
+    lines.append("Permitted downstream WorkItem ids for scoped contract invalidation:")
+    lines.extend(f"- {task_id}" for task_id in permitted)
+    if not permitted:
+        lines.append("(none)")
 
     lines.append(
         "\n--- Dependency context (already-implemented files this WorkItem depends on) ---"
@@ -228,8 +252,14 @@ def _build_self_check_response_schema() -> dict:
                 "accepted": {"type": "boolean"},
                 "issues": {"type": "array", "items": {"type": "string"}},
                 "reasoning": {"type": "string"},
+                "affected_paths": {"type": "array", "items": {"type": "string"}},
+                "affected_work_item_ids": {"type": "array", "items": {"type": "string"}},
+                "scope_reliable": {"type": "boolean"},
             },
-            "required": ["accepted", "issues", "reasoning"],
+            "required": [
+                "accepted", "issues", "reasoning", "affected_paths",
+                "affected_work_item_ids", "scope_reliable",
+            ],
             "additionalProperties": False,
         },
     }
@@ -260,7 +290,10 @@ def _parse_self_check_json(raw: str) -> dict:
 def _validate_and_build_self_check(parsed: dict) -> ReviewResult:
     """Validate a parsed self-check verdict dict's required keys/types
     and construct a ReviewResult, raising ValueError on problems."""
-    required = {"accepted", "issues", "reasoning"}
+    required = {
+        "accepted", "issues", "reasoning", "affected_paths",
+        "affected_work_item_ids", "scope_reliable",
+    }
     missing = required - parsed.keys()
     if missing:
         raise ValueError(f"Self-check verdict missing required fields: {sorted(missing)}")
@@ -275,11 +308,24 @@ def _validate_and_build_self_check(parsed: dict) -> ReviewResult:
 
     if not isinstance(parsed["reasoning"], str):
         raise ValueError("Self-check verdict 'reasoning' must be a string")
+    if not isinstance(parsed["affected_paths"], list) or not all(
+        isinstance(path, str) for path in parsed["affected_paths"]
+    ):
+        raise ValueError("Self-check verdict 'affected_paths' must be a list of strings")
+    if not isinstance(parsed["affected_work_item_ids"], list) or not all(
+        isinstance(task_id, str) for task_id in parsed["affected_work_item_ids"]
+    ):
+        raise ValueError("Self-check verdict 'affected_work_item_ids' must be a list of strings")
+    if not isinstance(parsed["scope_reliable"], bool):
+        raise ValueError("Self-check verdict 'scope_reliable' must be a boolean")
 
     return ReviewResult(
         accepted=parsed["accepted"],
         issues=parsed["issues"],
         reasoning=parsed["reasoning"],
+        affected_paths=parsed["affected_paths"],
+        affected_work_item_ids=parsed["affected_work_item_ids"],
+        scope_reliable=parsed["scope_reliable"],
     )
 
 
@@ -309,7 +355,7 @@ def _self_check(
     provider = model_cfg["provider"]
 
     user_content = _build_self_check_user_content(
-        work_item, written_content, dependency_context, deleted_files
+        work_item, written_content, dependency_context, config, deleted_files
     )
     messages = [
         {"role": "system", "content": SELF_CHECK_SYSTEM_PROMPT},
@@ -356,14 +402,23 @@ def _build_base_user_content(work_item: WorkItem, config: dict) -> str:
         + "\n".join(f"- {c}" for c in work_item.acceptance_criteria)
         + f"\nExpected interfaces:\n"
         + ("\n".join(f"- {contract}" for contract in work_item.expected_interfaces) or "- (none specified)")
-        + (
-            "\nOwned files (exact slash-separated paths relative to the project root; "
+          + (
+              "\nOwned files (exact slash-separated paths relative to the project root; "
             "edit only these paths, returning each as full content or an intentional deletion):\n"
             if project_mode
             else "\nOwned files (create exactly this set; do not repeat the area directory prefix):\n"
-        )
-        + "\n".join(files)
-    )
+          )
+          + "\n".join(files)
+          + (
+              "\n\nExact design contract authorities (preserve exact declarations and cite source references):\n"
+              + "\n\n".join(
+                  f"--- {contract['name']} ({contract['source_ref']}) ---\n{contract['declaration']}"
+                  for contract in work_item.design_contracts[:20]
+              )
+              if work_item.design_contracts
+              else ""
+          )
+      )
 
 
 def _legacy_json_multifile_specialist(

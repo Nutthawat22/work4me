@@ -86,10 +86,10 @@ from acp.schema import (
 from pipeline.master import MasterPlanError
 from pipeline.project_paths import PROJECT_ROOT, resolve_project_path
 from pipeline.project_context import validate_project_path
-from pipeline.runner import load_config, run_pipeline
+from pipeline.runner import load_config, resume_pipeline, run_pipeline
 
 AGENT_NAME = "agents-pipeline"
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.2.0"
 
 # ── stdout capture plumbing ─────────────────────────────────────────────────
 
@@ -284,7 +284,7 @@ class _SessionState:
 
     __slots__ = (
         "session_id", "cwd", "cancelled", "used", "mode", "project_path",
-        "progress", "progress_lock", "queue_ticket"
+        "progress", "progress_lock", "queue_ticket", "resume_spec"
     )
 
     def __init__(self, session_id: str, cwd: str) -> None:
@@ -295,9 +295,13 @@ class _SessionState:
         self.mode = "new_project"
         self.project_path: Optional[str] = None
         self.progress: dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "session_id": session_id,
             "run_id": None,
+            "run_dir": None,
+            "implementation_result_path": None,
+            "outcome_scope": "implementation",
+            "pipeline_outcome": None,
             "status": "created",
               "phase": "created",
               "outcome": None,
@@ -319,6 +323,7 @@ class _SessionState:
         }
         self.progress_lock = threading.Lock()
         self.queue_ticket: Optional[_RunTicket] = None
+        self.resume_spec: Optional[dict[str, Any]] = None
 
 
 class PipelineAgent:
@@ -366,6 +371,8 @@ class PipelineAgent:
                         "runStatus": {
                             "method": "_agents-pipeline/run/status",
                             "params": {"sessionId": "string"},
+                            "schemaVersion": 2,
+                            "outcomeScope": "implementation",
                         },
                         "sessionConfig": {
                             "method": "_agents-pipeline/session/configure",
@@ -373,6 +380,14 @@ class PipelineAgent:
                                 "sessionId": "string",
                                 "mode": "existing_project",
                                 "projectPath": "absolute server-side path",
+                            },
+                        },
+                        "runResume": {
+                            "method": "_agents-pipeline/run/resume",
+                            "params": {
+                                "sessionId": "string",
+                                "runId": "source run id or path",
+                                "taskIds": ["exact task id"],
                             },
                         },
                     }
@@ -412,6 +427,10 @@ class PipelineAgent:
         state.used = True
 
         text = _extract_prompt_text(prompt)
+        if state.resume_spec is not None and text.strip().casefold() != "resume":
+            raise acp.RequestError.invalid_params(
+                {"prompt": "send exactly 'resume' after configuring agents-pipeline/run/resume"}
+            )
         if not text:
             self._set_progress(
                 state,
@@ -484,8 +503,9 @@ class PipelineAgent:
                     self._run_pipeline_safely,
                     text,
                     label,
-                    lambda update: self._apply_pipeline_progress(state, update),
-                    state.project_path,
+                      lambda update: self._apply_pipeline_progress(state, update),
+                      state.project_path,
+                      state.resume_spec,
                 )
             )
             success, interrupted = await _wait_for_pipeline(pipeline_task)
@@ -518,7 +538,7 @@ class PipelineAgent:
                     )
                 response = PromptResponse(stop_reason="refusal")
             elif state.cancelled or interrupted:
-                self._set_progress(state, status="cancelled", phase="completed", outcome=outcome or "cancelled")
+                self._set_progress(state, status="cancelled", phase="completed", outcome="cancelled")
                 await self._send_message(
                     session_id,
                     "\n🛑 Session was cancelled (best-effort; run may have completed anyway).\n",
@@ -534,7 +554,8 @@ class PipelineAgent:
                     state,
                     status="completed" if success else "failed",
                     phase="completed",
-                    outcome=outcome,
+                    outcome="passed" if success else outcome,
+                    pipeline_outcome=outcome,
                 )
                 if outcome == "validation_passed_external_testing_pending":
                     summary = (
@@ -589,13 +610,16 @@ class PipelineAgent:
     @staticmethod
     def _progress_outcome(state: _SessionState) -> Optional[str]:
         with state.progress_lock:
-            outcome = state.progress.get("outcome")
+            outcome = state.progress.get("pipeline_outcome")
             return outcome if isinstance(outcome, str) else None
 
     @staticmethod
     def _apply_pipeline_progress(state: _SessionState, update: dict[str, object]) -> None:
         with state.progress_lock:
-            state.progress.update(update)
+            details = dict(update)
+            if "outcome" in details:
+                state.progress["pipeline_outcome"] = details.pop("outcome")
+            state.progress.update(details)
             if "task" in update:
                 task = update["task"]
                 if isinstance(task, dict) and task.get("status") == "running":
@@ -619,6 +643,7 @@ class PipelineAgent:
         label: str,
         progress: Callable[[dict[str, object]], None],
         existing_project_path: Optional[str] = None,
+        resume_spec: Optional[dict[str, Any]] = None,
     ) -> Optional[bool]:
         """
         Runs on an executor thread (via asyncio.to_thread). Wraps
@@ -632,6 +657,14 @@ class PipelineAgent:
         session_update was already sent).
         """
         try:
+            if resume_spec is not None:
+                return resume_pipeline(
+                    self.config,
+                    str(resume_spec["runId"]),
+                    list(resume_spec["taskIds"]),
+                    progress=progress,
+                    existing_project_path=existing_project_path,
+                )
             if existing_project_path is None:
                 return run_pipeline(self.config, user_input=user_input, label=label, progress=progress)
             return run_pipeline(
@@ -642,9 +675,6 @@ class PipelineAgent:
                 existing_project_path=existing_project_path,
             )
         except MasterPlanError as e:
-            # run_pipeline() already catches this internally and returns
-            # False -- this branch is defensive/documentation only (see
-            # its docstring), kept in case that contract ever changes.
             print(f"⚠️  MasterAgent failed to produce a valid plan: {e}\n")
             return False
         except Exception as e:  # noqa: BLE001 - deliberately broad: must not crash the ACP connection
@@ -774,13 +804,10 @@ class PipelineAgent:
             mode = params.get("mode")
             if mode != "existing_project":
                 raise acp.RequestError.invalid_params({"mode": "must be 'existing_project'"})
-            runs_root = os.path.realpath(
-                resolve_project_path(self.config["pipeline"]["runs_dir"])
-            )
+            runs_root = os.path.realpath(resolve_project_path(self.config["pipeline"]["runs_dir"]))
             try:
                 project_path = validate_project_path(
-                    params.get("projectPath", params.get("project_path")),
-                    runs_root,
+                    params.get("projectPath", params.get("project_path")), runs_root
                 )
             except ValueError as error:
                 raise acp.RequestError.invalid_params({"projectPath": str(error)}) from error
@@ -788,6 +815,30 @@ class PipelineAgent:
             state.project_path = project_path
             self._set_progress(state, mode=mode, project_path=project_path)
             return {"sessionId": session_id, "mode": mode, "projectPath": project_path}
+
+        if method == "agents-pipeline/run/resume":
+            session_id = params.get("sessionId", params.get("session_id"))
+            if not isinstance(session_id, str):
+                raise acp.RequestError.invalid_params({"sessionId": "required string"})
+            state = self._sessions.get(session_id)
+            if state is None:
+                raise acp.RequestError.invalid_params({"sessionId": session_id, "reason": "unknown session"})
+            if state.used or state.progress["status"] != "created" or state.resume_spec is not None:
+                raise acp.RequestError.invalid_params(
+                    {"sessionId": session_id, "reason": "resume must be configured once before prompt"}
+                )
+            run_id = params.get("runId", params.get("run_id"))
+            task_ids = params.get("taskIds", params.get("task_ids"))
+            if not isinstance(run_id, str) or not run_id.strip():
+                raise acp.RequestError.invalid_params({"runId": "required source run id or path"})
+            if not isinstance(task_ids, list) or not task_ids or not all(
+                isinstance(task_id, str) and task_id.strip() for task_id in task_ids
+            ):
+                raise acp.RequestError.invalid_params({"taskIds": "required non-empty list of exact task ids"})
+            if len(task_ids) != len(set(task_ids)):
+                raise acp.RequestError.invalid_params({"taskIds": "task ids must be unique"})
+            state.resume_spec = {"runId": run_id, "taskIds": list(task_ids)}
+            return {"sessionId": session_id, "runId": run_id, "taskIds": list(task_ids), "configured": True}
 
         if method != "agents-pipeline/run/status":
             raise acp.RequestError.method_not_found(f"ext_method {method} not supported")
